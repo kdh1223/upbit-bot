@@ -387,6 +387,9 @@ def maybe_generate_report(
     _LAST_RUN_AT = now
     try:
         return generate_report(trade_log_path, out_csv, out_xlsx, quiet=quiet)
+    except PermissionError:
+        print(f"⚠️ 엑셀 파일({out_xlsx})이 열려있어 저장 실패. 파일을 닫아주세요.")
+        return None
     except Exception as e:
         try:
             print(f"⚠️ report 생성 실패: {e}")
