@@ -1,5 +1,6 @@
 import csv
 import os
+import time
 from dataclasses import dataclass, asdict
 from datetime import datetime
 from typing import Dict, List, Tuple
@@ -11,12 +12,69 @@ TRADE_LOG = getattr(config, "TRADE_LOG_PATH", "trade_log.csv")
 OUT_XLSX = "trading_summary.xlsx"
 OUT_SUMMARY_CSV = "trading_summary.csv"
 
+_LAST_RUN_AT = 0.0
+
 
 def _to_float(x, default=0.0) -> float:
     try:
         return float(x)
     except Exception:
         return default
+
+
+def _get_initial_capital() -> float:
+    try:
+        return float(getattr(config, "INITIAL_CAPITAL", 1_000_000))
+    except Exception:
+        return 1_000_000.0
+
+
+def build_equity_curve(header: List[str], rows: List[List[str]]):
+    if not header or not rows:
+        return [], 0.0, "", ""
+
+    col = {name: idx for idx, name in enumerate(header)}
+    idx_time = col.get("time")
+    idx_pnl = col.get("pnl_pct")
+    if idx_pnl is None:
+        return [], 0.0, "", ""
+
+    cost_pp = float(getattr(config, "COST_ROUNDTRIP_PCT", 0.0)) * 100.0
+    equity = _get_initial_capital()
+    peak = equity
+    peak_time = ""
+    max_dd = 0.0
+    mdd_start = ""
+    mdd_end = ""
+    curve = []
+
+    for row in rows:
+        if idx_pnl >= len(row):
+            continue
+
+        ts = row[idx_time] if (idx_time is not None and idx_time < len(row)) else ""
+        pnl = _to_float(row[idx_pnl], 0.0)
+        pnl_net = pnl - cost_pp
+        equity *= (1.0 + pnl_net / 100.0)
+
+        if equity > peak:
+            peak = equity
+            peak_time = ts
+
+        if peak > 0:
+            dd = (equity / peak - 1.0) * 100.0
+        else:
+            dd = 0.0
+
+        if dd < max_dd:
+            max_dd = dd
+            mdd_start = peak_time if peak_time else ts
+            mdd_end = ts
+
+        curve.append((ts, equity, dd))
+
+    mdd = abs(max_dd)
+    return curve, mdd, mdd_start, mdd_end
 
 
 def load_trades(path: str) -> Tuple[List[str], List[List[str]]]:
@@ -48,6 +106,10 @@ class Metrics:
     gross_compound: float = 0.0  # %
     net_compound: float = 0.0    # %
     cost_pp: float = 0.0         # roundtrip cost in %p
+    mdd: float = 0.0             # %
+    mdd_start: str = ""
+    mdd_end: str = ""
+    profit_factor: float = 0.0
 
     by_reason: Dict[str, Dict[str, float]] = None
     by_regime: Dict[str, Dict[str, float]] = None
@@ -126,6 +188,17 @@ def calc_metrics(header: List[str], rows: List[List[str]]) -> Metrics:
     m.gross_compound = (gross_mult - 1.0) * 100.0
     m.net_compound = (net_mult - 1.0) * 100.0
 
+    # MDD (gross equity curve 기준)
+    _, mdd, mdd_start, mdd_end = build_equity_curve(header, rows)
+    m.mdd = mdd
+    m.mdd_start = mdd_start
+    m.mdd_end = mdd_end
+
+    # Profit Factor
+    gross_profit = sum(win_list)
+    gross_loss = abs(sum(loss_list))
+    m.profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else 0.0
+
     # 그룹 요약 저장
     for k, arr in reason_map.items():
         name = k if k else "(blank)"
@@ -188,6 +261,10 @@ def save_summary_csv(m: Metrics, out_path: str):
         ["gross_compound_pct", f"{m.gross_compound:.4f}"],
         ["net_compound_pct", f"{m.net_compound:.4f}"],
         ["roundtrip_cost_pctp", f"{m.cost_pp:.4f}"],
+        ["mdd_pct", f"{m.mdd:.4f}"],
+        ["mdd_start", m.mdd_start],
+        ["mdd_end", m.mdd_end],
+        ["profit_factor", f"{m.profit_factor:.4f}"],
     ]
     with open(out_path, "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
@@ -195,9 +272,16 @@ def save_summary_csv(m: Metrics, out_path: str):
         w.writerows(rows)
 
 
-def save_xlsx(header: List[str], rows: List[List[str]], m: Metrics, out_path: str):
+def save_xlsx(
+    header: List[str],
+    rows: List[List[str]],
+    m: Metrics,
+    out_path: str,
+    equity_curve=None,
+):
     try:
         from openpyxl import Workbook
+        from openpyxl.chart import LineChart, Reference
         from openpyxl.utils import get_column_letter
     except Exception:
         print("⚠️ openpyxl이 없어서 xlsx 저장은 스킵합니다. (요약 CSV는 생성됨)")
@@ -229,7 +313,41 @@ def save_xlsx(header: List[str], rows: List[List[str]], m: Metrics, out_path: st
     for r in rows:
         ws2.append(r)
 
-    for wsx in [ws, ws2]:
+    sheets = [ws, ws2]
+
+    if equity_curve:
+        ws3 = wb.create_sheet("Equity")
+        ws3.append(["timestamp", "equity", "drawdown_pct"])
+        for ts, eq, dd in equity_curve:
+            ws3.append([ts, eq, dd])
+        sheets.append(ws3)
+
+        ws4 = wb.create_sheet("Charts")
+        sheets.append(ws4)
+
+        max_row = ws3.max_row
+        if max_row >= 2:
+            cats = Reference(ws3, min_col=1, min_row=2, max_row=max_row)
+
+            eq_chart = LineChart()
+            eq_chart.title = "Equity"
+            eq_chart.y_axis.title = "Equity"
+            eq_chart.x_axis.title = "Time"
+            eq_data = Reference(ws3, min_col=2, min_row=1, max_row=max_row)
+            eq_chart.add_data(eq_data, titles_from_data=True)
+            eq_chart.set_categories(cats)
+            ws4.add_chart(eq_chart, "A1")
+
+            dd_chart = LineChart()
+            dd_chart.title = "Drawdown"
+            dd_chart.y_axis.title = "Drawdown %"
+            dd_chart.x_axis.title = "Time"
+            dd_data = Reference(ws3, min_col=3, min_row=1, max_row=max_row)
+            dd_chart.add_data(dd_data, titles_from_data=True)
+            dd_chart.set_categories(cats)
+            ws4.add_chart(dd_chart, "A16")
+
+    for wsx in sheets:
         for col_idx in range(1, wsx.max_column + 1):
             letter = get_column_letter(col_idx)
             wsx.column_dimensions[letter].width = 18
@@ -237,13 +355,48 @@ def save_xlsx(header: List[str], rows: List[List[str]], m: Metrics, out_path: st
     wb.save(out_path)
 
 
-def main():
-    header, rows = load_trades(TRADE_LOG)
+def generate_report(
+    trade_log_path: str = TRADE_LOG,
+    out_csv: str = OUT_SUMMARY_CSV,
+    out_xlsx: str = OUT_XLSX,
+    quiet: bool = False,
+):
+    header, rows = load_trades(trade_log_path)
     m = calc_metrics(header, rows)
+    equity_curve, _, _, _ = build_equity_curve(header, rows)
 
-    print_report(m)
-    save_summary_csv(m, OUT_SUMMARY_CSV)
-    save_xlsx(header, rows, m, OUT_XLSX)
+    if not quiet:
+        print_report(m)
+
+    save_summary_csv(m, out_csv)
+    save_xlsx(header, rows, m, out_xlsx, equity_curve=equity_curve)
+    return m
+
+
+def maybe_generate_report(
+    trade_log_path: str = TRADE_LOG,
+    out_csv: str = OUT_SUMMARY_CSV,
+    out_xlsx: str = OUT_XLSX,
+    min_interval_sec: float = 30.0,
+    quiet: bool = True,
+):
+    global _LAST_RUN_AT
+    now = time.time()
+    if now - _LAST_RUN_AT < float(min_interval_sec):
+        return None
+    _LAST_RUN_AT = now
+    try:
+        return generate_report(trade_log_path, out_csv, out_xlsx, quiet=quiet)
+    except Exception as e:
+        try:
+            print(f"⚠️ report 생성 실패: {e}")
+        except Exception:
+            print(f"\u26A0\uFE0F report \uC0DD\uC131 \uC2E4\uD328: {e}")
+        return None
+
+
+def main():
+    generate_report()
 
     print(f"✅ 요약 CSV 저장: {OUT_SUMMARY_CSV}")
     print(f"✅ 엑셀 저장: {OUT_XLSX} (openpyxl 있으면 생성)")

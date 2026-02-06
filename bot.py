@@ -7,6 +7,8 @@ from typing import Tuple
 
 import pyupbit
 import config
+import analyze
+import position_manager
 from indicators import check_filters, intraday_trend_ok, get_market_regime
 from market import load_keys, get_balance, get_top_tickers_by_value
 from strategy import calc_target, build_k_map
@@ -81,6 +83,9 @@ def verify_state_with_balance(upbit, state: dict):
         vol = float(get_balance(upbit, coin))
         if vol <= 0:
             s["holding"] = False
+            s["add_count"] = 0
+            s["invested_krw"] = 0.0
+            s["target_krw"] = 0.0
             fixed += 1
             continue
         if float(s.get("initial_volume", 0.0)) <= 0:
@@ -272,9 +277,8 @@ def run():
             # ✅ 신규 진입
             if allow_entry:
                 for ticker in universe:
-                    if holding_cnt >= max_holdings:
-                        break
-                    if state.get(ticker, {}).get("holding", False):
+                    holding = state.get(ticker, {}).get("holding", False)
+                    if holding_cnt >= max_holdings and not holding:
                         continue
                     if krw < per_trade_amt:
                         continue
@@ -282,6 +286,19 @@ def run():
                     until = cooldown_until.get(ticker)
                     if until is not None and now < until:
                         continue
+
+                    if holding:
+                        can_add, reason = position_manager.can_add_position(state, ticker, per_trade_amt)
+                        if not can_add:
+                            if reason:
+                                print(f"[BLOCK] {ticker} {reason}")
+                            continue
+                    else:
+                        can_new, reason = position_manager.can_open_new_position(state, ticker)
+                        if not can_new:
+                            if reason:
+                                print(f"[BLOCK] {ticker} {reason}")
+                            continue
 
                     # --- 일봉 필터 캐시 ---
                     cached = day_cache.get(ticker)
@@ -318,7 +335,8 @@ def run():
                         continue
 
                     if float(cur) >= target:
-                        print(f"💰 BUY {ticker} | Regime={regime} | KRW={per_trade_amt:,.0f}")
+                        action = "ADD" if holding else "BUY"
+                        print(f"[ENTRY] {action} {ticker} | Regime={regime} | KRW={per_trade_amt:,.0f}")
 
                         if config.REAL_ORDER:
                             upbit.buy_market_order(ticker, per_trade_amt)
@@ -332,17 +350,32 @@ def run():
                             initial_vol = float(per_trade_amt) / float(cur)
                             entry_price = float(cur)
 
-                        state[ticker] = {
-                            "holding": True,
-                            "entry": float(entry_price),  # ✅ 평균매수가 기반
-                            "peak": float(cur),
-                            "tp1": False,
-                            "tp2": False,
-                            "regime": regime,
-                            "initial_volume": float(initial_vol),
-                        }
-
-                        holding_cnt += 1
+                        if holding:
+                            if config.REAL_ORDER:
+                                position_manager.apply_add_snapshot(
+                                    state,
+                                    ticker,
+                                    float(initial_vol),
+                                    float(entry_price),
+                                    float(per_trade_amt),
+                                )
+                            else:
+                                add_vol = float(per_trade_amt) / float(cur)
+                                position_manager.apply_add_mock(
+                                    state,
+                                    ticker,
+                                    float(cur),
+                                    float(add_vol),
+                                    float(per_trade_amt),
+                                )
+                        else:
+                            state[ticker] = position_manager.init_position_state(
+                                float(entry_price),
+                                float(initial_vol),
+                                float(per_trade_amt),
+                                regime,
+                            )
+                            holding_cnt += 1
                         krw = float(get_balance(upbit, "KRW"))
 
                         # 즉시 저장
@@ -395,8 +428,21 @@ def run():
 
                     s["holding"] = False
 
+                    s["add_count"] = 0
+                    s["invested_krw"] = 0.0
+                    s["target_krw"] = 0.0
+
                     # 종료 즉시 저장
                     save_state(state, cooldown_until)
+
+                    if bool(getattr(config, "AUTO_REPORT", False)):
+                        analyze.maybe_generate_report(
+                            trade_log_path=config.TRADE_LOG_PATH,
+                            out_csv=analyze.OUT_SUMMARY_CSV,
+                            out_xlsx=analyze.OUT_XLSX,
+                            min_interval_sec=float(getattr(config, "AUTO_REPORT_MIN_INTERVAL_SEC", 30)),
+                            quiet=bool(getattr(config, "AUTO_REPORT_QUIET", True)),
+                        )
 
             # 주기 저장
             if (now - last_state_save).total_seconds() >= float(config.STATE_SAVE_INTERVAL_SEC):

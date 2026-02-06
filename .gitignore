@@ -1,0 +1,11 @@
+.env
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+trade_log.csv
+trading_summary.csv
+trading_summary.xlsx
+bot_state.json
+

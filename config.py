@@ -97,4 +97,16 @@ STATE_SAVE_INTERVAL_SEC = 30
 TRADE_LOG_PATH = "trade_log.csv"
 STATUS_PRINT_SEC = 60
 
+# ===== 자동 성적표 =====
+AUTO_REPORT = True
+AUTO_REPORT_MIN_INTERVAL_SEC = 30
+AUTO_REPORT_QUIET = True
+
+# ===== Equity Curve =====
+INITIAL_CAPITAL = 1_000_000
+
+# ===== Position / Split Entry =====
+POSITION_TARGET_MULT = 2.0
+POSITION_MAX_BUY_COUNT = 2
+
 

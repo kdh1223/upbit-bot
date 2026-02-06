@@ -1,5 +1,5 @@
 metric,value
-generated_at,2026-02-06 11:33:59
+generated_at,2026-02-06 12:59:53
 total,0
 wins,0
 losses,0
@@ -11,3 +11,7 @@ expectancy_pctp,0.0000
 gross_compound_pct,0.0000
 net_compound_pct,0.0000
 roundtrip_cost_pctp,0.1500
+mdd_pct,0.0000
+mdd_start,
+mdd_end,
+profit_factor,0.0000
