@@ -1,18 +1,12 @@
 # ===============================
-# 🎛 BOT 전략 모드 스위치
+# 🎛 BOT 전략 모드
 # ===============================
-# "TEST"  → 분봉 단독 테스트 전략만
-# "MAIN"  → 일봉 + 4시간 + 분봉 타이밍 실전 전략
-BOT_MODE = "TEST"     # 🔥 여기만 바꾸면 전략 전체 변경
-
-# ===============================
-# 🔒 주문 모드
-# ===============================
-REAL_ORDER = False    # TEST 단계는 반드시 False
+BOT_MODE = "TEST"      # TEST = 분봉 테스트
+REAL_ORDER = False     # 테스트니까 모의매매
 REQUIRE_ORDER_CONFIRM = True
 
 # ===============================
-# 📊 공통 기본 설정
+# 📊 기본 설정
 # ===============================
 TOP_N = 20
 REFRESH_MIN = 15
@@ -22,31 +16,43 @@ MIN_ORDER_KRW = 5_000
 # ===============================
 # 💰 비용
 # ===============================
+# 업비트 KRW 일반주문: 매수 0.05% + 매도 0.05% = 왕복 0.10%
+# 시장가 슬리피지 포함 보수적으로 0.15%
 COST_ROUNDTRIP_PCT = 0.0015  # 0.15%
 
 # ===============================
-# 🧠 시장 컨디션
+# 🚫 시장 차단 기능 OFF (테스트용)
 # ===============================
-USE_MARKET_REGIME = True
+USE_MARKET_REGIME = False  # 🔥 테스트 동안은 HALT로 막히지 않게 끔
+
+# ⚠️ 봇이 항상 참조하는 테이블이라 "반드시 존재"해야 함
+# (USE_MARKET_REGIME=False라도 코드가 읽을 수 있음)
+REGIME_INVEST_FRAC = {
+    "HALT": 1.0,   # 테스트에서는 막지 않도록 1.0
+    "LOW":  1.0,
+    "MID":  1.0,
+    "FULL": 1.0,
+}
+REGIME_HOLDINGS_MULT = {
+    "HALT": 1.0,   # 테스트에서는 0/0 방지
+    "LOW":  1.0,
+    "MID":  1.0,
+    "FULL": 1.0,
+}
+
+# (참고: MAIN 모드로 갈 때는 원래 값으로 되돌리면 됨)
+# REGIME_INVEST_FRAC = {"HALT":0.0,"LOW":0.30,"MID":0.70,"FULL":1.00}
+# REGIME_HOLDINGS_MULT = {"HALT":0.0,"LOW":0.50,"MID":0.70,"FULL":1.00}
+
+# ===============================
+# 🧠 시장 컨디션 지표 파라미터 (함수에서 참조할 수 있어 보관)
+# ===============================
 BTC_REGIME_FAST_MA = 5
 BTC_REGIME_SLOW_MA = 20
 BTC_REGIME_RSI_PERIOD = 14
 
-REGIME_INVEST_FRAC = {
-    "HALT": 0.0,
-    "LOW":  0.30,
-    "MID":  0.70,
-    "FULL": 1.00,
-}
-REGIME_HOLDINGS_MULT = {
-    "HALT": 0.0,
-    "LOW":  0.50,
-    "MID":  0.70,
-    "FULL": 1.00,
-}
-
 # ===============================
-# 🧱 포지션 크기 설정
+# 🧱 포지션 크기
 # ===============================
 TEST_EQUITY_CAP = 200_000
 TEST_PER_TRADE_KRW = 10_000
@@ -59,9 +65,9 @@ ACCOUNT_TIERS = [
 ]
 
 # ===============================
-# 🧨 손절 / 익절 / 트레일
+# 🧨 손절/익절/트레일
 # ===============================
-STOP_LOSS_PCT = 0.010
+STOP_LOSS_PCT = 0.010  # -1.0%
 
 TP_TABLE = {
     "LOW":  {"TP1_PCT": 0.006, "TP2_PCT": 0.012, "TRAIL_BACK_PCT": 0.005},
@@ -77,7 +83,7 @@ COOLDOWN_PROFIT_MIN = 10
 COOLDOWN_LOSS_MIN = 30
 
 # ===============================
-# 📈 변동성 돌파 (MAIN 모드 전용)
+# 📈 메인 전략 (테스트에서는 사실상 미사용이지만, 참조될 수 있어 유지)
 # ===============================
 K_DEFAULT = 0.5
 AUTO_K = True
@@ -91,9 +97,9 @@ K_CANDIDATES = [
 ]
 
 # ===============================
-# 📅 MAIN 전략 필터 (일봉 + 4시간 + 분봉)
+# ⏱ 4시간/분봉 보조 필터 (테스트에서는 OFF 권장)
 # ===============================
-USE_INTRADAY_FILTER = (BOT_MODE == "MAIN")
+USE_INTRADAY_FILTER = False
 INTRADAY_TREND_INTERVAL = "minute240"
 INTRADAY_FAST_MA = 20
 INTRADAY_SLOW_MA = 60
@@ -105,12 +111,14 @@ ENTRY_RSI_PERIOD = 14
 ENTRY_RSI_MAX = 70
 
 # ===============================
-# 🧪 TEST 전략 (분봉 단독)
+# 🧪 TEST 전략 (분봉)
 # ===============================
-USE_MINUTE_TEST_STRATEGY = (BOT_MODE == "TEST")
+USE_MINUTE_TEST_STRATEGY = True
 MINUTE_TEST_INTERVAL = "minute1"
-MINUTE_TEST_RSI_LOW = 48
-MINUTE_TEST_RSI_HIGH = 62
+
+# 🔥 신호 잘 나오게 완화(테스트용)
+MINUTE_TEST_RSI_LOW = 40
+MINUTE_TEST_RSI_HIGH = 70
 MINUTE_TEST_PER_TRADE_KRW = 10_000
 
 # ===============================
@@ -118,11 +126,12 @@ MINUTE_TEST_PER_TRADE_KRW = 10_000
 # ===============================
 STATE_FILE = "bot_state.json"
 STATE_SAVE_INTERVAL_SEC = 30
+
 TRADE_LOG_PATH = "trade_log.csv"
 STATUS_PRINT_SEC = 60
 
 # ===============================
-# 📊 자동 성적표
+# 📊 성적표
 # ===============================
 AUTO_REPORT = True
 AUTO_REPORT_MIN_INTERVAL_SEC = 30
@@ -143,9 +152,9 @@ DAY_FILTER_CACHE_SEC = 60
 INTRADAY_FILTER_CACHE_SEC = 30
 MINUTE_ENTRY_CACHE_SEC = 10
 
-# ===== 주문 재시도 =====
+# ===============================
+# 🔁 주문 재시도 + 주문 로그
+# ===============================
 ORDER_RETRY_MAX = 3
 ORDER_RETRY_SLEEP_SEC = 0.35
-
-# 주문 시도 로그
 ORDER_LOG_PATH = "order_log.csv"
