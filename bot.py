@@ -1,22 +1,22 @@
+# bot.py
 import time
 import datetime as dt
 import csv
 import os
-import json
-from typing import Tuple
 
 import pyupbit
 import config
-import analyze
-import position_manager
-from indicators import check_filters, intraday_trend_ok, get_market_regime
+
 from market import load_keys, get_balance, get_top_tickers_by_value
-from strategy import calc_target, build_k_map
-from risk import apply_risk_rules
+from strategy import build_k_map
+from indicators import get_market_regime, minute_test_signal
 
+from state_store import load_state, save_state, verify_state_with_balance
+from order_utils import wait_for_filled_snapshot
+from engine_entry import try_entries  # MAIN 모드에서만 사용
+from engine_manage import manage_positions
 
-def now_kst():
-    return dt.datetime.now()
+import position_manager
 
 
 def ensure_trade_log_header(path: str):
@@ -27,80 +27,10 @@ def ensure_trade_log_header(path: str):
         w.writerow(["time", "ticker", "entry_price", "exit_price", "pnl_pct", "reason", "regime"])
 
 
-def append_trade_log(path: str, row):
-    with open(path, "a", newline="", encoding="utf-8") as f:
-        csv.writer(f).writerow(row)
+def now_kst():
+    return dt.datetime.now()
 
 
-# -----------------------
-# 상태 저장/복구
-# -----------------------
-def save_state(state: dict, cooldown_until: dict):
-    try:
-        payload = {
-            "state": state,
-            "cooldown_until": {k: v.isoformat() for k, v in cooldown_until.items()},
-            "saved_at": now_kst().isoformat(),
-        }
-        with open(config.STATE_FILE, "w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        print(f"⚠️ state 저장 실패: {e}")
-
-
-def load_state():
-    if not os.path.exists(config.STATE_FILE):
-        return {}, {}
-    try:
-        with open(config.STATE_FILE, "r", encoding="utf-8") as f:
-            payload = json.load(f)
-        state = payload.get("state", {}) or {}
-        cd_raw = payload.get("cooldown_until", {}) or {}
-        cooldown_until = {}
-        for k, v in cd_raw.items():
-            try:
-                cooldown_until[k] = dt.datetime.fromisoformat(v)
-            except Exception:
-                pass
-        print(f"📂 state 복구: {len(state)}개")
-        return state, cooldown_until
-    except Exception as e:
-        print(f"⚠️ state 복구 실패: {e}")
-        return {}, {}
-
-
-def verify_state_with_balance(upbit, state: dict):
-    """
-    복구된 state가 실제 잔고와 맞는지 검증.
-    - holding=True인데 잔고가 0이면 holding False로 정리
-    - initial_volume 없거나 0이면 현재 잔고로 보정
-    """
-    fixed = 0
-    for ticker, s in list(state.items()):
-        if not s.get("holding"):
-            continue
-        coin = ticker.split("-")[1]
-        vol = float(get_balance(upbit, coin))
-        if vol <= 0:
-            s["holding"] = False
-            s["add_count"] = 0
-            s["invested_krw"] = 0.0
-            s["target_krw"] = 0.0
-            fixed += 1
-            continue
-        if float(s.get("initial_volume", 0.0)) <= 0:
-            s["initial_volume"] = vol
-            fixed += 1
-        if float(s.get("entry", 0.0)) <= 0:
-            # entry가 비어있으면 일단 0으로 두지 말고, 현재가/평단은 아래에서 다시 보정 가능
-            fixed += 1
-    if fixed:
-        print(f"🧹 state 보정 {fixed}건(잔고기반)")
-
-
-# -----------------------
-# 가격/체결 헬퍼
-# -----------------------
 def batch_get_prices(tickers):
     """
     pyupbit.get_current_price(list)-> dict
@@ -117,48 +47,6 @@ def batch_get_prices(tickers):
         return {}
 
 
-def get_coin_snapshot_from_balances(upbit, coin: str) -> Tuple[float, float]:
-    """
-    returns: (balance, avg_buy_price)
-    """
-    try:
-        bals = upbit.get_balances()
-        if not bals:
-            return 0.0, 0.0
-        for b in bals:
-            if b.get("currency") == coin:
-                bal = float(b.get("balance") or 0.0)
-                avg = float(b.get("avg_buy_price") or 0.0)
-                return bal, avg
-    except Exception:
-        pass
-    return 0.0, 0.0
-
-
-def wait_for_filled_snapshot(upbit, ticker: str, timeout_sec: float = 3.0, interval: float = 0.2) -> Tuple[float, float]:
-    """
-    실주문 직후:
-      - 코인 잔고(balance)
-      - 평균매수가(avg_buy_price)
-    둘 다 유효해질 때까지 대기 후 반환
-    """
-    coin = ticker.split("-")[1]
-    deadline = time.time() + timeout_sec
-    last_bal, last_avg = 0.0, 0.0
-
-    while time.time() < deadline:
-        bal, avg = get_coin_snapshot_from_balances(upbit, coin)
-        last_bal, last_avg = bal, avg
-        if bal > 0 and avg > 0:
-            return bal, avg
-        time.sleep(interval)
-
-    return float(last_bal), float(last_avg)
-
-
-# -----------------------
-# 포지션/시장 로직
-# -----------------------
 def estimate_equity(krw: float, state: dict, prices: dict, upbit) -> float:
     equity = float(krw)
     for ticker, s in state.items():
@@ -203,7 +91,88 @@ def apply_market_regime(equity, base_per_trade, base_max_holdings, regime: str):
     return float(per_trade_amt), int(eff_max_holdings)
 
 
+def try_minute_test_entries(
+    upbit,
+    now,
+    universe,
+    prices,
+    state,
+    cooldown_until,
+    max_holdings,
+    holding_cnt,
+    regime,
+    wait_for_filled_snapshot_fn,
+    save_state_fn,
+):
+    """
+    TEST 모드 전용:
+    - 일봉/4시간/돌파 로직/필터 전혀 안 씀
+    - indicators.minute_test_signal()만 보고 진입
+    - 쿨다운/보유수/잔고 체크만 적용
+    """
+    if not bool(getattr(config, "USE_MINUTE_TEST_STRATEGY", False)):
+        return False
+
+    test_krw = float(getattr(config, "MINUTE_TEST_PER_TRADE_KRW", 10_000))
+    if test_krw <= 0:
+        return False
+
+    if holding_cnt >= max_holdings:
+        return False
+
+    if prices.get("_krw", 0.0) < test_krw:
+        return False
+
+    for ticker in universe:
+        # 이미 보유면 스킵 (TEST는 분할매수 안 함)
+        holding = state.get(ticker, {}).get("holding", False)
+        if holding:
+            continue
+
+        # 쿨다운
+        until = cooldown_until.get(ticker)
+        if until is not None and now < until:
+            continue
+
+        cur = prices.get(ticker)
+        if cur is None or cur <= 0:
+            continue
+
+        # 신호
+        try:
+            sig = bool(minute_test_signal(ticker))
+        except Exception:
+            sig = False
+        if not sig:
+            continue
+
+        print(f"[TEST ENTRY] BUY {ticker} | Regime={regime} | KRW={test_krw:,.0f}")
+
+        if config.REAL_ORDER:
+            upbit.buy_market_order(ticker, test_krw)
+            filled_vol, avg_buy = wait_for_filled_snapshot_fn(upbit, ticker, timeout_sec=3.0, interval=0.2)
+            initial_vol = float(filled_vol) if filled_vol > 0 else (test_krw / float(cur))
+            entry_price = float(avg_buy) if avg_buy > 0 else float(cur)
+        else:
+            initial_vol = test_krw / float(cur)
+            entry_price = float(cur)
+
+        state[ticker] = position_manager.init_position_state(
+            float(entry_price),
+            float(initial_vol),
+            float(test_krw),
+            regime,
+        )
+        save_state_fn(state, cooldown_until)
+        time.sleep(0.15)
+        return True
+
+    return False
+
+
 def run():
+    BOT_MODE = str(getattr(config, "BOT_MODE", "MAIN")).upper().strip()
+
     access, secret = load_keys()
     upbit = pyupbit.Upbit(access, secret)
 
@@ -221,18 +190,22 @@ def run():
     state, cooldown_until = load_state()
     verify_state_with_balance(upbit, state)
 
+    # 유니버스/ K맵
     universe = get_top_tickers_by_value(config.TOP_N)
-    k_map = build_k_map(universe)
+
+    # MAIN에서만 K맵 필요(돌파 진입)
+    k_map = build_k_map(universe) if BOT_MODE == "MAIN" else {}
     last_refresh = now_kst()
 
     last_status = now_kst()
     last_state_save = now_kst()
 
-    # 필터 캐시: (ok, updated_at)
+    # 필터 캐시들 (MAIN 엔진에서만 사용)
     day_cache = {}
     intraday_cache = {}
+    minute_cache = {}
 
-    print("🤖 Bot start | REAL_ORDER=", config.REAL_ORDER)
+    print(f"🤖 Bot start | MODE={BOT_MODE} | REAL_ORDER={config.REAL_ORDER}")
 
     while True:
         try:
@@ -240,9 +213,9 @@ def run():
 
             # 유니버스 갱신
             if (now - last_refresh).total_seconds() >= config.REFRESH_MIN * 60:
-                print("\n🔄 Refresh universe + K map")
+                print("\n🔄 Refresh universe" + (" + K map" if BOT_MODE == "MAIN" else ""))
                 universe = get_top_tickers_by_value(config.TOP_N)
-                k_map = build_k_map(universe)
+                k_map = build_k_map(universe) if BOT_MODE == "MAIN" else {}
                 last_refresh = now
 
             # 시장 컨디션
@@ -258,11 +231,13 @@ def run():
             prices = batch_get_prices(price_targets)
 
             krw = float(get_balance(upbit, "KRW"))
+            prices["_krw"] = krw
+            prices["_caches"] = (day_cache, intraday_cache, minute_cache)
+
             equity = estimate_equity(krw, state, prices, upbit)
 
             base_per_trade, base_max_holdings = get_base_position_settings(equity)
             per_trade_amt, max_holdings = apply_market_regime(equity, base_per_trade, base_max_holdings, regime)
-
             holding_cnt = sum(1 for s in state.values() if s.get("holding"))
 
             if (now - last_status).total_seconds() >= config.STATUS_PRINT_SEC:
@@ -272,177 +247,53 @@ def run():
                 )
                 last_status = now
 
-            allow_entry = (max_holdings > 0 and per_trade_amt > 0)
-
             # ✅ 신규 진입
-            if allow_entry:
-                for ticker in universe:
-                    holding = state.get(ticker, {}).get("holding", False)
-                    if holding_cnt >= max_holdings and not holding:
-                        continue
-                    if krw < per_trade_amt:
-                        continue
+            if max_holdings > 0:
 
-                    until = cooldown_until.get(ticker)
-                    if until is not None and now < until:
-                        continue
-
-                    if holding:
-                        can_add, reason = position_manager.can_add_position(state, ticker, per_trade_amt)
-                        if not can_add:
-                            if reason:
-                                print(f"[BLOCK] {ticker} {reason}")
-                            continue
-                    else:
-                        can_new, reason = position_manager.can_open_new_position(state, ticker)
-                        if not can_new:
-                            if reason:
-                                print(f"[BLOCK] {ticker} {reason}")
-                            continue
-
-                    # --- 일봉 필터 캐시 ---
-                    cached = day_cache.get(ticker)
-                    if cached and (now - cached[1]).total_seconds() < config.DAY_FILTER_CACHE_SEC:
-                        ok = cached[0]
-                    else:
-                        ok = bool(check_filters(ticker))
-                        day_cache[ticker] = (ok, now)
-                    if not ok:
-                        continue
-
-                    # --- 시간봉 보조 필터 캐시 ---
-                    if config.USE_INTRADAY_FILTER:
-                        cached2 = intraday_cache.get(ticker)
-                        if cached2 and (now - cached2[1]).total_seconds() < config.INTRADAY_FILTER_CACHE_SEC:
-                            ok2 = cached2[0]
-                        else:
-                            try:
-                                ok2 = bool(intraday_trend_ok(ticker))
-                            except Exception:
-                                ok2 = True
-                            intraday_cache[ticker] = (ok2, now)
-                        if not ok2:
-                            continue
-
-                    cur = prices.get(ticker)
-                    if cur is None:
-                        continue
-
-                    k = float(k_map.get(ticker, config.K_DEFAULT))
-                    try:
-                        target = float(calc_target(ticker, k))
-                    except Exception:
-                        continue
-
-                    if float(cur) >= target:
-                        action = "ADD" if holding else "BUY"
-                        print(f"[ENTRY] {action} {ticker} | Regime={regime} | KRW={per_trade_amt:,.0f}")
-
-                        if config.REAL_ORDER:
-                            upbit.buy_market_order(ticker, per_trade_amt)
-
-                            # ✅ 체결/잔고 반영 기다려: 수량 + 평균매수가 확보
-                            filled_vol, avg_buy = wait_for_filled_snapshot(upbit, ticker, timeout_sec=3.0, interval=0.2)
-
-                            initial_vol = float(filled_vol) if filled_vol > 0 else (float(per_trade_amt) / float(cur))
-                            entry_price = float(avg_buy) if avg_buy > 0 else float(cur)
-                        else:
-                            initial_vol = float(per_trade_amt) / float(cur)
-                            entry_price = float(cur)
-
-                        if holding:
-                            if config.REAL_ORDER:
-                                position_manager.apply_add_snapshot(
-                                    state,
-                                    ticker,
-                                    float(initial_vol),
-                                    float(entry_price),
-                                    float(per_trade_amt),
-                                )
-                            else:
-                                add_vol = float(per_trade_amt) / float(cur)
-                                position_manager.apply_add_mock(
-                                    state,
-                                    ticker,
-                                    float(cur),
-                                    float(add_vol),
-                                    float(per_trade_amt),
-                                )
-                        else:
-                            state[ticker] = position_manager.init_position_state(
-                                float(entry_price),
-                                float(initial_vol),
-                                float(per_trade_amt),
-                                regime,
-                            )
-                            holding_cnt += 1
-                        krw = float(get_balance(upbit, "KRW"))
-
-                        # 즉시 저장
-                        save_state(state, cooldown_until)
-
-                        time.sleep(0.15)
-
-            # ✅ 포지션 관리(항상)
-            for ticker, s in list(state.items()):
-                if not s.get("holding", False):
-                    continue
-
-                cur = prices.get(ticker)
-                if cur is None:
-                    continue
-
-                def sell_fn(u, t, v):
-                    if v <= 0:
-                        return
-                    try:
-                        if config.REAL_ORDER:
-                            return u.sell_market_order(t, v)
-                        print(f"[MOCK SELL] {t} qty={v}")
-                    except Exception as e:
-                        print(f"⚠️ sell 실패: {t} qty={v} err={e}")
-
-                result = apply_risk_rules(upbit, ticker, s, float(cur), sell_fn)
-
-                if result.get("closed"):
-                    entry = float(s.get("entry", 0))
-                    exit_price = float(result.get("exit_price", float(cur)))
-                    pnl_pct = (exit_price / entry - 1.0) * 100.0 if entry > 0 else 0.0
-
-                    cd_min = config.COOLDOWN_PROFIT_MIN if pnl_pct > 0 else config.COOLDOWN_LOSS_MIN
-                    cooldown_until[ticker] = now + dt.timedelta(minutes=cd_min)
-
-                    print(f"📤 CLOSE {ticker} pnl={pnl_pct:+.2f}% | cooldown={cd_min}m | reason={result.get('reason')}")
-                    append_trade_log(
-                        config.TRADE_LOG_PATH,
-                        [
-                            now.strftime("%Y-%m-%d %H:%M:%S"),
-                            ticker,
-                            f"{entry:.6f}",
-                            f"{exit_price:.6f}",
-                            f"{pnl_pct:.2f}",
-                            result.get("reason", ""),
-                            s.get("regime", ""),
-                        ]
+                if BOT_MODE == "TEST":
+                    # TEST 모드는 per_trade_amt(메인 예산) 안 씀. MINUTE_TEST_PER_TRADE_KRW만 씀.
+                    _ = try_minute_test_entries(
+                        upbit=upbit,
+                        now=now,
+                        universe=universe,
+                        prices=prices,
+                        state=state,
+                        cooldown_until=cooldown_until,
+                        max_holdings=max_holdings,
+                        holding_cnt=holding_cnt,
+                        regime=regime,
+                        wait_for_filled_snapshot_fn=wait_for_filled_snapshot,
+                        save_state_fn=save_state,
                     )
 
-                    s["holding"] = False
-
-                    s["add_count"] = 0
-                    s["invested_krw"] = 0.0
-                    s["target_krw"] = 0.0
-
-                    # 종료 즉시 저장
-                    save_state(state, cooldown_until)
-
-                    if bool(getattr(config, "AUTO_REPORT", False)):
-                        analyze.maybe_generate_report(
-                            trade_log_path=config.TRADE_LOG_PATH,
-                            out_csv=analyze.OUT_SUMMARY_CSV,
-                            out_xlsx=analyze.OUT_XLSX,
-                            min_interval_sec=float(getattr(config, "AUTO_REPORT_MIN_INTERVAL_SEC", 30)),
-                            quiet=bool(getattr(config, "AUTO_REPORT_QUIET", True)),
+                else:
+                    # MAIN 모드: 기존 엔진 사용 (일봉 + 4시간 + 분봉타이밍 + 돌파)
+                    if per_trade_amt > 0:
+                        _ = try_entries(
+                            upbit=upbit,
+                            now=now,
+                            universe=universe,
+                            prices=prices,
+                            k_map=k_map,
+                            state=state,
+                            cooldown_until=cooldown_until,
+                            per_trade_amt=per_trade_amt,
+                            max_holdings=max_holdings,
+                            holding_cnt=holding_cnt,
+                            regime=regime,
+                            wait_for_filled_snapshot_fn=wait_for_filled_snapshot,
+                            save_state_fn=save_state,
                         )
+
+            # ✅ 포지션 관리(항상)
+            manage_positions(
+                upbit,
+                now,
+                state,
+                prices,
+                cooldown_until,
+                save_state_fn=save_state,
+            )
 
             # 주기 저장
             if (now - last_state_save).total_seconds() >= float(config.STATE_SAVE_INTERVAL_SEC):
@@ -458,3 +309,7 @@ def run():
         except Exception as e:
             print("에러:", e)
             time.sleep(1)
+
+
+if __name__ == "__main__":
+    run()
