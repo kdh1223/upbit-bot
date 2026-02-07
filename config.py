@@ -9,7 +9,7 @@ REQUIRE_ORDER_CONFIRM = True
 # 📊 기본 설정
 # ===============================
 TOP_N = 10
-UNIVERSE_SCAN_N = 40
+UNIVERSE_SCAN_N = 30
 SPIKE_CANDIDATE_MAX = 3
 SPIKE_RANK_SURGE_MIN = 5
 SPIKE_VOL_LOOKBACK_MIN = 5
@@ -69,13 +69,20 @@ BTC_REGIME_RSI_PERIOD = 14
 TEST_EQUITY_CAP = 200_000
 TEST_PER_TRADE_KRW = 30_000
 TEST_MAX_HOLDINGS = 2
+HOLDINGS_FIXED_UNTIL_EQUITY = 1_500_000
 
 ACCOUNT_TIERS = [
-    {"min_equity": 0, "max_holdings": 2},
-    {"min_equity": 500_000, "max_holdings": 3},
-    {"min_equity": 1_000_000, "max_holdings": 4},
-    {"min_equity": 3_000_000, "max_holdings": 5},
+    {"min_equity": 1_500_001, "max_holdings": 3},
+    {"min_equity": 3_000_000, "max_holdings": 4},
+    {"min_equity": 5_000_000, "max_holdings": 5},
 ]
+
+HOLDING_SCALE = {
+    2: 1.00,
+    3: 0.90,
+    4: 0.80,
+    5: 0.75,
+}
 
 # ===============================
 # 🧨 손절/익절/트레일
@@ -96,6 +103,54 @@ TP_TABLE = {
 
 TP1_SELL_RATIO = 0.50
 TP2_SELL_RATIO = 0.50
+TRAIL_BACK_PCT = 0.0070
+
+TP_SL_BY_HOLDINGS = {
+    2: {
+        "tp1": 0.008,
+        "tp2": 0.014,
+        "tp1_ratio": 0.50,
+        "tp2_ratio": 0.30,
+        "trail_back": 0.0070,
+        "stop_fixed": 0.016,
+        "daily_tp1_stop": 3,
+        "consec_loss_stop": 4,
+    },
+    3: {
+        "tp1": 0.007,
+        "tp2": 0.012,
+        "tp1_ratio": 0.55,
+        "tp2_ratio": 0.30,
+        "trail_back": 0.0075,
+        "stop_fixed": 0.014,
+        "daily_tp1_stop": 4,
+        "consec_loss_stop": 5,
+    },
+    4: {
+        "tp1": 0.006,
+        "tp2": 0.010,
+        "tp1_ratio": 0.60,
+        "tp2_ratio": 0.25,
+        "trail_back": 0.0080,
+        "stop_fixed": 0.012,
+        "daily_tp1_stop": 5,
+        "consec_loss_stop": 6,
+    },
+    5: {
+        "tp1": 0.0055,
+        "tp2": 0.009,
+        "tp1_ratio": 0.65,
+        "tp2_ratio": 0.20,
+        "trail_back": 0.0085,
+        "stop_fixed": 0.011,
+        "daily_tp1_stop": 6,
+        "consec_loss_stop": 7,
+    },
+}
+DAILY_TP1_STOP_COUNT = TP_SL_BY_HOLDINGS[2]["daily_tp1_stop"]
+CONSEC_LOSS_STOP_COUNT = TP_SL_BY_HOLDINGS[2]["consec_loss_stop"]
+DAILY_TP1_EXIT_LIMIT = 3
+CONSEC_LOSS_EXIT_LIMIT = 4
 
 COOLDOWN_PROFIT_MIN = 10
 COOLDOWN_LOSS_MIN = 30
@@ -127,11 +182,16 @@ ENTRY_FAST_MA = 5
 ENTRY_SLOW_MA = 20
 ENTRY_RSI_PERIOD = 14
 ENTRY_RSI_MAX = 70
-ENTRY_USE_VOLUME_FILTER = False
+ENTRY_RSI_CROSS_LEVEL = 45
+ENTRY_RSI_DELTA_MIN = 1.5
+ENTRY_MA_FAST = 5
+ENTRY_MA_SLOW = 20
+ENTRY_USE_VOLUME_FILTER = True
 ENTRY_VOL_MA_PERIOD = 20
-ENTRY_VOL_MULT = 1.1
+ENTRY_VOL_MULT = 1.2
+ENTRY_USE_BREAKOUT = True
+ENTRY_BREAKOUT_LOOKBACK = 20
 ENTRY_REQUIRE_RSI_UPTURN = False
-ENTRY_RSI_DELTA_MIN = 0.8
 
 # ===============================
 # 🧪 TEST 전략 (분봉)
@@ -152,6 +212,8 @@ MINUTE_TEST_USE_MA_FILTER = True
 MINUTE_TEST_MA_FAST = 5
 MINUTE_TEST_MA_SLOW = 20
 MINUTE_TEST_REQUIRE_PRICE_ABOVE_SLOW = True
+MINUTE_TEST_USE_BREAKOUT = True
+MINUTE_TEST_BREAKOUT_LOOKBACK = 20
 MINUTE_TEST_PER_TRADE_KRW = 30_000
 
 # ===============================

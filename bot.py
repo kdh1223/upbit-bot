@@ -3,6 +3,8 @@ import time
 import datetime as dt
 import csv
 import os
+import sys
+import copy
 from collections import Counter
 
 import pyupbit
@@ -25,6 +27,9 @@ from engine_entry import try_entries  # MAIN 모드에서만 사용
 from engine_manage import manage_positions
 
 import position_manager
+
+BASE_TP_TABLE = copy.deepcopy(getattr(config, "TP_TABLE", {}))
+BASE_STOP_LOSS_PCT = float(getattr(config, "STOP_LOSS_PCT", 0.01))
 
 
 def ensure_trade_log_header(path: str):
@@ -254,15 +259,20 @@ def update_momentum_stoploss_block(new_rows, now, momentum_entry_tickers: set, m
 
 
 def get_base_position_settings(equity):
-    if equity <= config.TEST_EQUITY_CAP:
-        return float(config.TEST_PER_TRADE_KRW), int(config.TEST_MAX_HOLDINGS)
+    fixed_until = float(getattr(config, "HOLDINGS_FIXED_UNTIL_EQUITY", 1_500_000))
+    if float(equity) <= fixed_until:
+        return float(config.TEST_PER_TRADE_KRW), 2
 
-    tier = config.ACCOUNT_TIERS[0]
-    for t in config.ACCOUNT_TIERS:
-        if equity >= t["min_equity"]:
+    tier = {"max_holdings": 3}
+    tiers = sorted((config.ACCOUNT_TIERS or []), key=lambda x: float(x.get("min_equity", 0)))
+    for t in tiers:
+        min_eq = float(t.get("min_equity", 0))
+        if min_eq <= fixed_until:
+            continue
+        if equity >= min_eq:
             tier = t
 
-    max_holdings = int(tier["max_holdings"])
+    max_holdings = int(tier.get("max_holdings", 3))
     per_trade_amt = float(equity) / max_holdings
     return per_trade_amt, max_holdings
 
@@ -279,6 +289,88 @@ def apply_market_regime(equity, base_per_trade, base_max_holdings, regime: str):
     per_trade_amt = total_invest_budget / eff_max_holdings
     per_trade_amt = max(float(config.MIN_ORDER_KRW), per_trade_amt)
     return float(per_trade_amt), int(eff_max_holdings)
+
+
+def _pick_holding_scale_key(max_holdings: int):
+    table = getattr(config, "HOLDING_SCALE", {}) or {}
+    keys = sorted([int(k) for k in table.keys() if str(k).isdigit() or isinstance(k, int)])
+    if not keys:
+        return 2
+
+    h = int(max_holdings)
+    if h <= keys[0]:
+        return keys[0]
+    if h >= keys[-1]:
+        return keys[-1]
+    for k in keys:
+        if h <= k:
+            return k
+    return keys[-1]
+
+
+def apply_runtime_params_by_holdings(max_holdings: int):
+    scale_table = getattr(config, "HOLDING_SCALE", {}) or {}
+    key = _pick_holding_scale_key(max_holdings)
+    scale = float(scale_table.get(key, 1.0))
+
+    base_table = BASE_TP_TABLE or copy.deepcopy(getattr(config, "TP_TABLE", {}))
+    scaled_table = {}
+    for regime, params in (base_table or {}).items():
+        tp1 = float(params.get("TP1_PCT", 0.0)) * scale
+        tp2 = float(params.get("TP2_PCT", 0.0)) * scale
+        trail_back = float(params.get("TRAIL_BACK_PCT", 0.0)) * scale
+        scaled_table[regime] = {
+            "TP1_PCT": tp1,
+            "TP2_PCT": tp2,
+            "TRAIL_BACK_PCT": trail_back,
+        }
+
+    if scaled_table:
+        config.TP_TABLE = scaled_table
+
+    # Keep ATR mode. This updates FIXED fallback only.
+    config.STOP_LOSS_PCT = float(BASE_STOP_LOSS_PCT) * scale
+    return key, scale
+
+
+def stop_bot_by_daily_limits(reason: str, day_tp1_count: int, consec_loss_count: int, persist_state_fn, state, cooldown_until):
+    print(f"[DAILY_STOP] reason={reason}")
+    print(f"[DAILY_STOP] stopping bot. tp1={day_tp1_count}, consec_loss={consec_loss_count}")
+    try:
+        persist_state_fn(state, cooldown_until)
+    finally:
+        sys.exit(0)
+
+
+def update_day_tp1_counter(state: dict, counted_tickers: set, day_tp1_count: int):
+    for ticker, s in state.items():
+        holding = bool(s.get("holding", False))
+        tp1 = bool(s.get("tp1", False))
+        if holding and tp1 and ticker not in counted_tickers:
+            counted_tickers.add(ticker)
+            day_tp1_count += 1
+            print(f"[TP1_COUNT] {day_tp1_count}")
+        if (not holding) or (not tp1):
+            counted_tickers.discard(ticker)
+    return int(day_tp1_count)
+
+
+def update_consec_loss_from_rows(new_rows, consec_loss: int):
+    for row in new_rows:
+        if len(row) < 5:
+            continue
+        try:
+            pnl_pct = float(row[4])
+        except Exception:
+            continue
+        prev = consec_loss
+        if pnl_pct < 0:
+            consec_loss += 1
+        else:
+            consec_loss = 0
+        if consec_loss != prev:
+            print(f"[LOSS_STREAK] {consec_loss}")
+    return int(consec_loss)
 
 
 def try_minute_test_entries(
@@ -458,7 +550,10 @@ def run():
     _, trade_log_consumed_rows = read_new_trade_rows(config.TRADE_LOG_PATH, 0)
 
     # 유니버스(Top10 + 모멘텀 후보) / K맵
-    raw_ranked = get_top_tickers_by_value(int(getattr(config, "UNIVERSE_SCAN_N", config.TOP_N)))
+    raw_ranked = get_top_tickers_by_value(
+        int(getattr(config, "UNIVERSE_SCAN_N", config.TOP_N)),
+        market_info=market_info,
+    )
     top_universe, momentum_candidates, inactive_universe, inactive_reasons, momentum_seen_at = build_rotation_universe(
         raw_ranked, market_info, momentum_seen_at, now_kst()
     )
@@ -482,6 +577,10 @@ def run():
 
     last_status = now_kst()
     last_state_save = now_kst()
+    trading_day = now_kst().date()
+    day_tp1_count = 0
+    consec_loss = 0
+    tp1_counted_tickers = {t for t, s in state.items() if bool(s.get("holding", False)) and bool(s.get("tp1", False))}
 
     # 필터 캐시들 (MAIN 엔진에서만 사용)
     day_cache = {}
@@ -497,7 +596,10 @@ def run():
             # 유니버스 갱신
             if (now - last_refresh).total_seconds() >= config.REFRESH_MIN * 60:
                 print("\n[REFRESH] universe" + (" + K map" if BOT_MODE == "MAIN" else ""))
-                raw_ranked = get_top_tickers_by_value(int(getattr(config, "UNIVERSE_SCAN_N", config.TOP_N)))
+                raw_ranked = get_top_tickers_by_value(
+                    int(getattr(config, "UNIVERSE_SCAN_N", config.TOP_N)),
+                    market_info=market_info,
+                )
                 top_universe, momentum_candidates, inactive_universe, inactive_reasons, momentum_seen_at = build_rotation_universe(
                     raw_ranked, market_info, momentum_seen_at, now
                 )
@@ -516,6 +618,15 @@ def run():
                     momentum_seen_at.pop(ticker, None)
             momentum_candidates = [t for t in momentum_candidates if t in momentum_seen_at]
             universe = _dedupe_keep_order(top_universe + momentum_candidates)
+
+            today = now.date()
+            if today != trading_day:
+                trading_day = today
+                day_tp1_count = 0
+                consec_loss = 0
+                tp1_counted_tickers = {
+                    t for t, s in state.items() if bool(s.get("holding", False)) and bool(s.get("tp1", False))
+                }
 
             # 시장 컨디션
             regime = "FULL"
@@ -541,6 +652,16 @@ def run():
 
             base_per_trade, base_max_holdings = get_base_position_settings(equity)
             per_trade_amt, max_holdings = apply_market_regime(equity, base_per_trade, base_max_holdings, regime)
+            active_holdings_key, active_scale = apply_runtime_params_by_holdings(max_holdings)
+            day_tp1_count = update_day_tp1_counter(state, tp1_counted_tickers, day_tp1_count)
+
+            tp1_limit = int(getattr(config, "DAILY_TP1_EXIT_LIMIT", 3))
+            loss_limit = int(getattr(config, "CONSEC_LOSS_EXIT_LIMIT", 4))
+            if day_tp1_count >= tp1_limit:
+                stop_bot_by_daily_limits("TP1_LIMIT", day_tp1_count, consec_loss, persist_state, state, cooldown_until)
+            if consec_loss >= loss_limit:
+                stop_bot_by_daily_limits("LOSS_STREAK", day_tp1_count, consec_loss, persist_state, state, cooldown_until)
+
             holding_cnt = sum(1 for s in state.values() if s.get("holding"))
             entry_universe, top_limit, momentum_limit, top_holdings, momentum_holdings = build_entry_universe(
                 state, top_universe, momentum_candidates, max_holdings, now, momentum_stoploss_until
@@ -550,7 +671,9 @@ def run():
                 print(
                     f"[STATUS] Regime={regime} | Equity~{equity:,.0f} | "
                     f"PerTrade~{per_trade_amt:,.0f} | Holding={holding_cnt}/{max_holdings} | "
-                    f"Top={top_holdings}/{top_limit} Momentum={momentum_holdings}/{momentum_limit}"
+                    f"Top={top_holdings}/{top_limit} Momentum={momentum_holdings}/{momentum_limit} | "
+                    f"HKey={active_holdings_key} HScale={active_scale:.2f} "
+                    f"TP1Day={day_tp1_count} LossSeq={consec_loss}"
                 )
                 last_status = now
 
@@ -610,6 +733,9 @@ def run():
                 inactive_tickers=inactive_tickers,
                 inactive_positions=inactive_positions,
             )
+            day_tp1_count = update_day_tp1_counter(state, tp1_counted_tickers, day_tp1_count)
+            if day_tp1_count >= tp1_limit:
+                stop_bot_by_daily_limits("TP1_LIMIT", day_tp1_count, consec_loss, persist_state, state, cooldown_until)
 
             top_set = set(top_universe)
             for ticker, s in state.items():
@@ -620,6 +746,9 @@ def run():
 
             new_rows, trade_log_consumed_rows = read_new_trade_rows(config.TRADE_LOG_PATH, trade_log_consumed_rows)
             update_momentum_stoploss_block(new_rows, now, momentum_entry_tickers, momentum_stoploss_until)
+            consec_loss = update_consec_loss_from_rows(new_rows, consec_loss)
+            if consec_loss >= loss_limit:
+                stop_bot_by_daily_limits("LOSS_STREAK", day_tp1_count, consec_loss, persist_state, state, cooldown_until)
 
             # 주기 저장
             if (now - last_state_save).total_seconds() >= float(config.STATE_SAVE_INTERVAL_SEC):

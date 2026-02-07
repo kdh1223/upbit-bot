@@ -50,8 +50,7 @@ def get_atr(df, period=14):
 
 def check_filters(ticker):
     """
-    종목(일봉) 필터: MA5>MA20 & RSI<70
-    (기존 유지: '일봉 필터' 역할)
+    Daily filter: MA5 > MA20 and RSI < 70.
     """
     df = pyupbit.get_ohlcv(ticker, interval="day", count=40)
     if df is None or len(df) < 25:
@@ -64,13 +63,12 @@ def check_filters(ticker):
 
 def intraday_trend_ok(ticker):
     """
-    4시간봉 보조 필터: MA20>MA60
-    (기존 minute60 → 우리가 하기로 한 minute240로 변경)
+    Intraday trend filter: MA(fast) > MA(slow) on configured interval.
     """
     interval = getattr(config, "INTRADAY_TREND_INTERVAL", "minute240")
     df = pyupbit.get_ohlcv(ticker, interval=interval, count=120)
     if df is None or len(df) < (config.INTRADAY_SLOW_MA + 5):
-        return True  # 데이터 부족이면 막지 않음(과도한 차단 방지)
+        return True  # Do not block entry on missing intraday data.
 
     ma_fast = df["close"].rolling(config.INTRADAY_FAST_MA).mean()
     ma_slow = df["close"].rolling(config.INTRADAY_SLOW_MA).mean()
@@ -79,14 +77,14 @@ def intraday_trend_ok(ticker):
 
 def minute_entry_ok(ticker):
     """
-    분봉(ENTRY_MINUTE_INTERVAL) 진입 타이밍 필터:
+    Minute filter for common entry timing:
     - MA(ENTRY_FAST) > MA(ENTRY_SLOW)
-    - RSI < ENTRY_RSI_MAX (과열 회피)
+    - RSI < ENTRY_RSI_MAX
     """
     interval = getattr(config, "ENTRY_MINUTE_INTERVAL", "minute5")
     df = pyupbit.get_ohlcv(ticker, interval=interval, count=80)
     if df is None or len(df) < 30:
-        return True  # 데이터 부족이면 막지 않음
+        return True  # Do not block entry on missing minute data.
 
     ma_fast = get_sma(df["close"], getattr(config, "ENTRY_FAST_MA", 5))
     ma_slow = get_sma(df["close"], getattr(config, "ENTRY_SLOW_MA", 20))
@@ -134,12 +132,16 @@ def minute_entry_ok(ticker):
 
 def minute_test_signal(ticker):
     """
-    분봉 단독 테스트 신호(옵션):
-    RSI가 중립 구간이면 진입 시도
+    강화 분봉 실전형 테스트 신호(1분봉)
+    - RSI 상승 전환 + 상승폭
+    - 녹색 캔들 확인(옵션)
+    - MA 정렬 + 종가가 MA_slow 위(옵션)
+    - 거래량 증가(옵션)
+    - 최근 구조(고점) 돌파(옵션)
     """
     interval = getattr(config, "MINUTE_TEST_INTERVAL", "minute1")
     df = pyupbit.get_ohlcv(ticker, interval=interval, count=80)
-    if df is None or len(df) < 30:
+    if df is None or len(df) < 35:
         return False
 
     debug_reject = bool(getattr(config, "DEBUG_ENTRY_REJECT", False))
@@ -154,87 +156,102 @@ def minute_test_signal(ticker):
     if rsi_now is None:
         return reject("rsi_now_nan")
 
-    rsi_prev = None
     try:
         rsi_prev = float(rsi.iloc[-2])
         if rsi_prev != rsi_prev:
-            rsi_prev = None
+            return reject("rsi_prev_nan")
     except Exception:
-        rsi_prev = None
-    if rsi_prev is None:
         return reject("rsi_prev_nan")
 
-    lo = float(getattr(config, "MINUTE_TEST_RSI_LOW", 45))
-    hi = float(getattr(config, "MINUTE_TEST_RSI_HIGH", 60))
-    if not (lo < rsi_now < hi):
-        return reject("rsi_band")
+    rsi_low = float(getattr(config, "MINUTE_TEST_RSI_LOW", 45))
+    rsi_high = float(getattr(config, "MINUTE_TEST_RSI_HIGH", 60))
+    use_rsi_cross = bool(getattr(config, "MINUTE_TEST_RSI_CROSS", True))
 
-    use_cross = bool(getattr(config, "MINUTE_TEST_RSI_CROSS", True))
-    if use_cross and not (rsi_prev < lo and rsi_now > lo):
-        return reject("rsi_cross")
+    if use_rsi_cross:
+        if not (rsi_prev < rsi_low and rsi_now > rsi_low):
+            return reject("rsi_cross")
+    else:
+        if not (rsi_low < rsi_now < rsi_high):
+            return reject("rsi_band")
 
     delta = rsi_now - rsi_prev
     delta_min = float(getattr(config, "MINUTE_TEST_RSI_DELTA_MIN", 1.5))
     if delta < delta_min:
         return reject("rsi_delta")
 
-    open_now = safe_last(df["open"])
     close_now = safe_last(df["close"])
-    if open_now is None or close_now is None:
-        return reject("candle_nan")
+    if close_now is None:
+        return reject("close_nan")
 
-    if bool(getattr(config, "MINUTE_TEST_REQUIRE_GREEN_CANDLE", True)):
+    require_green = bool(getattr(config, "MINUTE_TEST_REQUIRE_GREEN_CANDLE", True))
+    if require_green:
+        open_now = safe_last(df["open"])
+        if open_now is None:
+            return reject("open_nan")
         if not (close_now > open_now):
-            return reject("not_green_candle")
+            return reject("not_green")
 
     ma_fast_now = None
     ma_slow_now = None
-    if bool(getattr(config, "MINUTE_TEST_USE_MA_FILTER", True)):
-        ma_fast = get_sma(df["close"], int(getattr(config, "MINUTE_TEST_MA_FAST", 5)))
-        ma_slow = get_sma(df["close"], int(getattr(config, "MINUTE_TEST_MA_SLOW", 20)))
-        ma_fast_now = safe_last(ma_fast)
-        ma_slow_now = safe_last(ma_slow)
+    use_ma_filter = bool(getattr(config, "MINUTE_TEST_USE_MA_FILTER", True))
+    if use_ma_filter:
+        ma_fast_period = int(getattr(config, "MINUTE_TEST_MA_FAST", 5))
+        ma_slow_period = int(getattr(config, "MINUTE_TEST_MA_SLOW", 20))
+        ma_fast_now = safe_last(get_sma(df["close"], ma_fast_period))
+        ma_slow_now = safe_last(get_sma(df["close"], ma_slow_period))
         if ma_fast_now is None or ma_slow_now is None:
             return reject("ma_nan")
         if not (ma_fast_now > ma_slow_now):
             return reject("ma_align")
         if bool(getattr(config, "MINUTE_TEST_REQUIRE_PRICE_ABOVE_SLOW", True)):
             if not (close_now > ma_slow_now):
-                return reject("price_below_slow")
+                return reject("price_below_ma_slow")
 
     vol_now = None
     vma_now = None
     vol_mult = float(getattr(config, "MINUTE_TEST_VOL_MULT", 1.2))
-    if bool(getattr(config, "MINUTE_TEST_USE_VOLUME_FILTER", True)):
+    use_volume_filter = bool(getattr(config, "MINUTE_TEST_USE_VOLUME_FILTER", True))
+    if use_volume_filter:
         if "volume" not in df.columns:
             return reject("no_volume")
         vol_now = safe_last(df["volume"])
-        vma_now = safe_last(volume_ma(df, int(getattr(config, "MINUTE_TEST_VOL_MA_PERIOD", 20))))
+        vol_ma_period = int(getattr(config, "MINUTE_TEST_VOL_MA_PERIOD", 20))
+        vma_now = safe_last(volume_ma(df, vol_ma_period))
         if vol_now is None or vma_now is None or vma_now <= 0:
             return reject("volume_nan")
         if not (vol_now > vma_now * vol_mult):
             return reject("volume_low")
 
-    if bool(getattr(config, "DEBUG_TRADE_FLOW", False)):
-        if ma_fast_now is None:
-            ma_fast_now = safe_last(get_sma(df["close"], int(getattr(config, "MINUTE_TEST_MA_FAST", 5))))
-        if ma_slow_now is None:
-            ma_slow_now = safe_last(get_sma(df["close"], int(getattr(config, "MINUTE_TEST_MA_SLOW", 20))))
-        if vol_now is None and "volume" in df.columns:
-            vol_now = safe_last(df["volume"])
-        if vma_now is None and "volume" in df.columns:
-            vma_now = safe_last(volume_ma(df, int(getattr(config, "MINUTE_TEST_VOL_MA_PERIOD", 20))))
+    recent_high = None
+    use_breakout = bool(getattr(config, "MINUTE_TEST_USE_BREAKOUT", getattr(config, "ENTRY_USE_BREAKOUT", True)))
+    if use_breakout:
+        lookback = int(
+            getattr(
+                config,
+                "MINUTE_TEST_BREAKOUT_LOOKBACK",
+                getattr(config, "ENTRY_BREAKOUT_LOOKBACK", 20),
+            )
+        )
+        lookback = max(5, lookback)
+        if len(df) < (lookback + 2):
+            return reject("breakout_short")
+        recent_high = safe_last(df["close"].rolling(lookback).max().iloc[:-1])
+        if recent_high is None:
+            return reject("recent_high_nan")
+        if not (close_now > recent_high):
+            return reject("breakout_fail")
 
-        ma_fast_txt = f"{ma_fast_now:.6f}" if ma_fast_now is not None else "na"
-        ma_slow_txt = f"{ma_slow_now:.6f}" if ma_slow_now is not None else "na"
-        vol_txt = f"{vol_now:.6f}" if vol_now is not None else "na"
-        vma_txt = f"{vma_now:.6f}" if vma_now is not None else "na"
+    if bool(getattr(config, "DEBUG_TRADE_FLOW", False)):
+        ma_fast_txt = f"{ma_fast_now:.6f}" if ma_fast_now is not None else "off"
+        ma_slow_txt = f"{ma_slow_now:.6f}" if ma_slow_now is not None else "off"
+        vol_txt = f"{vol_now:.6f}" if vol_now is not None else "off"
+        vma_txt = f"{vma_now:.6f}" if vma_now is not None else "off"
+        recent_high_txt = f"{recent_high:.6f}" if recent_high is not None else "off"
         print(
             f"[진입근거_분봉TEST] {ticker} "
-            f"rsi_prev={rsi_prev:.2f} rsi_now={rsi_now:.2f} "
-            f"lo={lo:.2f} hi={hi:.2f} d={delta:.2f} "
+            f"rsi_prev={rsi_prev:.2f} rsi_now={rsi_now:.2f} lo={rsi_low:.2f} hi={rsi_high:.2f} d={delta:.2f} "
             f"ma_fast={ma_fast_txt} ma_slow={ma_slow_txt} "
-            f"vol={vol_txt} vma={vma_txt} mult={vol_mult:.2f}"
+            f"vol={vol_txt} vma={vma_txt} mult={vol_mult:.2f} recent_high={recent_high_txt} close={close_now:.6f}"
         )
 
     return True
@@ -274,12 +291,12 @@ def detect_momentum_candidate(ticker):
 
 def get_market_regime():
     """
-    BTC 일봉 기준으로 시장 컨디션을 4단계로 분류:
+    Classify market regime from BTC daily trend:
     - HALT / LOW / MID / FULL
     """
     df = pyupbit.get_ohlcv("KRW-BTC", interval="day", count=60)
     if df is None or len(df) < 30:
-        return "MID"  # 데이터 부족 시 너무 보수적으로 막지 않음
+        return "MID"  # Conservative fallback on missing data.
 
     ma_fast = df["close"].rolling(config.BTC_REGIME_FAST_MA).mean().iloc[-1]
     ma_slow = df["close"].rolling(config.BTC_REGIME_SLOW_MA).mean().iloc[-1]
@@ -287,13 +304,14 @@ def get_market_regime():
 
     uptrend = ma_fast >= ma_slow
 
-    # 🔻 하락 추세
+    # Downtrend
     if not uptrend:
         if rsi < 45:
             return "HALT"
         return "LOW"
 
-    # 🔺 상승 추세
+    # Uptrend
     if rsi >= 60:
         return "FULL"
     return "MID"
+
