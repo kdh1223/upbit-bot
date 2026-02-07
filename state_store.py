@@ -29,7 +29,8 @@ def load_state():
         return {}, {}
 
     try:
-        with open(config.STATE_FILE, "r", encoding="utf-8") as f:
+        # Accept both plain UTF-8 and UTF-8 with BOM.
+        with open(config.STATE_FILE, "r", encoding="utf-8-sig") as f:
             payload = json.load(f)
 
         state = payload.get("state", {}) or {}
