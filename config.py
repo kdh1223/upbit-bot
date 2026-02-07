@@ -8,11 +8,22 @@ REQUIRE_ORDER_CONFIRM = True
 # ===============================
 # 📊 기본 설정
 # ===============================
-TOP_N = 20
+TOP_N = 10
+UNIVERSE_SCAN_N = 40
+SPIKE_CANDIDATE_MAX = 3
+SPIKE_RANK_SURGE_MIN = 5
+SPIKE_VOL_LOOKBACK_MIN = 5
+SPIKE_VOL_MULT = 1.2
+SPIKE_RSI_CROSS_LEVEL = 50
+SPIKE_MA_FAST = 5
+SPIKE_MA_SLOW = 20
 REFRESH_MIN = 15
 POLL_SEC = 1
 MIN_ORDER_KRW = 5_000
 EXCLUDE_CAUTION = True
+DEBUG_STOP_PCT = False
+DEBUG_TRADE_FLOW = True
+DEBUG_ENTRY_REJECT = False
 
 # ===============================
 # 💰 비용
@@ -56,24 +67,30 @@ BTC_REGIME_RSI_PERIOD = 14
 # 🧱 포지션 크기
 # ===============================
 TEST_EQUITY_CAP = 200_000
-TEST_PER_TRADE_KRW = 10_000
-TEST_MAX_HOLDINGS = 1
+TEST_PER_TRADE_KRW = 30_000
+TEST_MAX_HOLDINGS = 2
 
 ACCOUNT_TIERS = [
-    {"min_equity": 1_000_000, "max_holdings": 2},
-    {"min_equity": 2_000_000, "max_holdings": 3},
-    {"min_equity": 5_000_000, "max_holdings": 5},
+    {"min_equity": 0, "max_holdings": 2},
+    {"min_equity": 500_000, "max_holdings": 3},
+    {"min_equity": 1_000_000, "max_holdings": 4},
+    {"min_equity": 3_000_000, "max_holdings": 5},
 ]
 
 # ===============================
 # 🧨 손절/익절/트레일
 # ===============================
 STOP_LOSS_PCT = 0.010  # -1.0%
+STOP_LOSS_MODE = "ATR"  # "FIXED" or "ATR"
+STOP_LOSS_ATR_PERIOD = 14
+STOP_LOSS_ATR_MULT_TABLE = {"LOW": 1.1, "MID": 1.3, "FULL": 1.5, "HALT": 1.0}
+STOP_LOSS_MIN_PCT = 0.010
+STOP_LOSS_MAX_PCT = 0.025
 
 TP_TABLE = {
-    "LOW":  {"TP1_PCT": 0.006, "TP2_PCT": 0.012, "TRAIL_BACK_PCT": 0.005},
-    "MID":  {"TP1_PCT": 0.010, "TP2_PCT": 0.020, "TRAIL_BACK_PCT": 0.006},
-    "FULL": {"TP1_PCT": 0.015, "TP2_PCT": 0.030, "TRAIL_BACK_PCT": 0.010},
+    "LOW":  {"TP1_PCT": 0.005, "TP2_PCT": 0.010, "TRAIL_BACK_PCT": 0.004},
+    "MID":  {"TP1_PCT": 0.008, "TP2_PCT": 0.016, "TRAIL_BACK_PCT": 0.005},
+    "FULL": {"TP1_PCT": 0.012, "TP2_PCT": 0.025, "TRAIL_BACK_PCT": 0.007},
     "HALT": {"TP1_PCT": 0.0,   "TP2_PCT": 0.0,   "TRAIL_BACK_PCT": 0.0},
 }
 
@@ -110,6 +127,11 @@ ENTRY_FAST_MA = 5
 ENTRY_SLOW_MA = 20
 ENTRY_RSI_PERIOD = 14
 ENTRY_RSI_MAX = 70
+ENTRY_USE_VOLUME_FILTER = False
+ENTRY_VOL_MA_PERIOD = 20
+ENTRY_VOL_MULT = 1.1
+ENTRY_REQUIRE_RSI_UPTURN = False
+ENTRY_RSI_DELTA_MIN = 0.8
 
 # ===============================
 # 🧪 TEST 전략 (분봉)
@@ -118,9 +140,19 @@ USE_MINUTE_TEST_STRATEGY = True
 MINUTE_TEST_INTERVAL = "minute1"
 
 # 🔥 신호 잘 나오게 완화(테스트용)
-MINUTE_TEST_RSI_LOW = 40
-MINUTE_TEST_RSI_HIGH = 70
-MINUTE_TEST_PER_TRADE_KRW = 10_000
+MINUTE_TEST_RSI_LOW = 45
+MINUTE_TEST_RSI_HIGH = 60
+MINUTE_TEST_RSI_CROSS = True
+MINUTE_TEST_RSI_DELTA_MIN = 1.5
+MINUTE_TEST_USE_VOLUME_FILTER = True
+MINUTE_TEST_VOL_MA_PERIOD = 20
+MINUTE_TEST_VOL_MULT = 1.2
+MINUTE_TEST_REQUIRE_GREEN_CANDLE = True
+MINUTE_TEST_USE_MA_FILTER = True
+MINUTE_TEST_MA_FAST = 5
+MINUTE_TEST_MA_SLOW = 20
+MINUTE_TEST_REQUIRE_PRICE_ABOVE_SLOW = True
+MINUTE_TEST_PER_TRADE_KRW = 30_000
 
 # ===============================
 # 📂 상태/로그

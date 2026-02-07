@@ -169,6 +169,8 @@ def try_entries(
                 state[ticker] = position_manager.init_position_state(
                     float(entry_price), float(initial_vol), float(per_trade_amt), regime
                 )
+                momentum_candidates = set(prices.get("_momentum_candidates", set()) or set())
+                state[ticker]["entry_bucket"] = "MOMENTUM" if ticker in momentum_candidates else "TOP10"
                 holding_cnt += 1
 
             save_state_fn(state, cooldown_until)
@@ -240,6 +242,8 @@ def try_entries(
                     float(test_krw),
                     regime,
                 )
+                momentum_candidates = set(prices.get("_momentum_candidates", set()) or set())
+                state[ticker]["entry_bucket"] = "MOMENTUM" if ticker in momentum_candidates else "TOP10"
                 save_state_fn(state, cooldown_until)
                 return True
         except Exception:
