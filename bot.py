@@ -3,11 +3,19 @@ import time
 import datetime as dt
 import csv
 import os
+from collections import Counter
 
 import pyupbit
 import config
 
-from market import load_keys, get_balance, get_top_tickers_by_value
+from market import (
+    load_keys,
+    get_balance,
+    get_top_tickers_by_value,
+    get_upbit_krw_markets,
+    filter_tradeable_tickers,
+    sanitize_positions,
+)
 from strategy import build_k_map
 from indicators import get_market_regime, minute_test_signal
 
@@ -78,20 +86,32 @@ def batch_get_prices(tickers):
         return {}
 
 
-def estimate_equity(krw: float, state: dict, prices: dict, upbit) -> float:
+def estimate_equity(krw: float, state: dict, prices: dict, upbit, inactive_positions: dict = None) -> float:
     equity = float(krw)
-    for ticker, s in state.items():
-        if not s.get("holding"):
-            continue
-        coin = ticker.split("-")[1]
-        vol = float(get_balance(upbit, coin))
-        if vol <= 0:
-            continue
-        p = prices.get(ticker)
-        if p is None:
-            continue
-        equity += vol * float(p)
+    for positions in (state, inactive_positions or {}):
+        for ticker, s in positions.items():
+            if not s.get("holding"):
+                continue
+            coin = ticker.split("-")[1]
+            vol = float(get_balance(upbit, coin))
+            if vol <= 0:
+                continue
+            p = prices.get(ticker)
+            if p is None:
+                continue
+            equity += vol * float(p)
     return float(equity)
+
+
+def print_filter_summary(active, inactive, reasons):
+    print(f"[FILTER] active tickers: {len(active)} / inactive tickers: {len(inactive)}")
+    if not inactive:
+        print("[FILTER] top inactive reasons: none")
+        return
+
+    c = Counter([reasons.get(t, "UNKNOWN") for t in inactive])
+    top = ", ".join([f"{k}:{v}" for k, v in c.most_common(5)])
+    print(f"[FILTER] top inactive reasons: {top}")
 
 
 def get_base_position_settings(equity):
@@ -134,6 +154,8 @@ def try_minute_test_entries(
     regime,
     wait_for_filled_snapshot_fn,
     save_state_fn,
+    inactive_tickers=None,
+    inactive_positions=None,
 ):
     """
     TEST 모드 전용:
@@ -154,7 +176,13 @@ def try_minute_test_entries(
     if prices.get("_krw", 0.0) < test_krw:
         return False
 
+    inactive_tickers = set(inactive_tickers or [])
+    inactive_positions = inactive_positions or {}
+
     for ticker in universe:
+        if ticker in inactive_tickers or ticker in inactive_positions:
+            continue
+
         # 이미 보유면 스킵 (TEST는 분할매수 안 함)
         holding = state.get(ticker, {}).get("holding", False)
         if holding:
@@ -180,6 +208,9 @@ def try_minute_test_entries(
         print(f"[TEST ENTRY] BUY {ticker} | Regime={regime} | KRW={test_krw:,.0f}")
 
         if config.REAL_ORDER:
+            if ticker in inactive_tickers or ticker in inactive_positions:
+                print(f"[BLOCK] inactive ticker buy blocked(TEST): {ticker}")
+                continue
             upbit.buy_market_order(ticker, test_krw)
             filled_vol, avg_buy = wait_for_filled_snapshot_fn(upbit, ticker, timeout_sec=3.0, interval=0.2)
             initial_vol = float(filled_vol) if filled_vol > 0 else (test_krw / float(cur))
@@ -218,11 +249,36 @@ def run():
     ensure_trade_log_header(config.TRADE_LOG_PATH)
 
     # state 복구
-    state, cooldown_until = load_state()
+    state, cooldown_until, inactive_positions = load_state()
     verify_state_with_balance(upbit, state)
 
+    # 마켓 정보 로딩 (실패 시 스테이블/사용자 제외만 적용)
+    market_info = get_upbit_krw_markets()
+    if market_info:
+        print(f"[FILTER] loaded KRW market info: {len(market_info)}")
+    else:
+        print("[FILTER] market info unavailable. apply stable/user exclusions only")
+
+    # 거래 불가 코인 포지션 분리
+    state, moved_inactive, sanitize_repaired, moved_count = sanitize_positions(state, market_info)
+    if moved_inactive:
+        inactive_positions.update(moved_inactive)
+    if sanitize_repaired:
+        print(f"[STATE] sanitize repaired fields: {sanitize_repaired}")
+    if moved_count:
+        print(f"[STATE] moved count: {moved_count}")
+
+    def persist_state(state_ref, cooldown_ref):
+        save_state(state_ref, cooldown_ref, inactive_positions=inactive_positions)
+
+    if moved_count:
+        persist_state(state, cooldown_until)
+
     # 유니버스/ K맵
-    universe = get_top_tickers_by_value(config.TOP_N)
+    raw_universe = get_top_tickers_by_value(config.TOP_N)
+    universe, inactive_universe, inactive_reasons = filter_tradeable_tickers(raw_universe, market_info)
+    inactive_tickers = set(inactive_universe) | set(inactive_positions.keys())
+    print_filter_summary(universe, inactive_universe, inactive_reasons)
 
     # MAIN에서만 K맵 필요(돌파 진입)
     k_map = build_k_map(universe) if BOT_MODE == "MAIN" else {}
@@ -245,7 +301,10 @@ def run():
             # 유니버스 갱신
             if (now - last_refresh).total_seconds() >= config.REFRESH_MIN * 60:
                 print("\n[REFRESH] universe" + (" + K map" if BOT_MODE == "MAIN" else ""))
-                universe = get_top_tickers_by_value(config.TOP_N)
+                raw_universe = get_top_tickers_by_value(config.TOP_N)
+                universe, inactive_universe, inactive_reasons = filter_tradeable_tickers(raw_universe, market_info)
+                inactive_tickers = set(inactive_universe) | set(inactive_positions.keys())
+                print_filter_summary(universe, inactive_universe, inactive_reasons)
                 k_map = build_k_map(universe) if BOT_MODE == "MAIN" else {}
                 last_refresh = now
 
@@ -258,14 +317,17 @@ def run():
                     regime = "MID"
 
             holding_tickers = [t for t, s in state.items() if s.get("holding")]
-            price_targets = set(universe) | set(holding_tickers)
+            inactive_holding_tickers = [t for t, s in inactive_positions.items() if s.get("holding")]
+            price_targets = set(universe) | set(holding_tickers) | set(inactive_holding_tickers)
             prices = batch_get_prices(price_targets)
 
             krw = float(get_balance(upbit, "KRW"))
             prices["_krw"] = krw
             prices["_caches"] = (day_cache, intraday_cache, minute_cache)
+            prices["_inactive_tickers"] = inactive_tickers
+            prices["_inactive_positions"] = inactive_positions
 
-            equity = estimate_equity(krw, state, prices, upbit)
+            equity = estimate_equity(krw, state, prices, upbit, inactive_positions=inactive_positions)
 
             base_per_trade, base_max_holdings = get_base_position_settings(equity)
             per_trade_amt, max_holdings = apply_market_regime(equity, base_per_trade, base_max_holdings, regime)
@@ -294,7 +356,9 @@ def run():
                         holding_cnt=holding_cnt,
                         regime=regime,
                         wait_for_filled_snapshot_fn=wait_for_filled_snapshot,
-                        save_state_fn=save_state,
+                        save_state_fn=persist_state,
+                        inactive_tickers=inactive_tickers,
+                        inactive_positions=inactive_positions,
                     )
 
                 else:
@@ -313,7 +377,9 @@ def run():
                             holding_cnt=holding_cnt,
                             regime=regime,
                             wait_for_filled_snapshot_fn=wait_for_filled_snapshot,
-                            save_state_fn=save_state,
+                            save_state_fn=persist_state,
+                            inactive_tickers=inactive_tickers,
+                            inactive_positions=inactive_positions,
                         )
 
             # 포지션 관리(항상)
@@ -323,19 +389,21 @@ def run():
                 state,
                 prices,
                 cooldown_until,
-                save_state_fn=save_state,
+                save_state_fn=persist_state,
+                inactive_tickers=inactive_tickers,
+                inactive_positions=inactive_positions,
             )
 
             # 주기 저장
             if (now - last_state_save).total_seconds() >= float(config.STATE_SAVE_INTERVAL_SEC):
-                save_state(state, cooldown_until)
+                persist_state(state, cooldown_until)
                 last_state_save = now
 
             time.sleep(config.POLL_SEC)
 
         except KeyboardInterrupt:
             print("\n사용자 종료(Ctrl+C)")
-            save_state(state, cooldown_until)
+            persist_state(state, cooldown_until)
             break
         except Exception as e:
             print("에러:", e)

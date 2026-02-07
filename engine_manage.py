@@ -43,9 +43,24 @@ def append_trade_log(path: str, row):
         csv.writer(f).writerow(row)
 
 
-def _sell_with_retry(upbit, ticker: str, qty: float, max_retry: int = 3, sleep_sec: float = 0.35):
+def _sell_with_retry(
+    upbit,
+    ticker: str,
+    qty: float,
+    max_retry: int = 3,
+    sleep_sec: float = 0.35,
+    inactive_tickers=None,
+    inactive_positions=None,
+):
     if qty <= 0:
         return True
+
+    inactive_tickers = set(inactive_tickers or [])
+    inactive_positions = inactive_positions or {}
+    if ticker in inactive_tickers or ticker in inactive_positions:
+        log_order("SELL_BLOCK", ticker, qty, False, "inactive_ticker_blocked")
+        print(f"[BLOCK] inactive ticker sell blocked: {ticker}")
+        return False
 
     if not bool(getattr(config, "REAL_ORDER", False)):
         print(f"[MOCK SELL] {ticker} qty={qty}")
@@ -78,9 +93,25 @@ def _is_dust_value(krw_value: float) -> bool:
     return float(krw_value) < float(getattr(config, "MIN_ORDER_KRW", 5_000))
 
 
-def manage_positions(upbit, now, state, prices, cooldown_until, save_state_fn):
+def manage_positions(
+    upbit,
+    now,
+    state,
+    prices,
+    cooldown_until,
+    save_state_fn,
+    inactive_tickers=None,
+    inactive_positions=None,
+):
+    inactive_tickers = set(inactive_tickers or [])
+    inactive_positions = inactive_positions or {}
+
     for ticker, s in list(state.items()):
         if not s.get("holding", False):
+            continue
+
+        if ticker in inactive_tickers or ticker in inactive_positions:
+            print(f"[BLOCK] inactive ticker position management skipped: {ticker}")
             continue
 
         cur = prices.get(ticker)
@@ -94,6 +125,8 @@ def manage_positions(upbit, now, state, prices, cooldown_until, save_state_fn):
                 v,
                 max_retry=int(getattr(config, "ORDER_RETRY_MAX", 3)),
                 sleep_sec=float(getattr(config, "ORDER_RETRY_SLEEP_SEC", 0.35)),
+                inactive_tickers=inactive_tickers,
+                inactive_positions=inactive_positions,
             )
 
         result = apply_risk_rules(upbit, ticker, s, float(cur), sell_fn)

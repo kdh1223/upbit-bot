@@ -21,6 +21,10 @@ def _safe_krw(prices) -> float:
         return 0.0
 
 
+def _is_blocked_ticker(ticker: str, inactive_tickers, inactive_positions) -> bool:
+    return (ticker in inactive_tickers) or (ticker in inactive_positions)
+
+
 def entry_passes_filters(ticker: str, now, day_cache, intraday_cache, minute_cache) -> bool:
     # 일봉 캐시
     cached = day_cache.get(ticker)
@@ -76,17 +80,24 @@ def try_entries(
     regime,
     wait_for_filled_snapshot_fn,
     save_state_fn,
+    inactive_tickers=None,
+    inactive_positions=None,
 ):
     """
     성공 시 True 반환 (한 번 진입하면 루프 탈출)
     """
     day_cache, intraday_cache, minute_cache = _safe_caches(prices)
     krw = _safe_krw(prices)
+    inactive_tickers = set(inactive_tickers or [])
+    inactive_positions = inactive_positions or {}
 
     # ==========================
     # 1) 메인 진입 우선 스캔
     # ==========================
     for ticker in universe:
+        if _is_blocked_ticker(ticker, inactive_tickers, inactive_positions):
+            continue
+
         holding = state.get(ticker, {}).get("holding", False)
         if holding_cnt >= max_holdings and not holding:
             continue
@@ -131,6 +142,9 @@ def try_entries(
             print(f"[ENTRY] {action} {ticker} | Regime={regime} | KRW={per_trade_amt:,.0f}")
 
             try:
+                if _is_blocked_ticker(ticker, inactive_tickers, inactive_positions):
+                    print(f"[BLOCK] inactive ticker buy blocked: {ticker}")
+                    continue
                 if bool(getattr(config, "REAL_ORDER", False)):
                     upbit.buy_market_order(ticker, per_trade_amt)
                     filled_vol, avg_buy = wait_for_filled_snapshot_fn(upbit, ticker, timeout_sec=3.0, interval=0.2)
@@ -174,6 +188,9 @@ def try_entries(
         return False
 
     for ticker in universe:
+        if _is_blocked_ticker(ticker, inactive_tickers, inactive_positions):
+            continue
+
         holding = state.get(ticker, {}).get("holding", False)
         if holding:
             continue
@@ -202,6 +219,9 @@ def try_entries(
                 print(f"[TEST ENTRY] BUY {ticker} | Regime={regime} | KRW={test_krw:,.0f}")
 
                 try:
+                    if _is_blocked_ticker(ticker, inactive_tickers, inactive_positions):
+                        print(f"[BLOCK] inactive ticker buy blocked(TEST): {ticker}")
+                        continue
                     if bool(getattr(config, "REAL_ORDER", False)):
                         upbit.buy_market_order(ticker, test_krw)
                         filled_vol, avg_buy = wait_for_filled_snapshot_fn(upbit, ticker, timeout_sec=3.0, interval=0.2)

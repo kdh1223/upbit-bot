@@ -12,6 +12,7 @@ TOP_N = 20
 REFRESH_MIN = 15
 POLL_SEC = 1
 MIN_ORDER_KRW = 5_000
+EXCLUDE_CAUTION = True
 
 # ===============================
 # 💰 비용

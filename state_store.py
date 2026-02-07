@@ -11,10 +11,11 @@ def now_kst():
     return dt.datetime.now()
 
 
-def save_state(state: dict, cooldown_until: dict):
+def save_state(state: dict, cooldown_until: dict, inactive_positions: dict = None):
     try:
         payload = {
             "state": state,
+            "inactive_positions": inactive_positions or {},
             "cooldown_until": {k: v.isoformat() for k, v in cooldown_until.items()},
             "saved_at": now_kst().isoformat(),
         }
@@ -26,7 +27,7 @@ def save_state(state: dict, cooldown_until: dict):
 
 def load_state():
     if not os.path.exists(config.STATE_FILE):
-        return {}, {}
+        return {}, {}, {}
 
     try:
         # Accept both plain UTF-8 and UTF-8 with BOM.
@@ -34,6 +35,7 @@ def load_state():
             payload = json.load(f)
 
         state = payload.get("state", {}) or {}
+        inactive_positions = payload.get("inactive_positions", {}) or {}
         cd_raw = payload.get("cooldown_until", {}) or {}
         cooldown_until = {}
 
@@ -44,10 +46,10 @@ def load_state():
                 pass
 
         print(f"[STATE] loaded positions: {len(state)}")
-        return state, cooldown_until
+        return state, cooldown_until, inactive_positions
     except Exception as e:
         print(f"[WARN] state load failed: {e}")
-        return {}, {}
+        return {}, {}, {}
 
 
 def verify_state_with_balance(upbit, state: dict):
