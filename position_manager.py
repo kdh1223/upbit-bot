@@ -62,6 +62,8 @@ def init_position_state(
         "invested_krw": float(per_trade_amt),
         "target_krw": float(_get_target_krw(per_trade_amt)),
         "add_count": 1,
+        "realized_krw": 0.0,
+        "realized_cost_krw": 0.0,
     }
 
 

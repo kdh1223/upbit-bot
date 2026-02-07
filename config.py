@@ -2,7 +2,7 @@
 # 🎛 BOT 전략 모드
 # ===============================
 BOT_MODE = "TEST"      # TEST = 분봉 테스트
-REAL_ORDER = False     # 테스트니까 모의매매
+REAL_ORDER = True      # 소액 실주문 테스트
 REQUIRE_ORDER_CONFIRM = True
 
 # ===============================

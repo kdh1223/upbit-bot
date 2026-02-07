@@ -5,6 +5,7 @@ __pycache__/
 *.pyc
 
 trade_log.csv
+order_log.csv
 trading_summary.csv
 trading_summary.xlsx
 bot_state.json

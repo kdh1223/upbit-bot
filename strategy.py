@@ -68,8 +68,8 @@ def build_k_map(universe: List[str], sleep_sec: float = 0.05) -> Dict[str, float
         return k_map
 
     print(
-        f"🧠 K 자동화 계산 (lookback={config.K_LOOKBACK_DAYS}d, "
-        f"candidates={len(config.K_CANDIDATES)}, cost≈{config.COST_ROUNDTRIP_PCT*100:.2f}%)"
+        f"[KMAP] auto calc (lookback={config.K_LOOKBACK_DAYS}d, "
+        f"candidates={len(config.K_CANDIDATES)}, cost~{config.COST_ROUNDTRIP_PCT*100:.2f}%)"
     )
 
     for i, t in enumerate(universe, start=1):
@@ -85,5 +85,5 @@ def build_k_map(universe: List[str], sleep_sec: float = 0.05) -> Dict[str, float
 
     print()
     preview = ", ".join([f"{t}:{k_map[t]:.2f}" for t in universe[:10] if t in k_map])
-    print(f"✅ K 맵 준비 완료 (앞 10개): {preview}")
+    print(f"[KMAP] ready (first 10): {preview}")
     return k_map

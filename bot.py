@@ -20,11 +20,42 @@ import position_manager
 
 
 def ensure_trade_log_header(path: str):
-    if os.path.exists(path):
+    expected = ["time", "ticker", "entry_price", "exit_price", "pnl_pct", "reason", "regime"]
+
+    if not os.path.exists(path):
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            csv.writer(f).writerow(expected)
         return
-    with open(path, "w", newline="", encoding="utf-8") as f:
-        w = csv.writer(f)
-        w.writerow(["time", "ticker", "entry_price", "exit_price", "pnl_pct", "reason", "regime"])
+
+    try:
+        with open(path, "r", newline="", encoding="utf-8") as f:
+            rows = list(csv.reader(f))
+    except Exception:
+        return
+
+    if not rows:
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            csv.writer(f).writerow(expected)
+        return
+
+    header = rows[0]
+    if header == expected:
+        return
+
+    # Backward compatibility: old header without "regime" column.
+    legacy = expected[:-1]
+    if header == legacy:
+        migrated = [expected]
+        for row in rows[1:]:
+            fixed = row[: len(legacy)]
+            while len(fixed) < len(legacy):
+                fixed.append("")
+            fixed.append("")
+            migrated.append(fixed)
+
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            csv.writer(f).writerows(migrated)
+        print(f"[MIGRATE] {path} header updated: added 'regime' column")
 
 
 def now_kst():
@@ -178,10 +209,10 @@ def run():
 
     # 실주문 확인 프롬프트(안전장치)
     if bool(getattr(config, "REAL_ORDER", False)) and bool(getattr(config, "REQUIRE_ORDER_CONFIRM", False)):
-        print("🚨 REAL_ORDER=True (실주문 모드)")
+        print("[WARN] REAL_ORDER=True (live order mode)")
         ans = input("정말 실전 매매를 시작할까요? 진행하려면 'yes' 입력: ").strip().lower()
         if ans != "yes":
-            print("❌ 취소됨")
+            print("[STOP] canceled")
             return
 
     ensure_trade_log_header(config.TRADE_LOG_PATH)
@@ -205,7 +236,7 @@ def run():
     intraday_cache = {}
     minute_cache = {}
 
-    print(f"🤖 Bot start | MODE={BOT_MODE} | REAL_ORDER={config.REAL_ORDER}")
+    print(f"[BOT] start | MODE={BOT_MODE} | REAL_ORDER={config.REAL_ORDER}")
 
     while True:
         try:
@@ -213,7 +244,7 @@ def run():
 
             # 유니버스 갱신
             if (now - last_refresh).total_seconds() >= config.REFRESH_MIN * 60:
-                print("\n🔄 Refresh universe" + (" + K map" if BOT_MODE == "MAIN" else ""))
+                print("\n[REFRESH] universe" + (" + K map" if BOT_MODE == "MAIN" else ""))
                 universe = get_top_tickers_by_value(config.TOP_N)
                 k_map = build_k_map(universe) if BOT_MODE == "MAIN" else {}
                 last_refresh = now
@@ -242,12 +273,12 @@ def run():
 
             if (now - last_status).total_seconds() >= config.STATUS_PRINT_SEC:
                 print(
-                    f"📊 Regime={regime} | Equity≈{equity:,.0f} | "
-                    f"PerTrade≈{per_trade_amt:,.0f} | Holding={holding_cnt}/{max_holdings}"
+                    f"[STATUS] Regime={regime} | Equity~{equity:,.0f} | "
+                    f"PerTrade~{per_trade_amt:,.0f} | Holding={holding_cnt}/{max_holdings}"
                 )
                 last_status = now
 
-            # ✅ 신규 진입
+            # 신규 진입
             if max_holdings > 0:
 
                 if BOT_MODE == "TEST":
@@ -285,7 +316,7 @@ def run():
                             save_state_fn=save_state,
                         )
 
-            # ✅ 포지션 관리(항상)
+            # 포지션 관리(항상)
             manage_positions(
                 upbit,
                 now,

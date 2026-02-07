@@ -212,7 +212,7 @@ def calc_metrics(header: List[str], rows: List[List[str]]) -> Metrics:
 
 def print_report(m: Metrics):
     print("\n" + "=" * 44)
-    print("📊 Trading Performance Report")
+    print("[REPORT] Trading Performance Report")
     print("=" * 44)
     print(f"Generated: {m.generated_at}")
     print(f"Roundtrip Cost Assumed: {m.cost_pp:.2f}%p")
@@ -235,12 +235,12 @@ def print_report(m: Metrics):
     print("-" * 44)
 
     if m.by_regime:
-        print("📌 Regime별 요약")
+        print("[Regime] summary")
         for k, v in sorted(m.by_regime.items(), key=lambda x: -x[1]["count"]):
             print(f"  {k:8s} | n={int(v['count']):3d} | win={v['winrate']:5.1f}% | avg={v['avg']:+.2f}%")
 
     if m.by_reason:
-        print("\n📌 종료 사유(reason)별 요약")
+        print("\n[Reason] summary")
         for k, v in sorted(m.by_reason.items(), key=lambda x: -x[1]["count"]):
             print(f"  {k:12s} | n={int(v['count']):3d} | win={v['winrate']:5.1f}% | avg={v['avg']:+.2f}%")
 
@@ -284,7 +284,7 @@ def save_xlsx(
         from openpyxl.chart import LineChart, Reference
         from openpyxl.utils import get_column_letter
     except Exception:
-        print("⚠️ openpyxl이 없어서 xlsx 저장은 스킵합니다. (요약 CSV는 생성됨)")
+        print("[WARN] openpyxl missing; skip xlsx (summary CSV is still written)")
         return
 
     wb = Workbook()
@@ -388,21 +388,21 @@ def maybe_generate_report(
     try:
         return generate_report(trade_log_path, out_csv, out_xlsx, quiet=quiet)
     except PermissionError:
-        print(f"⚠️ 엑셀 파일({out_xlsx})이 열려있어 저장 실패. 파일을 닫아주세요.")
+        print(f"[WARN] failed to save {out_xlsx}; file is open. Close it and retry.")
         return None
     except Exception as e:
         try:
-            print(f"⚠️ report 생성 실패: {e}")
+            print(f"[WARN] report generation failed: {e}")
         except Exception:
-            print(f"\u26A0\uFE0F report \uC0DD\uC131 \uC2E4\uD328: {e}")
+            print(f"[WARN] report generation failed: {e}")
         return None
 
 
 def main():
     generate_report()
 
-    print(f"✅ 요약 CSV 저장: {OUT_SUMMARY_CSV}")
-    print(f"✅ 엑셀 저장: {OUT_XLSX} (openpyxl 있으면 생성)")
+    print(f"[OK] summary CSV saved: {OUT_SUMMARY_CSV}")
+    print(f"[OK] xlsx saved: {OUT_XLSX} (if openpyxl installed)")
 
 
 if __name__ == "__main__":

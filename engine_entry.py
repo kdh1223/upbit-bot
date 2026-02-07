@@ -140,7 +140,7 @@ def try_entries(
                     initial_vol = float(per_trade_amt) / float(cur)
                     entry_price = float(cur)
             except Exception as e:
-                print(f"⚠️ buy 실패: {ticker} err={e}")
+                print(f"[WARN] buy failed: {ticker} err={e}")
                 continue
 
             if holding:
@@ -211,7 +211,7 @@ def try_entries(
                         initial_vol = test_krw / float(cur)
                         entry_price = float(cur)
                 except Exception as e:
-                    print(f"⚠️ buy 실패(TEST): {ticker} err={e}")
+                    print(f"[WARN] buy failed(TEST): {ticker} err={e}")
                     continue
 
                 state[ticker] = position_manager.init_position_state(

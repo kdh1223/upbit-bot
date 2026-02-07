@@ -1,4 +1,4 @@
-# risk.py
+﻿# risk.py
 import config
 from market import get_balance
 
@@ -18,10 +18,6 @@ def _is_real_order() -> bool:
 
 
 def _get_volume(upbit, ticker: str, state: dict) -> float:
-    """
-    실주문: 실제 잔고
-    모의: state["initial_volume"]를 잔고로 취급
-    """
     if _is_real_order():
         coin = ticker.split("-")[1]
         return float(get_balance(upbit, coin))
@@ -29,25 +25,39 @@ def _get_volume(upbit, ticker: str, state: dict) -> float:
 
 
 def _mock_reduce_volume(state: dict, qty: float):
-    """
-    모의모드에서만: initial_volume을 '잔고'처럼 차감
-    """
     v = float(state.get("initial_volume", 0.0))
     v = max(0.0, v - float(qty))
     state["initial_volume"] = v
 
 
+def _record_realized(state: dict, qty: float, price: float):
+    q = float(qty)
+    p = float(price)
+    if q <= 0 or p <= 0:
+        return
+    entry = float(state.get("entry", 0.0))
+    state["realized_krw"] = float(state.get("realized_krw", 0.0)) + (q * p)
+    state["realized_cost_krw"] = float(state.get("realized_cost_krw", 0.0)) + (q * entry)
+
+
+def _execute_sell(upbit, ticker: str, qty: float, market_sell, fail_reason: str):
+    try:
+        ok = bool(market_sell(upbit, ticker, qty))
+    except Exception as e:
+        if _is_real_order():
+            return False, f"{fail_reason}:{e}"
+        ok = False
+
+    if _is_real_order() and not ok:
+        return False, f"{fail_reason}:returned_false"
+    return True, ""
+
+
 def apply_risk_rules(upbit, ticker: str, state: dict, cur: float, market_sell):
-    """
-    state keys(권장):
-      holding(bool), entry(float), peak(float), tp1(bool), tp2(bool), regime(str),
-      initial_volume(float)  # 실주문에서는 체결 후 잔고 스냅샷, 모의에서는 가상 잔고 역할
-    """
     entry = float(state.get("entry", 0.0))
     if entry <= 0:
         return {"closed": False}
 
-    # 최고가 갱신
     state["peak"] = max(float(state.get("peak", entry)), float(cur))
 
     pnl = (float(cur) / entry) - 1.0
@@ -56,83 +66,63 @@ def apply_risk_rules(upbit, ticker: str, state: dict, cur: float, market_sell):
     regime = state.get("regime", "MID")
     tp1, tp2, trail_back = _get_params_by_regime(regime)
 
-    # 잔고(실제 or 모의)
     vol = _get_volume(upbit, ticker, state)
 
-    # 찌꺼기(dust) 처리: 최소 주문금액 미만이면 매도 불가 → 종료 처리(옵션)
     if vol > 0 and not _can_order(float(cur), vol):
         if bool(getattr(config, "DUST_CLOSE_AS_CLOSED", True)):
             state["holding"] = False
             return {"closed": True, "reason": "dust(<min_order)", "exit_price": float(cur)}
         return {"closed": False}
 
-    # =========================
-    # 1) 손절(전량)
-    # =========================
+    # 1) stop loss full close
     if pnl <= -float(getattr(config, "STOP_LOSS_PCT", 0.01)):
         if vol > 0 and _can_order(float(cur), vol):
-            try:
-                market_sell(upbit, ticker, vol)
-            except Exception as e:
-                # 실주문에서는 실패 시 포지션을 닫지 않는 편이 안전
-                if _is_real_order():
-                    return {"closed": False, "reason": f"stop_loss_sell_failed:{e}"}
+            ok, err = _execute_sell(upbit, ticker, vol, market_sell, "stop_loss_sell_failed")
+            if not ok:
+                return {"closed": False, "reason": err}
+            _record_realized(state, vol, float(cur))
             if not _is_real_order():
                 _mock_reduce_volume(state, vol)
 
         state["holding"] = False
         return {"closed": True, "reason": "stop_loss", "exit_price": float(cur)}
 
-    # =========================
-    # 2) 1차 익절 (initial_volume 기준)
-    # =========================
+    # 2) TP1 partial
     if (not bool(state.get("tp1", False))) and tp1 > 0 and pnl >= tp1:
         vol = _get_volume(upbit, ticker, state)
         if vol > 0:
-            sell_qty = vol * float(getattr(config, "TP1_SELL_RATIO", 0.5))
-            sell_qty = min(sell_qty, vol)
-
+            sell_qty = min(vol * float(getattr(config, "TP1_SELL_RATIO", 0.5)), vol)
             if sell_qty > 0 and _can_order(float(cur), sell_qty):
-                try:
-                    market_sell(upbit, ticker, sell_qty)
-                except Exception as e:
-                    if _is_real_order():
-                        return {"closed": False, "reason": f"tp1_sell_failed:{e}"}
+                ok, err = _execute_sell(upbit, ticker, sell_qty, market_sell, "tp1_sell_failed")
+                if not ok:
+                    return {"closed": False, "reason": err}
+                _record_realized(state, sell_qty, float(cur))
                 if not _is_real_order():
                     _mock_reduce_volume(state, sell_qty)
-
                 state["tp1"] = True
 
-    # =========================
-    # 3) 2차 익절 (남은 잔고 기준)
-    # =========================
+    # 3) TP2 partial
     if (not bool(state.get("tp2", False))) and tp2 > 0 and pnl >= tp2:
         vol = _get_volume(upbit, ticker, state)
         if vol > 0:
             sell_qty = vol * float(getattr(config, "TP2_SELL_RATIO", 0.5))
-
             if sell_qty > 0 and _can_order(float(cur), sell_qty):
-                try:
-                    market_sell(upbit, ticker, sell_qty)
-                except Exception as e:
-                    if _is_real_order():
-                        return {"closed": False, "reason": f"tp2_sell_failed:{e}"}
+                ok, err = _execute_sell(upbit, ticker, sell_qty, market_sell, "tp2_sell_failed")
+                if not ok:
+                    return {"closed": False, "reason": err}
+                _record_realized(state, sell_qty, float(cur))
                 if not _is_real_order():
                     _mock_reduce_volume(state, sell_qty)
-
                 state["tp2"] = True
 
-    # =========================
-    # 4) 트레일링(전량)
-    # =========================
+    # 4) trailing full close
     if trail_back > 0 and from_peak <= -trail_back:
         vol = _get_volume(upbit, ticker, state)
         if vol > 0 and _can_order(float(cur), vol):
-            try:
-                market_sell(upbit, ticker, vol)
-            except Exception as e:
-                if _is_real_order():
-                    return {"closed": False, "reason": f"trail_sell_failed:{e}"}
+            ok, err = _execute_sell(upbit, ticker, vol, market_sell, "trail_sell_failed")
+            if not ok:
+                return {"closed": False, "reason": err}
+            _record_realized(state, vol, float(cur))
             if not _is_real_order():
                 _mock_reduce_volume(state, vol)
 

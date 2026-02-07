@@ -11,7 +11,7 @@ def load_keys() -> Tuple[str, str]:
     access = os.getenv("UPBIT_ACCESS")
     secret = os.getenv("UPBIT_SECRET")
     if not access or not secret:
-        raise RuntimeError("❌ .env에 UPBIT_ACCESS / UPBIT_SECRET 키가 없습니다.")
+        raise RuntimeError(".env missing UPBIT_ACCESS / UPBIT_SECRET")
     return access, secret
 
 
@@ -35,7 +35,7 @@ def get_top_tickers_by_value(n: int, sleep_sec: float = 0.03) -> List[str]:
     total = len(tickers)
 
     data = []
-    print(f"🔎 TOP{n} 계산: KRW 종목 {total}개 스캔 시작")
+    print(f"[SCAN] TOP{n} start: KRW {total} tickers")
 
     for i, t in enumerate(tickers, start=1):
         try:
@@ -60,5 +60,5 @@ def get_top_tickers_by_value(n: int, sleep_sec: float = 0.03) -> List[str]:
     print()
     data.sort(key=lambda x: x[1], reverse=True)
     top = [t for t, _ in data[:n]]
-    print(f"✅ TOP{n} 완료")
+    print(f"[SCAN] TOP{n} done")
     return top
