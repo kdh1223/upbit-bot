@@ -6,6 +6,9 @@ import pyupbit
 from dotenv import load_dotenv
 
 
+STABLECOIN_SYMBOLS = {"USDT", "USDC", "BUSD", "TUSD", "DAI", "FDUSD", "USDP"}
+
+
 def load_keys() -> Tuple[str, str]:
     load_dotenv()
     access = os.getenv("UPBIT_ACCESS")
@@ -27,11 +30,24 @@ def get_balance(upbit: pyupbit.Upbit, currency: str) -> float:
     return float(bal) if bal else 0.0
 
 
+def filter_stablecoins(tickers):
+    filtered = []
+    for ticker in tickers:
+        if not isinstance(ticker, str):
+            continue
+        coin = ticker.split("-", 1)[1].upper() if "-" in ticker else ticker.upper()
+        if coin in STABLECOIN_SYMBOLS:
+            continue
+        filtered.append(ticker)
+    return filtered
+
+
 def get_top_tickers_by_value(n: int, sleep_sec: float = 0.03) -> List[str]:
     """
     KRW 마켓 전체에서 거래대금(value) 기준 TOP N
     """
     tickers = pyupbit.get_tickers(fiat="KRW")
+    tickers = filter_stablecoins(tickers)
     total = len(tickers)
 
     data = []
