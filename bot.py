@@ -14,7 +14,7 @@ import config
 import position_manager
 from engine_entry import try_main_entries, try_scalp_entries
 from engine_manage import manage_positions
-from indicators import check_filters, detect_momentum_candidate, get_market_regime, intraday_trend_ok
+from indicators import check_filters_with_reason, detect_momentum_candidate, get_market_regime, intraday_trend_ok
 from market import (
     filter_tradeable_tickers,
     get_balance,
@@ -123,6 +123,15 @@ def print_filter_summary(active, inactive, reasons):
     print(f"[FILTER] top inactive reasons: {top}")
 
 
+def print_main_filter_reject_summary(stats: Counter):
+    if not stats:
+        return
+    topn = max(1, int(getattr(config, "MAIN_FILTER_REJECT_SUMMARY_TOPN", 6)))
+    total = sum(int(v) for v in stats.values())
+    top = ", ".join([f"{k}:{v}" for k, v in stats.most_common(topn)])
+    print(f"[MAIN_일봉필터요약] total={total} | {top}")
+
+
 def _dedupe_keep_order(items):
     out = []
     seen = set()
@@ -198,15 +207,24 @@ def _core_and_surge_from_ranked(raw_ranked, market_info):
     surge_active, surge_inactive, surge_reasons = filter_tradeable_tickers(surge_raw, market_info)
 
     # CORE keeps higher-timeframe trend.
+    core_filter_rejects = Counter()
+    for ticker in core_inactive:
+        reason = str(core_reasons.get(ticker, "UNIVERSE_FILTER"))
+        core_filter_rejects[f"UNIVERSE_{reason}"] += 1
+
     core_filtered = []
     for ticker in core_active:
         try:
-            if not bool(check_filters(ticker)):
+            ok_day, day_reason = check_filters_with_reason(ticker)
+            if not bool(ok_day):
+                core_filter_rejects[str(day_reason or "DAY_FILTER_FAIL")] += 1
                 continue
             if bool(getattr(config, "USE_INTRADAY_FILTER", False)) and (not bool(intraday_trend_ok(ticker))):
+                core_filter_rejects["INTRADAY_TREND_FAIL"] += 1
                 continue
             core_filtered.append(ticker)
         except Exception:
+            core_filter_rejects["DAY_FILTER_ERR"] += 1
             continue
 
     strict_prefilter = bool(getattr(config, "CORE_STRICT_PREFILTER", False))
@@ -220,7 +238,7 @@ def _core_and_surge_from_ranked(raw_ranked, market_info):
     reasons_all = {}
     reasons_all.update(core_reasons)
     reasons_all.update(surge_reasons)
-    return core_final, surge_active, inactive_all, reasons_all
+    return core_final, surge_active, inactive_all, reasons_all, core_filter_rejects
 
 
 def _update_surge_candidates(surge_pool, momentum_seen_at: dict, now):
@@ -429,10 +447,14 @@ def run():
         int(getattr(config, "UNIVERSE_SCAN_N", config.TOP_N)),
         market_info=market_info,
     )
-    core_universe, surge_pool, inactive_universe, inactive_reasons = _core_and_surge_from_ranked(raw_ranked, market_info)
+    core_universe, surge_pool, inactive_universe, inactive_reasons, core_filter_rejects = _core_and_surge_from_ranked(
+        raw_ranked, market_info
+    )
     surge_candidates, momentum_seen_at = _update_surge_candidates(surge_pool, momentum_seen_at, now)
     active_universe = _dedupe_keep_order(core_universe + surge_candidates)
     inactive_tickers = set(inactive_universe) | set(inactive_positions.keys())
+    main_filter_reject_stats = Counter(core_filter_rejects or {})
+    main_filter_summary_last = now
 
     print_filter_summary(active_universe, inactive_universe, inactive_reasons)
     print(f"[UNIVERSE] core={len(core_universe)} surge={len(surge_candidates)}")
@@ -477,12 +499,17 @@ def run():
                     int(getattr(config, "UNIVERSE_SCAN_N", config.TOP_N)),
                     market_info=market_info,
                 )
-                core_universe, surge_pool, inactive_universe, inactive_reasons = _core_and_surge_from_ranked(
-                    raw_ranked, market_info
-                )
+                (
+                    core_universe,
+                    surge_pool,
+                    inactive_universe,
+                    inactive_reasons,
+                    core_filter_rejects,
+                ) = _core_and_surge_from_ranked(raw_ranked, market_info)
                 surge_candidates, momentum_seen_at = _update_surge_candidates(surge_pool, momentum_seen_at, now)
                 active_universe = _dedupe_keep_order(core_universe + surge_candidates)
                 inactive_tickers = set(inactive_universe) | set(inactive_positions.keys())
+                main_filter_reject_stats.update(core_filter_rejects or {})
 
                 print_filter_summary(active_universe, inactive_universe, inactive_reasons)
                 print(f"[UNIVERSE] core={len(core_universe)} surge={len(surge_candidates)}")
@@ -492,6 +519,13 @@ def run():
                 if enable_main:
                     k_map = build_k_map(core_universe)
                 last_refresh = now
+
+            main_filter_summary_min = float(getattr(config, "MAIN_FILTER_REJECT_SUMMARY_MIN", 10))
+            main_filter_summary_sec = max(60.0, main_filter_summary_min * 60.0)
+            if (now - main_filter_summary_last).total_seconds() >= main_filter_summary_sec:
+                print_main_filter_reject_summary(main_filter_reject_stats)
+                main_filter_reject_stats.clear()
+                main_filter_summary_last = now
 
             today = now.date()
             if today != trading_day:

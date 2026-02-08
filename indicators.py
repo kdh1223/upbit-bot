@@ -1,7 +1,44 @@
 """지표 계산 함수와 전략 진입/필터 신호 함수를 제공하는 모듈."""
 
+from collections import Counter
+import time
+
 import pyupbit
+
 import config
+
+
+_MINUTE_REJECT_COUNTER = Counter()
+_MINUTE_REJECT_TOTAL = 0
+_MINUTE_REJECT_LAST_PRINT_TS = time.time()
+
+
+def _flush_minute_reject_summary(force: bool = False):
+    global _MINUTE_REJECT_TOTAL, _MINUTE_REJECT_LAST_PRINT_TS
+
+    summary_min = float(getattr(config, "ENTRY_MINUTE_REJECT_SUMMARY_MIN", 10))
+    interval_sec = max(60.0, summary_min * 60.0)
+    now_ts = time.time()
+    if (not force) and ((now_ts - _MINUTE_REJECT_LAST_PRINT_TS) < interval_sec):
+        return
+
+    _MINUTE_REJECT_LAST_PRINT_TS = now_ts
+    if not _MINUTE_REJECT_COUNTER:
+        return
+
+    topn = max(1, int(getattr(config, "ENTRY_MINUTE_REJECT_SUMMARY_TOPN", 6)))
+    parts = ", ".join([f"{k}:{v}" for k, v in _MINUTE_REJECT_COUNTER.most_common(topn)])
+    print(f"[MAIN_분봉거절요약] total={_MINUTE_REJECT_TOTAL} | {parts}")
+    _MINUTE_REJECT_COUNTER.clear()
+    _MINUTE_REJECT_TOTAL = 0
+
+
+def _track_minute_reject(reason: str):
+    global _MINUTE_REJECT_TOTAL
+    key = str(reason or "UNKNOWN")
+    _MINUTE_REJECT_COUNTER[key] += 1
+    _MINUTE_REJECT_TOTAL += 1
+    _flush_minute_reject_summary(force=False)
 
 
 def get_ma(df, period):
@@ -50,17 +87,36 @@ def get_atr(df, period=14):
     return tr.rolling(period).mean()
 
 
-def check_filters(ticker):
+def check_filters_with_reason(ticker):
     """
-    Daily filter: MA5 > MA20 and RSI < 70.
+    Daily filter detail:
+    - MA5 > MA20
+    - RSI < 70
     """
     df = pyupbit.get_ohlcv(ticker, interval="day", count=40)
     if df is None or len(df) < 25:
-        return False
+        return False, "DAY_DATA_SHORT"
+
     ma5 = get_ma(df, 5)
     ma20 = get_ma(df, 20)
     rsi = get_rsi(df, 14)
-    return bool(ma5.iloc[-1] > ma20.iloc[-1] and rsi.iloc[-1] < 70)
+
+    ma5_now = safe_last(ma5)
+    ma20_now = safe_last(ma20)
+    rsi_now = safe_last(rsi)
+    if ma5_now is None or ma20_now is None or rsi_now is None:
+        return False, "DAY_DATA_NAN"
+
+    if not (ma5_now > ma20_now):
+        return False, "DAY_MA_FAIL"
+    if not (rsi_now < 70):
+        return False, "DAY_RSI_FAIL"
+    return True, "OK"
+
+
+def check_filters(ticker):
+    ok, _ = check_filters_with_reason(ticker)
+    return bool(ok)
 
 
 def intraday_trend_ok(ticker):
@@ -79,28 +135,116 @@ def intraday_trend_ok(ticker):
 
 def minute_entry_ok(ticker):
     """
-    Minute filter for common entry timing:
-    - MA(ENTRY_FAST) > MA(ENTRY_SLOW)
-    - RSI < ENTRY_RSI_MAX
+    MAIN minute timing filter.
+    Daily filter is handled elsewhere and not changed here.
     """
     interval = getattr(config, "ENTRY_MINUTE_INTERVAL", "minute5")
     df = pyupbit.get_ohlcv(ticker, interval=interval, count=80)
     if df is None or len(df) < 30:
         return True  # Do not block entry on missing minute data.
 
-    ma_fast = get_sma(df["close"], getattr(config, "ENTRY_FAST_MA", 5))
-    ma_slow = get_sma(df["close"], getattr(config, "ENTRY_SLOW_MA", 20))
-    rsi = get_rsi(df, getattr(config, "ENTRY_RSI_PERIOD", 14))
+    debug_reject = bool(getattr(config, "DEBUG_ENTRY_REJECT", False))
+
+    def reject(reason: str):
+        _track_minute_reject(reason)
+        if debug_reject:
+            print(f"[MAIN_분봉거절] {ticker} {reason}")
+        return False
+
+    ma_fast_period = int(getattr(config, "ENTRY_MA_FAST", getattr(config, "ENTRY_FAST_MA", 5)))
+    ma_slow_period = int(getattr(config, "ENTRY_MA_SLOW", getattr(config, "ENTRY_SLOW_MA", 20)))
+    rsi_period = int(getattr(config, "ENTRY_RSI_PERIOD", 14))
+    lookback = int(getattr(config, "ENTRY_PULLBACK_LOOKBACK", getattr(config, "ENTRY_BREAKOUT_LOOKBACK", 20)))
+    lookback = max(5, lookback)
+    min_needed = max(30, ma_slow_period + 3, lookback + 3)
+    if len(df) < min_needed:
+        return True  # Keep legacy behavior on short data.
+
+    close_series = df["close"]
+    vol_series = df["volume"] if "volume" in df.columns else None
+    ma_fast = get_sma(close_series, ma_fast_period)
+    ma_slow = get_sma(close_series, ma_slow_period)
+    rsi = get_rsi(df, rsi_period)
 
     ma_fast_now = safe_last(ma_fast)
     ma_slow_now = safe_last(ma_slow)
+    slope_bars = max(1, int(getattr(config, "ENTRY_MA_SLOPE_BARS", 1)))
+    ma_fast_prev = None
+    try:
+        ma_fast_prev = float(ma_fast.iloc[-1 - slope_bars])
+        if ma_fast_prev != ma_fast_prev:
+            ma_fast_prev = None
+    except Exception:
+        ma_fast_prev = None
     rsi_now = safe_last(rsi)
-    if ma_fast_now is None or ma_slow_now is None or rsi_now is None:
+    close_now = safe_last(close_series)
+    close_prev = safe_last(close_series.iloc[:-1])
+    if None in (ma_fast_now, ma_slow_now, ma_fast_prev, rsi_now, close_now, close_prev):
         return True
 
-    rsi_max = float(getattr(config, "ENTRY_RSI_MAX", 70))
-    if not (ma_fast_now > ma_slow_now and rsi_now < rsi_max):
-        return False
+    ma_fast_slope = float(ma_fast_now) - float(ma_fast_prev)
+    strong_trend = bool(close_now > ma_fast_now > ma_slow_now and ma_fast_slope > 0.0)
+
+    base_rsi_max = float(getattr(config, "ENTRY_RSI_MAX", 70))
+    rsi_max = float(base_rsi_max)
+    relaxed_rsi_mode = False
+    if bool(getattr(config, "ENTRY_ENABLE_TREND_RSI_RELAX", True)) and strong_trend:
+        strong_rsi_max = float(getattr(config, "ENTRY_RSI_MAX_STRONG", 74))
+        rsi_max = max(base_rsi_max, strong_rsi_max)
+        relaxed_rsi_mode = bool(rsi_max > base_rsi_max)
+
+    if not (ma_fast_now > ma_slow_now):
+        return reject("MA_ALIGN")
+    if not (rsi_now < rsi_max):
+        return reject("RSI_OVERHEAT")
+
+    recent_high = None
+    try:
+        recent_high = float(df["high"].rolling(lookback).max().iloc[-2])
+        if recent_high != recent_high or recent_high <= 0:
+            recent_high = None
+    except Exception:
+        recent_high = None
+
+    if recent_high is not None:
+        near_high_block_pct = float(getattr(config, "ENTRY_NEAR_HIGH_BLOCK_PCT", 0.002))
+        if float(close_now) >= float(recent_high) * (1.0 - near_high_block_pct):
+            return reject("NEAR_RECENT_HIGH")
+
+    # If RSI upper is relaxed in strong trend, only allow entry
+    # after a pullback zone has appeared, then a rebound with non-weak volume.
+    if relaxed_rsi_mode:
+        if recent_high is None:
+            return reject("PULLBACK_REF_MISSING")
+
+        pull_min = float(getattr(config, "ENTRY_PULLBACK_MIN_PCT", 0.003))
+        pull_max = float(getattr(config, "ENTRY_PULLBACK_MAX_PCT", 0.010))
+        if pull_min > pull_max:
+            pull_min, pull_max = pull_max, pull_min
+
+        pull_window = max(2, int(getattr(config, "ENTRY_PULLBACK_WINDOW", 8)))
+        pull_slice = close_series.iloc[max(0, len(close_series) - 1 - pull_window) : len(close_series) - 1]
+        if pull_slice.empty:
+            return reject("PULLBACK_WINDOW_SHORT")
+
+        drawdown = 1.0 - (pull_slice / float(recent_high))
+        pull_seen = bool(((drawdown >= pull_min) & (drawdown <= pull_max)).any())
+        if not pull_seen:
+            return reject("PULLBACK_NOT_SEEN")
+
+        if bool(getattr(config, "ENTRY_REQUIRE_REBOUND", True)):
+            if not (float(close_now) > float(close_prev)):
+                return reject("REBOUND_NOT_CONFIRMED")
+
+        if bool(getattr(config, "ENTRY_REQUIRE_VOL_HOLD", True)):
+            if vol_series is None:
+                return reject("VOLUME_MISSING")
+            vol_now = safe_last(vol_series)
+            vol_prev = safe_last(vol_series.iloc[:-1])
+            if vol_now is None or vol_prev is None:
+                return reject("VOLUME_NAN")
+            if float(vol_now) < float(vol_prev):
+                return reject("VOLUME_DECAY")
 
     if bool(getattr(config, "ENTRY_REQUIRE_RSI_UPTURN", False)):
         rsi_prev = None
@@ -112,22 +256,22 @@ def minute_entry_ok(ticker):
             rsi_prev = None
 
         if rsi_prev is None:
-            return False
+            return reject("RSI_PREV_NAN")
 
         delta_min = float(getattr(config, "ENTRY_RSI_DELTA_MIN", 0.8))
         if (rsi_now - rsi_prev) < delta_min:
-            return False
+            return reject("RSI_DELTA_LOW")
 
     if bool(getattr(config, "ENTRY_USE_VOLUME_FILTER", False)):
-        if "volume" not in df.columns:
-            return False
-        v_now = safe_last(df["volume"])
+        if vol_series is None:
+            return reject("VOLUME_MISSING")
+        v_now = safe_last(vol_series)
         vma = safe_last(volume_ma(df, getattr(config, "ENTRY_VOL_MA_PERIOD", 20)))
         if v_now is None or vma is None or vma <= 0:
-            return False
+            return reject("VOLUME_NAN")
         vol_mult = float(getattr(config, "ENTRY_VOL_MULT", 1.1))
         if not (v_now > vma * vol_mult):
-            return False
+            return reject("VOLUME_FILTER_FAIL")
 
     return True
 
