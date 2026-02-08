@@ -1,3 +1,5 @@
+"""지표 계산 함수와 전략 진입/필터 신호 함수를 제공하는 모듈."""
+
 import pyupbit
 import config
 

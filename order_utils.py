@@ -1,4 +1,5 @@
-# order_utils.py
+"""시장가 매수 직후 체결 스냅샷을 확인하는 주문 유틸 모듈."""
+
 import time
 from typing import Tuple
 import pyupbit

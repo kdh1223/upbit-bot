@@ -1,4 +1,5 @@
-# state_store.py
+"""상태 저장/복구, 스키마 마이그레이션, 잔고 정합성 보정을 담당하는 모듈."""
+
 import datetime as dt
 import json
 import os

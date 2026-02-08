@@ -1,4 +1,6 @@
-﻿# engine_manage.py
+﻿"""리스크 적용, 청산 처리, 주문/거래 로그 기록을 담당하는 포지션 관리 모듈."""
+
+# engine_manage.py
 import csv
 import datetime as dt
 import os

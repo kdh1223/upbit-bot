@@ -1,4 +1,6 @@
-﻿# risk.py
+﻿"""손절/익절/트레일링과 매도 의사결정을 수행하는 리스크 규칙 모듈."""
+
+# risk.py
 import config
 import pyupbit
 from indicators import get_atr

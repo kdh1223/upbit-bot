@@ -1,4 +1,6 @@
-﻿import os
+﻿"""업비트 시세/계정 조회와 유니버스 메타 필터링을 담당하는 마켓 유틸."""
+
+import os
 import time
 from typing import Dict, List, Tuple
 

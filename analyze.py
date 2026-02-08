@@ -1,3 +1,5 @@
+"""거래 로그를 바탕으로 자산곡선/성과 요약을 생성하는 분석 유틸."""
+
 import csv
 import os
 import time

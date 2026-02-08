@@ -1,3 +1,5 @@
+"""돌파 목표가 계산과 자동 K 선택 로직을 제공하는 전략 계산 모듈."""
+
 import time
 from typing import Dict, List
 

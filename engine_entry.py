@@ -1,4 +1,5 @@
-# engine_entry.py
+"""MAIN/SCALP 전략 신호 판단과 매수 실행을 담당하는 진입 엔진."""
+
 import time
 
 import config

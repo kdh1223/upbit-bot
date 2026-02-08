@@ -1,4 +1,5 @@
-# bot.py
+"""유니버스 갱신, 진입/청산, 상태 저장을 총괄하는 봇 메인 루프."""
+
 import copy
 import csv
 import datetime as dt
