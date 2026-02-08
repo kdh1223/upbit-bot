@@ -213,13 +213,17 @@ def get_krw_market_snapshots_24h(
     out: List[Dict[str, float]] = []
     done = 0
     for chunk in _chunked(tickers, chunk_size):
+        # pyupbit does not provide get_ticker(); call Upbit ticker endpoint directly.
         try:
-            rows = pyupbit.get_ticker(chunk)
+            resp = requests.get(
+                "https://api.upbit.com/v1/ticker",
+                params={"markets": ",".join(chunk)},
+                timeout=5.0,
+            )
+            resp.raise_for_status()
+            rows = resp.json()
         except Exception:
-            rows = None
-
-        if isinstance(rows, dict):
-            rows = [rows]
+            rows = []
 
         for row in rows or []:
             try:
