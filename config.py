@@ -3,7 +3,7 @@
 # ===============================
 # BOT mode
 # ===============================
-BOT_MODE = "MAIN"  # MAIN / TEST / DUAL
+BOT_MODE = "DUAL"  # MAIN / TEST / DUAL
 REAL_ORDER = True
 REQUIRE_ORDER_CONFIRM = True
 
