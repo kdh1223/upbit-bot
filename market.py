@@ -14,6 +14,7 @@ import config
 STABLECOIN_SYMBOLS = {"USDT", "USDC", "BUSD", "TUSD", "DAI", "FDUSD", "USDP"}
 USER_EXCLUDED_SYMBOLS = {"APENFT", "LUNA2", "LUNC"}
 _MARKET_META_DEBUG_PRINTED = False
+_BALANCE_WARN_LAST_TS = 0.0
 
 
 def _extract_symbol(ticker: str) -> str:
@@ -25,9 +26,15 @@ def _extract_symbol(ticker: str) -> str:
 
 
 def load_keys() -> Tuple[str, str]:
-    load_dotenv()
-    access = os.getenv("UPBIT_ACCESS")
-    secret = os.getenv("UPBIT_SECRET")
+    env_path = os.path.join(os.getcwd(), ".env")
+    try:
+        load_dotenv(dotenv_path=env_path)
+    except Exception:
+        # python-dotenv may fail in some stdin/embedded contexts.
+        pass
+
+    access = str(os.getenv("UPBIT_ACCESS") or "").strip().strip("'").strip('"')
+    secret = str(os.getenv("UPBIT_SECRET") or "").strip().strip("'").strip('"')
     if not access or not secret:
         raise RuntimeError(".env missing UPBIT_ACCESS / UPBIT_SECRET")
     return access, secret
@@ -40,9 +47,60 @@ def get_current_price(ticker: str) -> float:
     return float(p)
 
 
+def _warn_balance_issue_once(msg: str):
+    global _BALANCE_WARN_LAST_TS
+    now_ts = time.time()
+    if (now_ts - _BALANCE_WARN_LAST_TS) < 30.0:
+        return
+    _BALANCE_WARN_LAST_TS = now_ts
+    print(f"[WARN] balance fetch issue: {msg}")
+
+
+def _pick_balance_from_accounts(accounts, currency: str) -> float:
+    cur = str(currency or "").upper().strip()
+    if not cur:
+        return 0.0
+
+    for row in accounts:
+        if not isinstance(row, dict):
+            continue
+        coin = str(row.get("currency") or "").upper().strip()
+        if coin != cur:
+            continue
+        try:
+            return float(row.get("balance") or 0.0)
+        except Exception:
+            return 0.0
+    return 0.0
+
+
 def get_balance(upbit: pyupbit.Upbit, currency: str) -> float:
-    bal = upbit.get_balance(currency)
-    return float(bal) if bal else 0.0
+    """
+    Safe balance fetch wrapper.
+    Avoids noisy pyupbit.get_balance() exception-class prints and handles
+    unexpected payloads defensively.
+    """
+    try:
+        accounts = upbit.get_balances()
+    except Exception as e:
+        _warn_balance_issue_once(f"{type(e).__name__}: {e}")
+        return 0.0
+
+    if isinstance(accounts, list):
+        return _pick_balance_from_accounts(accounts, currency)
+
+    if isinstance(accounts, dict):
+        err = accounts.get("error")
+        if isinstance(err, dict):
+            name = str(err.get("name") or "unknown")
+            msg = str(err.get("message") or "")
+            _warn_balance_issue_once(f"api_error name={name} msg={msg}")
+        else:
+            _warn_balance_issue_once(f"unexpected dict payload keys={list(accounts.keys())[:5]}")
+        return 0.0
+
+    _warn_balance_issue_once(f"unexpected payload type={type(accounts).__name__}")
+    return 0.0
 
 
 def filter_stablecoins(tickers):
