@@ -27,6 +27,19 @@ def _is_blocked_ticker(ticker: str, inactive_tickers, inactive_positions) -> boo
     return (ticker in inactive_tickers) or (ticker in inactive_positions)
 
 
+def _is_cooldown_active(now, until) -> bool:
+    if until is None:
+        return False
+    try:
+        return bool(now < until)
+    except TypeError:
+        # Defensive fallback for mixed naive/aware datetime values.
+        try:
+            return float(now.timestamp()) < float(until.timestamp())
+        except Exception:
+            return False
+
+
 def entry_passes_filters(ticker: str, now, day_cache, intraday_cache, minute_cache) -> bool:
     # Daily filter cache
     cached = day_cache.get(ticker)
@@ -133,7 +146,7 @@ def try_main_entries(
                 continue
 
         until = cooldown_until.get(ticker)
-        if until is not None and now < until:
+        if _is_cooldown_active(now, until):
             continue
 
         holding = bool(state.get(ticker, {}).get("holding", False))
@@ -243,7 +256,7 @@ def try_scalp_entries(
             continue
 
         until = cooldown_until.get(ticker)
-        if until is not None and now < until:
+        if _is_cooldown_active(now, until):
             continue
 
         can_new, _ = position_manager.can_open_new_position(state, ticker)

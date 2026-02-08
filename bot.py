@@ -6,6 +6,7 @@ import datetime as dt
 import os
 import sys
 import time
+import traceback
 from collections import Counter
 
 import pyupbit
@@ -728,7 +729,8 @@ def run():
             persist_state()
             break
         except Exception as e:
-            print("[ERROR]", e)
+            print(f"[ERROR] {type(e).__name__}: {e}")
+            traceback.print_exc(limit=2)
             time.sleep(1)
 
 
