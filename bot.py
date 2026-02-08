@@ -14,8 +14,14 @@ import pyupbit
 import config
 import position_manager
 from engine_entry import try_main_entries, try_scalp_entries
-from engine_manage import manage_positions
-from indicators import check_filters_with_reason, detect_momentum_candidate, get_market_regime, intraday_trend_ok
+from engine_manage import append_trade_log, log_order, manage_positions
+from indicators import (
+    check_filters_with_reason,
+    detect_momentum_candidate,
+    get_market_regime,
+    intraday_trend_ok,
+    scalp_btc_entry_signal,
+)
 from market import (
     filter_tradeable_tickers,
     get_balance,
@@ -377,40 +383,340 @@ def _is_dawn_hour(now: dt.datetime) -> bool:
     return h >= start or h < end
 
 
-def _mode_to_strategy_flags(bot_mode: str):
-    mode = str(bot_mode or "").upper().strip()
-    if mode == "MAIN":
-        return True, False
+def _resolve_mode() -> str:
+    mode = str(getattr(config, "MODE", getattr(config, "BOT_MODE", "MAIN"))).upper().strip()
+    if mode not in {"MAIN", "SAFE", "TEST"}:
+        mode = "SAFE"
+    return mode
+
+
+def _mode_to_strategy_flags(mode: str):
+    """
+    MAIN: MAIN + SCALP_BTC
+    SAFE: MAIN only
+    TEST: MAIN + SCALP_BTC (mock order only)
+    """
+    legacy_on = bool(getattr(config, "SCALP_LEGACY_ENABLED", False))
+    scalp_btc_on = bool(getattr(config, "SCALP_BTC_ENABLED", True))
+    if mode == "SAFE":
+        return True, False, False, False
     if mode == "TEST":
-        return False, True
-    if mode == "DUAL":
-        return True, True
-    return bool(getattr(config, "ENABLE_MAIN_STRATEGY", True)), bool(getattr(config, "ENABLE_SCALP_STRATEGY", True))
+        return True, False and legacy_on, scalp_btc_on, True
+    # MAIN(default)
+    return True, legacy_on, scalp_btc_on, False
+
+
+class _TickerLock:
+    def __init__(self):
+        self._exp = {}
+
+    def acquire(self, ticker: str, now: dt.datetime, timeout_sec: float) -> bool:
+        timeout_sec = max(1.0, float(timeout_sec))
+        exp = self._exp.get(ticker)
+        if isinstance(exp, dt.datetime) and now < exp:
+            return False
+        self._exp[ticker] = now + dt.timedelta(seconds=timeout_sec)
+        return True
+
+    def release(self, ticker: str):
+        self._exp.pop(ticker, None)
+
+
+def _scalp_btc_is_holding(scalp_btc_state: dict) -> bool:
+    return bool((scalp_btc_state or {}).get("holding", False))
+
+
+def _all_holding_tickers_with_scalp_btc(strategy_state: dict, scalp_btc_state: dict):
+    out = _all_holding_tickers(strategy_state)
+    if _scalp_btc_is_holding(scalp_btc_state):
+        out.add(str(getattr(config, "SCALP_BTC_TICKER", "KRW-BTC")))
+    return out
+
+
+def _count_total_holdings_with_scalp_btc(strategy_state: dict, scalp_btc_state: dict, include_legacy_scalp: bool):
+    total = _count_strategy_holdings(strategy_state.get("MAIN", {}))
+    if include_legacy_scalp:
+        total += _count_strategy_holdings(strategy_state.get("SCALP", {}))
+    if _scalp_btc_is_holding(scalp_btc_state):
+        total += 1
+    return int(total)
+
+
+def _get_scalp_btc_buy_krw(equity: float, krw: float):
+    per_share = float(getattr(config, "SCALP_BTC_PER_TRADE_SHARE", 0.10))
+    max_share = float(getattr(config, "SCALP_BTC_MAX_SHARE", 0.20))
+    per_krw = float(equity) * per_share
+    cap_krw = float(equity) * max_share
+    buy_krw = min(per_krw, cap_krw, float(krw))
+
+    required = float(getattr(config, "MIN_ORDER_KRW", 5_000)) * float(getattr(config, "SCALP_BTC_MIN_ORDER_BUFFER", 1.02))
+    if buy_krw < required:
+        print(f"[SCALP_BTC] skip: size {buy_krw:,.0f} < required_min {required:,.0f} (fee buffer)")
+        return 0.0
+    return float(buy_krw)
+
+
+def _scalp_btc_reset_position(state: dict):
+    state["holding"] = False
+    state["entry_price"] = 0.0
+    state["qty"] = 0.0
+    state["entry_time"] = None
+    state["peak_price"] = 0.0
+
+
+def _scalp_btc_close_position(
+    upbit,
+    now: dt.datetime,
+    state: dict,
+    prices: dict,
+    reason: str,
+    persist_state_fn,
+):
+    ticker = str(getattr(config, "SCALP_BTC_TICKER", "KRW-BTC"))
+    if not bool(state.get("holding", False)):
+        return True, None
+
+    cur = prices.get(ticker)
+    if cur is None:
+        try:
+            cur = float(pyupbit.get_current_price(ticker))
+        except Exception:
+            cur = None
+    if cur is None or float(cur) <= 0:
+        return False, "price_unavailable"
+    cur = float(cur)
+
+    entry = float(state.get("entry_price", 0.0))
+    qty = float(state.get("qty", 0.0))
+    if bool(getattr(config, "REAL_ORDER", False)):
+        coin = ticker.split("-")[1]
+        qty = float(get_balance(upbit, coin))
+    if qty <= 0:
+        _scalp_btc_reset_position(state)
+        persist_state_fn()
+        return True, None
+
+    order_value = qty * cur
+    if order_value < float(getattr(config, "MIN_ORDER_KRW", 5_000)):
+        if bool(getattr(config, "DUST_CLOSE_AS_CLOSED", True)):
+            _scalp_btc_reset_position(state)
+            persist_state_fn()
+            return True, None
+        return False, "below_min_order"
+
+    ok = True
+    err_msg = ""
+    if bool(getattr(config, "REAL_ORDER", False)):
+        ok = False
+        max_retry = int(getattr(config, "ORDER_RETRY_MAX", 3))
+        sleep_sec = float(getattr(config, "ORDER_RETRY_SLEEP_SEC", 0.35))
+        for i in range(max_retry):
+            try:
+                resp = upbit.sell_market_order(ticker, qty)
+                log_order("SELL", ticker, qty, True, f"scalp_btc_close try={i+1} resp={str(resp)[:120]}")
+                ok = True
+                break
+            except Exception as e:
+                err_msg = str(e)
+                log_order("SELL", ticker, qty, False, f"scalp_btc_close try={i+1} err={err_msg}")
+                time.sleep(sleep_sec)
+    else:
+        log_order("SELL", ticker, qty, True, "scalp_btc_mock")
+
+    if not ok:
+        return False, f"sell_failed:{err_msg}"
+
+    pnl = (cur / entry - 1.0) if entry > 0 else 0.0
+    cd_min = int(getattr(config, "SCALP_BTC_COOLDOWN_PROFIT_MIN", 10))
+    if pnl < 0:
+        cd_min = int(getattr(config, "SCALP_BTC_COOLDOWN_LOSS_MIN", 30))
+    state["cooldown_until"] = now + dt.timedelta(minutes=max(1, cd_min))
+
+    if pnl < 0:
+        state["loss_streak"] = int(state.get("loss_streak", 0)) + 1
+        print(f"[LOSS_STREAK][SCALP_BTC] {state['loss_streak']}")
+        max_streak = int(getattr(config, "SCALP_BTC_MAX_LOSS_STREAK", 2))
+        if int(state["loss_streak"]) >= max_streak:
+            pause_min = int(getattr(config, "SCALP_BTC_PAUSE_MIN_AFTER_STREAK", 60))
+            state["paused_until"] = now + dt.timedelta(minutes=max(1, pause_min))
+            state["loss_streak"] = 0
+            print(f"[SCALP_BTC_PAUSE] reason=LOSS_STREAK until={state['paused_until'].strftime('%H:%M:%S')}")
+    else:
+        state["loss_streak"] = 0
+
+    append_trade_log(
+        config.TRADE_LOG_PATH,
+        [
+            now.strftime("%Y-%m-%d %H:%M:%S"),
+            ticker,
+            f"{entry:.6f}",
+            f"{cur:.6f}",
+            f"{(pnl * 100.0):.2f}",
+            reason,
+            "SCALP_BTC",
+            "SCALP_BTC",
+        ],
+    )
+    print(f"[CLOSE][SCALP_BTC] {ticker} pnl={(pnl * 100.0):+.2f}% reason={reason}")
+    _scalp_btc_reset_position(state)
+    persist_state_fn()
+    return True, None
+
+
+def _manage_scalp_btc_position(upbit, now: dt.datetime, state: dict, prices: dict, persist_state_fn):
+    if not bool(state.get("holding", False)):
+        return False
+
+    ticker = str(getattr(config, "SCALP_BTC_TICKER", "KRW-BTC"))
+    cur = prices.get(ticker)
+    if cur is None:
+        return False
+    cur = float(cur)
+
+    entry = float(state.get("entry_price", 0.0))
+    if entry <= 0:
+        return False
+
+    state["peak_price"] = max(float(state.get("peak_price", entry)), cur)
+    pnl = (cur / entry) - 1.0
+    from_peak = (cur / max(float(state.get("peak_price", cur)), 1e-12)) - 1.0
+
+    reason = None
+    if pnl <= -float(getattr(config, "SCALP_BTC_SL_PCT", 0.009)):
+        reason = "scalp_btc_stop_loss"
+    elif pnl >= float(getattr(config, "SCALP_BTC_TP_PCT", 0.012)):
+        reason = "scalp_btc_take_profit"
+    elif bool(getattr(config, "SCALP_BTC_TRAIL_ON", True)):
+        trail_from = float(getattr(config, "SCALP_BTC_TRAIL_FROM", 0.010))
+        giveback = float(getattr(config, "SCALP_BTC_TRAIL_GIVEBACK", 0.006))
+        if pnl >= trail_from and from_peak <= -giveback:
+            reason = "scalp_btc_trailing"
+
+    if reason is None:
+        entry_time = state.get("entry_time")
+        if isinstance(entry_time, dt.datetime):
+            hold_min = (now - entry_time).total_seconds() / 60.0
+            if hold_min >= float(getattr(config, "SCALP_BTC_MAX_HOLD_MIN", 90)):
+                reason = "scalp_btc_timeout"
+
+    if reason is None:
+        return False
+
+    _scalp_btc_close_position(
+        upbit=upbit,
+        now=now,
+        state=state,
+        prices=prices,
+        reason=reason,
+        persist_state_fn=persist_state_fn,
+    )
+    return True
+
+
+def _try_scalp_btc_entry(
+    upbit,
+    now: dt.datetime,
+    state: dict,
+    prices: dict,
+    equity: float,
+    krw: float,
+    max_holdings: int,
+    total_holding: int,
+    main_state: dict,
+    persist_state_fn,
+    ticker_lock: _TickerLock,
+):
+    ticker = str(getattr(config, "SCALP_BTC_TICKER", "KRW-BTC"))
+
+    if bool(state.get("holding", False)):
+        return False
+    if total_holding >= int(max_holdings):
+        return False
+    if int(getattr(config, "SCALP_BTC_MAX_POSITIONS", 1)) < 1:
+        return False
+
+    paused_until = state.get("paused_until")
+    if isinstance(paused_until, dt.datetime) and now < paused_until:
+        return False
+    cooldown_until = state.get("cooldown_until")
+    if isinstance(cooldown_until, dt.datetime) and now < cooldown_until:
+        return False
+
+    if bool(getattr(config, "SCALP_BTC_BLOCK_WHEN_MAIN_HOLDING", False)):
+        if _count_strategy_holdings(main_state) > 0:
+            return False
+
+    if bool(main_state.get(ticker, {}).get("holding", False)):
+        return False
+
+    buy_krw = _get_scalp_btc_buy_krw(equity, krw)
+    if buy_krw <= 0:
+        return False
+
+    if not bool(scalp_btc_entry_signal(ticker)):
+        return False
+
+    lock_timeout = float(getattr(config, "SCALP_BTC_LOCK_TIMEOUT_SEC", 5))
+    if not ticker_lock.acquire(ticker, now, lock_timeout):
+        print(f"[SCALP_BTC] deferred: lock busy {ticker}")
+        return False
+
+    try:
+        cur = prices.get(ticker)
+        if cur is None or float(cur) <= 0:
+            return False
+        cur = float(cur)
+
+        if bool(getattr(config, "REAL_ORDER", False)):
+            upbit.buy_market_order(ticker, buy_krw)
+            qty, entry = wait_for_filled_snapshot(upbit, ticker, timeout_sec=3.0, interval=0.2)
+            qty = float(qty) if float(qty) > 0 else float(buy_krw) / cur
+            entry = float(entry) if float(entry) > 0 else cur
+            log_order("BUY", ticker, qty, True, "scalp_btc")
+        else:
+            qty = float(buy_krw) / cur
+            entry = cur
+            log_order("BUY", ticker, qty, True, "scalp_btc_mock")
+
+        state["holding"] = True
+        state["ticker"] = ticker
+        state["entry_price"] = float(entry)
+        state["qty"] = float(qty)
+        state["entry_time"] = now
+        state["peak_price"] = float(entry)
+        print(f"[SCALP_BTC ENTRY] BUY {ticker} | KRW={buy_krw:,.0f}")
+        persist_state_fn()
+        return True
+    except Exception as e:
+        log_order("BUY", ticker, 0.0, False, f"scalp_btc_err={e}")
+        print(f"[WARN] buy failed(SCALP_BTC): {ticker} err={e}")
+        return False
+    finally:
+        ticker_lock.release(ticker)
 
 
 def run():
-    bot_mode = str(getattr(config, "BOT_MODE", "TEST")).upper().strip()
-    enable_main, enable_scalp = _mode_to_strategy_flags(bot_mode)
+    bot_mode = _resolve_mode()
+    enable_main, enable_scalp_legacy, enable_scalp_btc, force_mock_order = _mode_to_strategy_flags(bot_mode)
+
+    if force_mock_order and bool(getattr(config, "REAL_ORDER", False)):
+        print("[MODE] TEST mode detected: force REAL_ORDER=False")
+        config.REAL_ORDER = False
 
     access, secret = load_keys()
     upbit = pyupbit.Upbit(access, secret)
 
-    if bool(getattr(config, "REAL_ORDER", False)) and bool(getattr(config, "REQUIRE_ORDER_CONFIRM", False)):
-        print("[WARN] REAL_ORDER=True (live order mode)")
-        ans = input("정말 실전 매매를 시작할까요? 진행하려면 'yes' 입력: ").strip().lower()
-        if ans != "yes":
-            print("[STOP] canceled")
-            return
+    if bool(getattr(config, "REAL_ORDER", False)):
+        print("[WARN] REAL_ORDER=True (live order mode) | auto-start (confirmation disabled)")
 
     ensure_trade_log_header(config.TRADE_LOG_PATH)
 
-    strategy_state, strategy_cooldowns, inactive_positions = load_state()
+    strategy_state, strategy_cooldowns, inactive_positions, scalp_btc_state = load_state()
     for s in STRATEGIES:
         strategy_state.setdefault(s, {})
         strategy_cooldowns.setdefault(s, {})
 
     verify_state_with_balance(upbit, strategy_state)
-
     repaired_dup = _repair_cross_strategy_duplicate_holdings(strategy_state)
 
     market_info = get_upbit_krw_markets()
@@ -435,7 +741,12 @@ def run():
         print(f"[STATE] moved count: {moved_count}")
 
     def persist_state(*_args, **_kwargs):
-        save_state(strategy_state, strategy_cooldowns, inactive_positions=inactive_positions)
+        save_state(
+            strategy_state,
+            strategy_cooldowns,
+            inactive_positions=inactive_positions,
+            scalp_btc_state=scalp_btc_state,
+        )
 
     if moved_count or repaired_dup:
         persist_state()
@@ -443,6 +754,7 @@ def run():
     now = now_kst()
     momentum_seen_at = {}
     surge_stoploss_until = {}
+    ticker_lock = _TickerLock()
 
     raw_ranked = get_top_tickers_by_value(
         int(getattr(config, "UNIVERSE_SCAN_N", config.TOP_N)),
@@ -451,7 +763,10 @@ def run():
     core_universe, surge_pool, inactive_universe, inactive_reasons, core_filter_rejects = _core_and_surge_from_ranked(
         raw_ranked, market_info
     )
-    surge_candidates, momentum_seen_at = _update_surge_candidates(surge_pool, momentum_seen_at, now)
+    if enable_scalp_legacy:
+        surge_candidates, momentum_seen_at = _update_surge_candidates(surge_pool, momentum_seen_at, now)
+    else:
+        surge_candidates = []
     active_universe = _dedupe_keep_order(core_universe + surge_candidates)
     inactive_tickers = set(inactive_universe) | set(inactive_positions.keys())
     main_filter_reject_stats = Counter(core_filter_rejects or {})
@@ -468,18 +783,14 @@ def run():
     last_state_save = now
     trading_day = now.date()
 
-    day_tp1_count = {s: 0 for s in STRATEGIES}
-    loss_seq = {s: 0 for s in STRATEGIES}
-    scalp_pause_until = None
-    tp1_counted = {
-        s: {
-            t
-            for t, st in (strategy_state.get(s, {}) or {}).items()
-            if bool(st.get("holding", False)) and bool(st.get("tp1", False))
-        }
-        for s in STRATEGIES
+    day_tp1_count_main = 0
+    loss_seq_main = 0
+    tp1_counted_main = {
+        t
+        for t, st in (strategy_state.get("MAIN", {}) or {}).items()
+        if bool(st.get("holding", False)) and bool(st.get("tp1", False))
     }
-    entry_blocked_prev = {s: False for s in STRATEGIES}
+    main_entry_blocked_prev = False
 
     day_cache = {}
     intraday_cache = {}
@@ -487,12 +798,15 @@ def run():
 
     print(
         f"[BOT] start | MODE={bot_mode} | REAL_ORDER={config.REAL_ORDER} "
-        f"| MAIN={'ON' if enable_main else 'OFF'} SCALP={'ON' if enable_scalp else 'OFF'}"
+        f"| MAIN={'ON' if enable_main else 'OFF'} "
+        f"SCALP_BTC={'ON' if enable_scalp_btc else 'OFF'} "
+        f"LEGACY_SCALP={'ON' if enable_scalp_legacy else 'OFF'}"
     )
 
     while True:
         try:
             now = now_kst()
+            main_entry_intent = None
 
             if (now - last_refresh).total_seconds() >= float(config.REFRESH_MIN) * 60.0:
                 print("\n[REFRESH] universe")
@@ -507,7 +821,11 @@ def run():
                     inactive_reasons,
                     core_filter_rejects,
                 ) = _core_and_surge_from_ranked(raw_ranked, market_info)
-                surge_candidates, momentum_seen_at = _update_surge_candidates(surge_pool, momentum_seen_at, now)
+
+                if enable_scalp_legacy:
+                    surge_candidates, momentum_seen_at = _update_surge_candidates(surge_pool, momentum_seen_at, now)
+                else:
+                    surge_candidates = []
                 active_universe = _dedupe_keep_order(core_universe + surge_candidates)
                 inactive_tickers = set(inactive_universe) | set(inactive_positions.keys())
                 main_filter_reject_stats.update(core_filter_rejects or {})
@@ -528,14 +846,12 @@ def run():
                 main_filter_reject_stats.clear()
                 main_filter_summary_last = now
 
-            today = now.date()
-            if today != trading_day:
-                trading_day = today
-                day_tp1_count = {s: 0 for s in STRATEGIES}
-                loss_seq = {s: 0 for s in STRATEGIES}
-                scalp_pause_until = None
-                tp1_counted = {s: set() for s in STRATEGIES}
-                entry_blocked_prev = {s: False for s in STRATEGIES}
+            if now.date() != trading_day:
+                trading_day = now.date()
+                day_tp1_count_main = 0
+                loss_seq_main = 0
+                tp1_counted_main = set()
+                main_entry_blocked_prev = False
                 print("[DAY_RESET] counters reset")
 
             regime = "FULL"
@@ -545,9 +861,15 @@ def run():
                 except Exception:
                     regime = "MID"
 
-            holding_tickers = _all_holding_tickers(strategy_state)
+            btc_ticker = str(getattr(config, "SCALP_BTC_TICKER", "KRW-BTC"))
+            holding_tickers = _all_holding_tickers_with_scalp_btc(strategy_state, scalp_btc_state)
             inactive_holding_tickers = [t for t, s in (inactive_positions or {}).items() if s.get("holding", False)]
-            price_targets = set(core_universe) | set(surge_candidates) | set(holding_tickers) | set(inactive_holding_tickers)
+
+            price_targets = set(core_universe) | set(holding_tickers) | set(inactive_holding_tickers)
+            if enable_scalp_legacy:
+                price_targets |= set(surge_candidates)
+            if enable_scalp_btc:
+                price_targets.add(btc_ticker)
             prices = batch_get_prices(price_targets)
 
             krw = float(get_balance(upbit, "KRW"))
@@ -555,66 +877,169 @@ def run():
             prices["_caches"] = (day_cache, intraday_cache, minute_cache)
 
             equity = estimate_equity(krw, strategy_state, prices, upbit, inactive_positions=inactive_positions)
+            if _scalp_btc_is_holding(scalp_btc_state):
+                btc_px = prices.get(btc_ticker)
+                if btc_px is not None:
+                    qty = float(scalp_btc_state.get("qty", 0.0))
+                    if bool(getattr(config, "REAL_ORDER", False)):
+                        qty = float(get_balance(upbit, btc_ticker.split("-")[1]))
+                    if qty > 0:
+                        equity += qty * float(btc_px)
+
             base_per_trade, base_max_holdings = get_base_position_settings(equity)
             per_trade_main, max_holdings = apply_market_regime(equity, base_per_trade, base_max_holdings, regime)
             h_key, h_scale = apply_runtime_params_by_holdings(max_holdings)
 
-            total_holding = _count_total_holdings(strategy_state)
+            total_holding = _count_total_holdings_with_scalp_btc(
+                strategy_state, scalp_btc_state, include_legacy_scalp=enable_scalp_legacy
+            )
 
-            for s in STRATEGIES:
-                day_tp1_count[s] = update_day_tp1_counter(
-                    strategy_state.get(s, {}),
-                    tp1_counted[s],
-                    day_tp1_count[s],
-                    s,
-                )
+            day_tp1_count_main = update_day_tp1_counter(
+                strategy_state.get("MAIN", {}),
+                tp1_counted_main,
+                day_tp1_count_main,
+                "MAIN",
+            )
 
             tp1_limit = int(getattr(config, "DAILY_TP1_EXIT_LIMIT", 3))
             main_loss_limit = int(getattr(config, "MAIN_CONSEC_LOSS_LIMIT", getattr(config, "CONSEC_LOSS_EXIT_LIMIT", 4)))
-            scalp_loss_limit = int(
-                getattr(config, "SCALP_CONSEC_LOSS_LIMIT", getattr(config, "CONSEC_LOSS_EXIT_LIMIT", 4))
-            )
+            main_entry_allowed = (day_tp1_count_main < tp1_limit) and (loss_seq_main < main_loss_limit)
 
-            entry_allowed = {
-                "MAIN": (day_tp1_count["MAIN"] < tp1_limit) and (loss_seq["MAIN"] < main_loss_limit),
-                "SCALP": (day_tp1_count["SCALP"] < tp1_limit)
-                and (loss_seq["SCALP"] < scalp_loss_limit)
-                and (scalp_pause_until is None or now >= scalp_pause_until),
-            }
-
-            for s in STRATEGIES:
-                blocked = not entry_allowed[s]
-                if blocked and not entry_blocked_prev[s]:
-                    if day_tp1_count[s] >= tp1_limit:
-                        print(f"[ENTRY_BLOCK][{s}] reason=TP1_LIMIT count={day_tp1_count[s]}")
-                    if (s == "MAIN" and loss_seq[s] >= main_loss_limit) or (
-                        s == "SCALP" and loss_seq[s] >= scalp_loss_limit
-                    ):
-                        print(f"[ENTRY_BLOCK][{s}] reason=LOSS_STREAK count={loss_seq[s]}")
-                    if s == "SCALP" and scalp_pause_until is not None and now < scalp_pause_until:
-                        remain = int((scalp_pause_until - now).total_seconds() / 60)
-                        print(f"[ENTRY_BLOCK][SCALP] reason=PAUSE remain_min={max(0, remain)}")
-                entry_blocked_prev[s] = blocked
+            blocked_main = not main_entry_allowed
+            if blocked_main and not main_entry_blocked_prev:
+                if day_tp1_count_main >= tp1_limit:
+                    print(f"[ENTRY_BLOCK][MAIN] reason=TP1_LIMIT count={day_tp1_count_main}")
+                if loss_seq_main >= main_loss_limit:
+                    print(f"[ENTRY_BLOCK][MAIN] reason=LOSS_STREAK count={loss_seq_main}")
+            main_entry_blocked_prev = blocked_main
 
             if (now - last_status).total_seconds() >= float(config.STATUS_PRINT_SEC):
                 main_h = _count_strategy_holdings(strategy_state.get("MAIN", {}))
-                scalp_h = _count_strategy_holdings(strategy_state.get("SCALP", {}))
+                legacy_h = _count_strategy_holdings(strategy_state.get("SCALP", {})) if enable_scalp_legacy else 0
+                scalp_btc_h = 1 if _scalp_btc_is_holding(scalp_btc_state) else 0
                 pause_txt = "-"
-                if scalp_pause_until is not None and now < scalp_pause_until:
-                    pause_txt = f"{max(0, int((scalp_pause_until - now).total_seconds() / 60))}m"
+                paused_until = scalp_btc_state.get("paused_until")
+                if isinstance(paused_until, dt.datetime) and now < paused_until:
+                    pause_txt = f"{max(0, int((paused_until - now).total_seconds() / 60))}m"
                 print(
                     f"[STATUS] Regime={regime} | Equity~{equity:,.0f} | PerTrade~{per_trade_main:,.0f} | "
-                    f"Holding={total_holding}/{max_holdings} | MAIN={main_h} SCALP={scalp_h} | "
+                    f"Holding={total_holding}/{max_holdings} | MAIN={main_h} LEGACY={legacy_h} SCALP_BTC={scalp_btc_h} | "
                     f"Core={len(core_universe)} Surge={len(surge_candidates)} | "
-                    f"HKey={h_key} HScale={h_scale:.2f} | TP1(M/S)={day_tp1_count['MAIN']}/{day_tp1_count['SCALP']} "
-                    f"Loss(M/S)={loss_seq['MAIN']}/{loss_seq['SCALP']} | SPause={pause_txt}"
+                    f"HKey={h_key} HScale={h_scale:.2f} | TP1_MAIN={day_tp1_count_main} "
+                    f"Loss_MAIN={loss_seq_main} SBtcLoss={int(scalp_btc_state.get('loss_streak', 0))} SBtcPause={pause_txt}"
                 )
                 last_status = now
 
-            # MAIN entry
-            if enable_main and entry_allowed["MAIN"] and total_holding < max_holdings:
-                if float(per_trade_main) > 0:
-                    _ = try_main_entries(
+            # 1) MAIN position management
+            if enable_main:
+                events_main = manage_positions(
+                    upbit=upbit,
+                    now=now,
+                    state=strategy_state["MAIN"],
+                    prices=prices,
+                    cooldown_until=strategy_cooldowns["MAIN"],
+                    save_state_fn=persist_state,
+                    inactive_tickers=inactive_tickers,
+                    inactive_positions=inactive_positions,
+                    strategy="MAIN",
+                )
+                if events_main:
+                    loss_seq_main = update_loss_seq_from_events(events_main, loss_seq_main, "MAIN")
+                    day_tp1_count_main = update_day_tp1_counter(
+                        strategy_state.get("MAIN", {}),
+                        tp1_counted_main,
+                        day_tp1_count_main,
+                        "MAIN",
+                    )
+
+            # 2) SCALP_BTC position management
+            if enable_scalp_btc:
+                _manage_scalp_btc_position(
+                    upbit=upbit,
+                    now=now,
+                    state=scalp_btc_state,
+                    prices=prices,
+                    persist_state_fn=persist_state,
+                )
+
+            # 2b) Legacy SCALP position management (optional)
+            if enable_scalp_legacy:
+                events_scalp = manage_positions(
+                    upbit=upbit,
+                    now=now,
+                    state=strategy_state["SCALP"],
+                    prices=prices,
+                    cooldown_until=strategy_cooldowns["SCALP"],
+                    save_state_fn=persist_state,
+                    inactive_tickers=inactive_tickers,
+                    inactive_positions=inactive_positions,
+                    strategy="SCALP",
+                )
+                if events_scalp:
+                    block_min = int(getattr(config, "SURGE_STOPLOSS_REENTRY_BLOCK_MIN", 30))
+                    for e in events_scalp:
+                        pnl = float(e.get("pnl_pct", 0.0))
+                        reason = str(e.get("reason", ""))
+                        if pnl < 0 and reason in {"stop_loss", "trailing"}:
+                            t = str(e.get("ticker", ""))
+                            if t:
+                                surge_stoploss_until[t] = now + dt.timedelta(minutes=block_min)
+                                print(f"[SURGE_BLOCK] {t} blocked {block_min}m ({reason})")
+
+            total_holding = _count_total_holdings_with_scalp_btc(
+                strategy_state, scalp_btc_state, include_legacy_scalp=enable_scalp_legacy
+            )
+
+            # 3) MAIN entry scan (intent at order-finalization)
+            if enable_main and main_entry_allowed and total_holding < max_holdings and float(per_trade_main) > 0:
+                def before_main_buy(ticker: str, buy_krw: float, cur: float):
+                    nonlocal main_entry_intent
+                    if ticker != btc_ticker:
+                        return True
+
+                    main_entry_intent = {"strategy": "MAIN", "ticker": ticker, "ts": now}
+                    try:
+                        if not _scalp_btc_is_holding(scalp_btc_state):
+                            return True
+
+                        lock_timeout = float(getattr(config, "SCALP_BTC_LOCK_TIMEOUT_SEC", 5))
+                        if not ticker_lock.acquire(ticker, now, lock_timeout):
+                            print("[SWITCH] lock busy -> main BTC entry deferred")
+                            return False
+
+                        try:
+                            ok, err = _scalp_btc_close_position(
+                                upbit=upbit,
+                                now=now,
+                                state=scalp_btc_state,
+                                prices=prices,
+                                reason="switch_to_main",
+                                persist_state_fn=persist_state,
+                            )
+                        finally:
+                            ticker_lock.release(ticker)
+
+                        if ok:
+                            scalp_btc_state["switch_fail_count"] = 0
+                            persist_state()
+                            return True
+
+                        print("[SWITCH fail] scalp close failed -> main BTC entry deferred")
+                        cnt = int(scalp_btc_state.get("switch_fail_count", 0)) + 1
+                        scalp_btc_state["switch_fail_count"] = cnt
+                        limit = int(getattr(config, "SCALP_BTC_SWITCH_FAIL_LIMIT", 3))
+                        if cnt >= limit:
+                            pause_min = int(getattr(config, "SCALP_BTC_SWITCH_FAIL_PAUSE_MIN", 60))
+                            scalp_btc_state["paused_until"] = now + dt.timedelta(minutes=max(1, pause_min))
+                            scalp_btc_state["switch_fail_count"] = 0
+                            print("[SCALP_BTC_PAUSE] paused 60m due to repeated switch failures")
+                        persist_state()
+                        return False
+                    finally:
+                        main_entry_intent = None
+
+                try:
+                    did_main = try_main_entries(
                         upbit=upbit,
                         now=now,
                         universe=core_universe,
@@ -630,93 +1055,69 @@ def run():
                         save_state_fn=persist_state,
                         inactive_tickers=inactive_tickers,
                         inactive_positions=inactive_positions,
-                        global_holding_tickers=_all_holding_tickers(strategy_state),
+                        global_holding_tickers=_all_holding_tickers_with_scalp_btc(strategy_state, scalp_btc_state),
+                        before_buy_fn=before_main_buy,
                     )
-                    if _:
-                        total_holding = _count_total_holdings(strategy_state)
+                finally:
+                    main_entry_intent = None
 
-            # SCALP entry
-            if enable_scalp and entry_allowed["SCALP"] and total_holding < max_holdings:
-                if _is_dawn_hour(now) and bool(getattr(config, "SCALP_DAWN_BLOCK", False)):
-                    pass
-                else:
-                    conservative = False
-                    if _is_dawn_hour(now) and bool(getattr(config, "SCALP_DAWN_CONSERVATIVE", True)):
-                        conservative = True
-                    if loss_seq["SCALP"] >= int(getattr(config, "SCALP_LOSSSEQ_CONSERVATIVE_TRIGGER", 2)):
-                        conservative = True
-
-                    scalp_universe = []
-                    for ticker in surge_candidates:
-                        until = surge_stoploss_until.get(ticker)
-                        if until is not None and now < until:
-                            continue
-                        scalp_universe.append(ticker)
-
-                    scalp_buy_krw = float(getattr(config, "MINUTE_TEST_PER_TRADE_KRW", config.TEST_PER_TRADE_KRW))
-                    _ = try_scalp_entries(
-                        upbit=upbit,
-                        now=now,
-                        universe=scalp_universe,
-                        prices=prices,
-                        state=strategy_state["SCALP"],
-                        cooldown_until=strategy_cooldowns["SCALP"],
-                        per_trade_amt=scalp_buy_krw,
-                        max_holdings=max_holdings,
-                        total_holding_cnt=total_holding,
-                        regime=regime,
-                        wait_for_filled_snapshot_fn=wait_for_filled_snapshot,
-                        save_state_fn=persist_state,
-                        inactive_tickers=inactive_tickers,
-                        inactive_positions=inactive_positions,
-                        global_holding_tickers=_all_holding_tickers(strategy_state),
-                        conservative=conservative,
+                if did_main:
+                    total_holding = _count_total_holdings_with_scalp_btc(
+                        strategy_state, scalp_btc_state, include_legacy_scalp=enable_scalp_legacy
                     )
-                    if _:
-                        total_holding = _count_total_holdings(strategy_state)
 
-            # Position management per strategy
-            for s in STRATEGIES:
-                events = manage_positions(
+            # 4) Legacy SCALP entry (optional)
+            if enable_scalp_legacy and total_holding < max_holdings:
+                scalp_universe = []
+                for ticker in surge_candidates:
+                    until = surge_stoploss_until.get(ticker)
+                    if until is not None and now < until:
+                        continue
+                    scalp_universe.append(ticker)
+
+                scalp_buy_krw = float(getattr(config, "MINUTE_TEST_PER_TRADE_KRW", config.TEST_PER_TRADE_KRW))
+                did_legacy = try_scalp_entries(
                     upbit=upbit,
                     now=now,
-                    state=strategy_state[s],
+                    universe=scalp_universe,
                     prices=prices,
-                    cooldown_until=strategy_cooldowns[s],
+                    state=strategy_state["SCALP"],
+                    cooldown_until=strategy_cooldowns["SCALP"],
+                    per_trade_amt=scalp_buy_krw,
+                    max_holdings=max_holdings,
+                    total_holding_cnt=total_holding,
+                    regime=regime,
+                    wait_for_filled_snapshot_fn=wait_for_filled_snapshot,
                     save_state_fn=persist_state,
                     inactive_tickers=inactive_tickers,
                     inactive_positions=inactive_positions,
-                    strategy=s,
+                    global_holding_tickers=_all_holding_tickers_with_scalp_btc(strategy_state, scalp_btc_state),
+                    conservative=False,
                 )
-                if events:
-                    prev_loss = int(loss_seq[s])
-                    loss_seq[s] = update_loss_seq_from_events(events, loss_seq[s], s)
-                    if s == "SCALP":
-                        if bool(getattr(config, "SCALP_PAUSE_ON_LOSSSEQ", True)):
-                            trig = int(getattr(config, "SCALP_PAUSE_LOSSSEQ_TRIGGER", 2))
-                            pause_min = int(getattr(config, "SCALP_PAUSE_MINUTES", 60))
-                            if prev_loss < trig <= int(loss_seq[s]):
-                                scalp_pause_until = now + dt.timedelta(minutes=max(1, pause_min))
-                                print(
-                                    f"[SCALP_PAUSE] reason=LOSS_STREAK "
-                                    f"loss_seq={loss_seq[s]} until={scalp_pause_until.strftime('%H:%M:%S')}"
-                                )
-                        block_min = int(getattr(config, "SURGE_STOPLOSS_REENTRY_BLOCK_MIN", 30))
-                        for e in events:
-                            pnl = float(e.get("pnl_pct", 0.0))
-                            reason = str(e.get("reason", ""))
-                            if pnl < 0 and reason in {"stop_loss", "trailing"}:
-                                t = str(e.get("ticker", ""))
-                                if t:
-                                    surge_stoploss_until[t] = now + dt.timedelta(minutes=block_min)
-                                    print(f"[SURGE_BLOCK] {t} blocked {block_min}m ({reason})")
+                if did_legacy:
+                    total_holding = _count_total_holdings_with_scalp_btc(
+                        strategy_state, scalp_btc_state, include_legacy_scalp=enable_scalp_legacy
+                    )
 
-                day_tp1_count[s] = update_day_tp1_counter(
-                    strategy_state.get(s, {}),
-                    tp1_counted[s],
-                    day_tp1_count[s],
-                    s,
+            # 5) SCALP_BTC entry (always last)
+            if enable_scalp_btc and total_holding < max_holdings:
+                did_scalp_btc = _try_scalp_btc_entry(
+                    upbit=upbit,
+                    now=now,
+                    state=scalp_btc_state,
+                    prices=prices,
+                    equity=equity,
+                    krw=krw,
+                    max_holdings=max_holdings,
+                    total_holding=total_holding,
+                    main_state=strategy_state["MAIN"],
+                    persist_state_fn=persist_state,
+                    ticker_lock=ticker_lock,
                 )
+                if did_scalp_btc:
+                    total_holding = _count_total_holdings_with_scalp_btc(
+                        strategy_state, scalp_btc_state, include_legacy_scalp=enable_scalp_legacy
+                    )
 
             if (now - last_state_save).total_seconds() >= float(config.STATE_SAVE_INTERVAL_SEC):
                 persist_state()

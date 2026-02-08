@@ -120,6 +120,7 @@ def try_main_entries(
     inactive_tickers=None,
     inactive_positions=None,
     global_holding_tickers=None,
+    before_buy_fn=None,
 ):
     day_cache, intraday_cache, minute_cache = _safe_caches(prices)
     krw = _safe_krw(prices)
@@ -182,6 +183,14 @@ def try_main_entries(
             if _is_blocked_ticker(ticker, inactive_tickers, inactive_positions):
                 print(f"[BLOCK] inactive ticker buy blocked: {ticker}")
                 continue
+            if callable(before_buy_fn):
+                try:
+                    allowed = bool(before_buy_fn(ticker=ticker, buy_krw=float(per_trade_amt), cur=float(cur)))
+                except Exception as e:
+                    print(f"[WARN] before_buy failed(MAIN): {ticker} err={e}")
+                    continue
+                if not allowed:
+                    continue
             initial_vol, entry_price = _execute_buy(
                 upbit=upbit,
                 ticker=ticker,

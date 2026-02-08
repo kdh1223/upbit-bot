@@ -49,6 +49,10 @@ def get_sma(series, period):
     return series.rolling(period).mean()
 
 
+def get_ema(series, period):
+    return series.ewm(span=period, adjust=False).mean()
+
+
 def safe_last(series):
     try:
         v = float(series.iloc[-1])
@@ -401,6 +405,72 @@ def minute_test_signal(ticker):
         )
 
     return True
+
+
+def scalp_btc_entry_signal(ticker):
+    """
+    BTC-only scalp signal (oversold + rebound confirmation):
+    - Environment:
+      RSI <= oversold threshold and recent volume spike exists
+    - Rebound trigger:
+      satisfy at least 2 of 3
+    """
+    interval = str(getattr(config, "SCALP_BTC_TF", "minute15"))
+    rsi_len = int(getattr(config, "SCALP_BTC_RSI_LEN", 14))
+    rsi_os = float(getattr(config, "SCALP_BTC_RSI_OS", 28))
+    vol_lb = max(5, int(getattr(config, "SCALP_BTC_VOL_LOOKBACK", 20)))
+    vol_mult = float(getattr(config, "SCALP_BTC_VOL_SPIKE_MULT", 1.5))
+    vol_win = max(1, int(getattr(config, "SCALP_BTC_VOL_SPIKE_WINDOW", 3)))
+    ema_fast = max(2, int(getattr(config, "SCALP_BTC_EMA_FAST", 9)))
+
+    min_needed = max(40, vol_lb + vol_win + 5, rsi_len + 5, ema_fast + 5)
+    df = pyupbit.get_ohlcv(ticker, interval=interval, count=min_needed + 10)
+    if df is None or len(df) < min_needed:
+        return False
+    if "volume" not in df.columns:
+        return False
+
+    close = df["close"]
+    high = df["high"]
+    volume = df["volume"]
+
+    rsi_series = get_rsi(df, rsi_len)
+    ema_series = get_ema(close, ema_fast)
+    vol_ma = volume.rolling(vol_lb).mean()
+
+    close_now = safe_last(close)
+    ema_now = safe_last(ema_series)
+    rsi_now = safe_last(rsi_series)
+    if None in (close_now, ema_now, rsi_now):
+        return False
+
+    try:
+        prev_high = float(high.iloc[-2])
+        rsi_prev = float(rsi_series.iloc[-2])
+        if prev_high != prev_high or rsi_prev != rsi_prev:
+            return False
+    except Exception:
+        return False
+
+    cond_env_rsi = float(rsi_now) <= rsi_os
+
+    spike_flags = (volume > (vol_ma * vol_mult)).tail(vol_win)
+    cond_env_vol = bool(spike_flags.any())
+    if not (cond_env_rsi and cond_env_vol):
+        return False
+
+    trig_1 = float(close_now) > float(prev_high)
+    trig_2 = float(close_now) > float(ema_now)
+    trig_3 = float(rsi_now) > float(rsi_prev)
+    trig_count = int(trig_1) + int(trig_2) + int(trig_3)
+    ok = trig_count >= 2
+
+    if ok and bool(getattr(config, "DEBUG_TRADE_FLOW", False)):
+        print(
+            f"[SCALP_BTC_진입근거] {ticker} rsi_now={float(rsi_now):.2f}<=os({rsi_os:.2f}) "
+            f"vol_spike=1 triggers={trig_count}/3 close={float(close_now):.2f} ema={float(ema_now):.2f}"
+        )
+    return bool(ok)
 
 
 def scalp_entry_signal(ticker, conservative=False):

@@ -10,6 +10,22 @@ from market import get_balance
 
 
 STRATEGIES = ("MAIN", "SCALP")
+SCALP_BTC_DT_FIELDS = ("entry_time", "cooldown_until", "paused_until")
+
+
+def _default_scalp_btc_state():
+    return {
+        "holding": False,
+        "ticker": str(getattr(config, "SCALP_BTC_TICKER", "KRW-BTC")),
+        "entry_price": 0.0,
+        "qty": 0.0,
+        "entry_time": None,
+        "peak_price": 0.0,
+        "cooldown_until": None,
+        "loss_streak": 0,
+        "paused_until": None,
+        "switch_fail_count": 0,
+    }
 
 
 def now_kst():
@@ -40,6 +56,70 @@ def _from_iso_map(raw: dict):
     return out
 
 
+def _parse_dt(value):
+    if value is None:
+        return None
+    if isinstance(value, dt.datetime):
+        return value
+    try:
+        return dt.datetime.fromisoformat(str(value))
+    except Exception:
+        return None
+
+
+def _normalize_scalp_btc_state(raw: dict):
+    state = dict(raw or {})
+    base = _default_scalp_btc_state()
+
+    # Idempotent migration: fill only missing fields.
+    for k, v in base.items():
+        state.setdefault(k, v)
+
+    # Type repair.
+    state["holding"] = bool(state.get("holding", False))
+    state["ticker"] = str(state.get("ticker") or base["ticker"])
+    try:
+        state["entry_price"] = float(state.get("entry_price", 0.0))
+    except Exception:
+        state["entry_price"] = 0.0
+    try:
+        state["qty"] = float(state.get("qty", 0.0))
+    except Exception:
+        state["qty"] = 0.0
+    try:
+        state["peak_price"] = float(state.get("peak_price", 0.0))
+    except Exception:
+        state["peak_price"] = 0.0
+    try:
+        state["loss_streak"] = int(state.get("loss_streak", 0))
+    except Exception:
+        state["loss_streak"] = 0
+    try:
+        state["switch_fail_count"] = int(state.get("switch_fail_count", 0))
+    except Exception:
+        state["switch_fail_count"] = 0
+
+    for key in SCALP_BTC_DT_FIELDS:
+        state[key] = _parse_dt(state.get(key))
+    return state
+
+
+def _scalp_btc_to_json(state: dict):
+    out = dict(state or {})
+    for key in SCALP_BTC_DT_FIELDS:
+        v = out.get(key)
+        if isinstance(v, dt.datetime):
+            out[key] = v.isoformat()
+        elif v is None:
+            out[key] = None
+        else:
+            try:
+                out[key] = dt.datetime.fromisoformat(str(v)).isoformat()
+            except Exception:
+                out[key] = None
+    return out
+
+
 def _is_strategy_dict(value) -> bool:
     if not isinstance(value, dict):
         return False
@@ -55,7 +135,7 @@ def _legacy_target_strategy() -> str:
     return "SCALP"
 
 
-def save_state(state: dict, cooldown_until: dict, inactive_positions: dict = None):
+def save_state(state: dict, cooldown_until: dict, inactive_positions: dict = None, scalp_btc_state: dict = None):
     """
     New format:
     - state: {"MAIN": {...}, "SCALP": {...}}
@@ -83,6 +163,7 @@ def save_state(state: dict, cooldown_until: dict, inactive_positions: dict = Non
             "state": state_out,
             "inactive_positions": inactive_positions or {},
             "cooldown_until": cd_out,
+            "scalp_btc": _scalp_btc_to_json(_normalize_scalp_btc_state(scalp_btc_state or {})),
             "saved_at": now_kst().isoformat(),
             "schema": 2,
         }
@@ -92,9 +173,9 @@ def save_state(state: dict, cooldown_until: dict, inactive_positions: dict = Non
         print(f"[WARN] state save failed: {e}")
 
 
-def load_state() -> Tuple[Dict[str, dict], Dict[str, dict], dict]:
+def load_state() -> Tuple[Dict[str, dict], Dict[str, dict], dict, dict]:
     if not os.path.exists(config.STATE_FILE):
-        return _empty_strategy_payload(), _empty_strategy_payload(), {}
+        return _empty_strategy_payload(), _empty_strategy_payload(), {}, _default_scalp_btc_state()
 
     try:
         with open(config.STATE_FILE, "r", encoding="utf-8-sig") as f:
@@ -103,6 +184,7 @@ def load_state() -> Tuple[Dict[str, dict], Dict[str, dict], dict]:
         inactive_positions = payload.get("inactive_positions", {}) or {}
         state_raw = payload.get("state", {}) or {}
         cd_raw = payload.get("cooldown_until", {}) or {}
+        scalp_btc_raw = payload.get("scalp_btc", {}) or {}
 
         strategy_state = _empty_strategy_payload()
         strategy_cd = _empty_strategy_payload()
@@ -124,10 +206,11 @@ def load_state() -> Tuple[Dict[str, dict], Dict[str, dict], dict]:
         loaded_main = len(strategy_state["MAIN"])
         loaded_scalp = len(strategy_state["SCALP"])
         print(f"[STATE] loaded positions: MAIN={loaded_main}, SCALP={loaded_scalp}")
-        return strategy_state, strategy_cd, inactive_positions
+        scalp_btc_state = _normalize_scalp_btc_state(scalp_btc_raw)
+        return strategy_state, strategy_cd, inactive_positions, scalp_btc_state
     except Exception as e:
         print(f"[WARN] state load failed: {e}")
-        return _empty_strategy_payload(), _empty_strategy_payload(), {}
+        return _empty_strategy_payload(), _empty_strategy_payload(), {}, _default_scalp_btc_state()
 
 
 def _repair_strategy_state_with_balance(upbit, state: dict) -> int:
