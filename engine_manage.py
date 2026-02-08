@@ -102,9 +102,12 @@ def manage_positions(
     save_state_fn,
     inactive_tickers=None,
     inactive_positions=None,
+    strategy: str = "MAIN",
 ):
     inactive_tickers = set(inactive_tickers or [])
     inactive_positions = inactive_positions or {}
+    strategy = str(strategy or "MAIN").upper().strip()
+    events = []
 
     for ticker, s in list(state.items()):
         if not s.get("holding", False):
@@ -172,7 +175,17 @@ def manage_positions(
                     f"{pnl_pct:.2f}",
                     result.get("reason", ""),
                     s.get("regime", ""),
+                    strategy,
                 ],
+            )
+            events.append(
+                {
+                    "time": now,
+                    "ticker": ticker,
+                    "pnl_pct": float(pnl_pct),
+                    "reason": str(result.get("reason", "")),
+                    "strategy": strategy,
+                }
             )
 
             s["holding"] = False
@@ -195,3 +208,4 @@ def manage_positions(
                     min_interval_sec=float(getattr(config, "AUTO_REPORT_MIN_INTERVAL_SEC", 30)),
                     quiet=bool(getattr(config, "AUTO_REPORT_QUIET", True)),
                 )
+    return events

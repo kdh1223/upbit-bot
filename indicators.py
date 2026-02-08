@@ -257,9 +257,96 @@ def minute_test_signal(ticker):
     return True
 
 
+def scalp_entry_signal(ticker, conservative=False):
+    """
+    SCALP dedicated entry signal:
+    - breakout confirmation bars
+    - RSI as secondary filter
+    - MA align
+    - volume expansion
+    """
+    df = pyupbit.get_ohlcv(ticker, interval="minute1", count=120)
+    if df is None or len(df) < 80:
+        return False
+    if "volume" not in df.columns:
+        return False
+
+    close = df["close"]
+    volume = df["volume"]
+    rsi_series = get_rsi(df, 14)
+
+    close_now = safe_last(close)
+    rsi_now = safe_last(rsi_series)
+    ma_fast_now = safe_last(close.rolling(int(getattr(config, "SCALP_MA_FAST", 5))).mean())
+    ma_slow_now = safe_last(close.rolling(int(getattr(config, "SCALP_MA_SLOW", 20))).mean())
+    vol_now = safe_last(volume)
+    vma_now = safe_last(volume.rolling(int(getattr(config, "SCALP_VOL_MA_PERIOD", 20))).mean())
+
+    if None in (close_now, rsi_now, ma_fast_now, ma_slow_now, vol_now, vma_now):
+        return False
+    if float(vma_now) <= 0:
+        return False
+
+    try:
+        rsi_prev = float(rsi_series.iloc[-2])
+        if rsi_prev != rsi_prev:
+            return False
+    except Exception:
+        return False
+
+    lookback = int(getattr(config, "SCALP_BREAKOUT_LOOKBACK", 20))
+    confirm_bars = max(0, int(getattr(config, "SCALP_CONFIRM_BARS", 1)))
+    if len(df) < (lookback + confirm_bars + 5):
+        return False
+
+    # Confirm breakout for N+1 latest bars (N=0 means only current bar).
+    latest_idx = len(df) - 1
+    for offset in range(confirm_bars + 1):
+        ci = latest_idx - offset
+        ws = ci - lookback
+        if ws < 0:
+            return False
+        level = float(close.iloc[ws:ci].max())
+        if float(close.iloc[ci]) <= level:
+            return False
+
+    rsi_min = float(
+        getattr(
+            config,
+            "SCALP_CONSERVATIVE_RSI_MIN" if conservative else "SCALP_RSI_MIN",
+            52.0 if conservative else 50.0,
+        )
+    )
+    rsi_delta_min = float(getattr(config, "SCALP_RSI_DELTA_MIN", 0.2))
+    vol_mult = float(
+        getattr(
+            config,
+            "SCALP_CONSERVATIVE_VOL_MULT" if conservative else "SCALP_VOL_MULT",
+            1.5 if conservative else 1.2,
+        )
+    )
+
+    cond_rsi = float(rsi_now) >= rsi_min and (float(rsi_now) - float(rsi_prev)) >= rsi_delta_min
+    cond_ma = float(ma_fast_now) > float(ma_slow_now) and float(close_now) > float(ma_slow_now)
+    cond_vol = float(vol_now) > float(vma_now) * vol_mult
+
+    if not (cond_rsi and cond_ma and cond_vol):
+        return False
+
+    if bool(getattr(config, "DEBUG_TRADE_FLOW", False)):
+        print(
+            f"[SCALP_진입근거] {ticker} "
+            f"cons={'Y' if conservative else 'N'} "
+            f"rsi_prev={rsi_prev:.2f} rsi_now={float(rsi_now):.2f} "
+            f"ma_fast={float(ma_fast_now):.6f} ma_slow={float(ma_slow_now):.6f} "
+            f"vol={float(vol_now):.6f} vma={float(vma_now):.6f} mult={vol_mult:.2f}"
+        )
+    return True
+
+
 def detect_momentum_candidate(ticker):
-    df = pyupbit.get_ohlcv(ticker, interval="minute1", count=60)
-    if df is None or len(df) < 30:
+    df = pyupbit.get_ohlcv(ticker, interval="minute1", count=90)
+    if df is None or len(df) < 70:
         return False
     if "volume" not in df.columns:
         return False
@@ -267,26 +354,41 @@ def detect_momentum_candidate(ticker):
     close = df["close"]
     volume = df["volume"]
 
-    vma20 = safe_last(volume.rolling(20).mean())
     v_now = safe_last(volume)
-    if vma20 is None or v_now is None or vma20 <= 0:
+    vma20 = safe_last(volume.rolling(20).mean())
+    if v_now is None or vma20 is None or float(vma20) <= 0:
         return False
 
-    recent_high = safe_last(close.rolling(20).max().iloc[:-1])
     close_now = safe_last(close)
+    close_prev = safe_last(close.iloc[:-1])
+    recent_high = safe_last(close.rolling(20).max().iloc[:-1])
     ma5 = safe_last(close.rolling(5).mean())
     ma20 = safe_last(close.rolling(20).mean())
-    rsi = safe_last(get_rsi(df, 14))
-
-    if recent_high is None or close_now is None or ma5 is None or ma20 is None or rsi is None:
+    ma60 = safe_last(close.rolling(60).mean())
+    rsi_series = get_rsi(df, 14)
+    rsi_now = safe_last(rsi_series)
+    try:
+        rsi_prev = float(rsi_series.iloc[-2])
+        if rsi_prev != rsi_prev:
+            return False
+    except Exception:
         return False
 
-    cond_volume_spike = v_now > (vma20 * 1.5)
-    cond_breakout = close_now > recent_high
-    cond_trend_align = ma5 > ma20
-    cond_rsi_mid = rsi > 50
+    if None in (close_now, close_prev, recent_high, ma5, ma20, ma60, rsi_now):
+        return False
 
-    return bool(cond_volume_spike and cond_breakout and cond_trend_align and cond_rsi_mid)
+    v5 = float(volume.tail(5).sum())
+    pv5 = float(volume.iloc[-10:-5].sum())
+    if pv5 <= 0:
+        return False
+
+    cond_volume_spike = float(v_now) > float(vma20) * 1.5 and v5 > pv5 * 1.4
+    cond_breakout = float(close_now) > float(recent_high)
+    cond_trend_align = float(ma5) > float(ma20)
+    cond_rsi_cross = float(rsi_prev) <= 50.0 and float(rsi_now) > 50.0
+    cond_not_downtrend = float(ma20) >= float(ma60) and float(close_now) >= float(ma20) and float(close_now) >= float(close_prev)
+
+    return bool(cond_volume_spike and cond_breakout and cond_trend_align and cond_rsi_cross and cond_not_downtrend)
 
 
 def get_market_regime():

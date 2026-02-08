@@ -1,39 +1,42 @@
 # bot.py
-import time
-import datetime as dt
+import copy
 import csv
+import datetime as dt
 import os
 import sys
-import copy
+import time
 from collections import Counter
 
 import pyupbit
-import config
 
+import config
+import position_manager
+from engine_entry import try_main_entries, try_scalp_entries
+from engine_manage import manage_positions
+from indicators import check_filters, detect_momentum_candidate, get_market_regime, intraday_trend_ok
 from market import (
-    load_keys,
+    filter_tradeable_tickers,
     get_balance,
     get_top_tickers_by_value,
     get_upbit_krw_markets,
-    filter_tradeable_tickers,
+    load_keys,
     sanitize_positions,
 )
-from strategy import build_k_map
-from indicators import get_market_regime, minute_test_signal, detect_momentum_candidate
-
-from state_store import load_state, save_state, verify_state_with_balance
 from order_utils import wait_for_filled_snapshot
-from engine_entry import try_entries  # MAIN 모드에서만 사용
-from engine_manage import manage_positions
+from state_store import STRATEGIES, load_state, save_state, verify_state_with_balance
+from strategy import build_k_map
 
-import position_manager
 
 BASE_TP_TABLE = copy.deepcopy(getattr(config, "TP_TABLE", {}))
 BASE_STOP_LOSS_PCT = float(getattr(config, "STOP_LOSS_PCT", 0.01))
 
 
+def now_kst():
+    return dt.datetime.now()
+
+
 def ensure_trade_log_header(path: str):
-    expected = ["time", "ticker", "entry_price", "exit_price", "pnl_pct", "reason", "regime"]
+    expected = ["time", "ticker", "entry_price", "exit_price", "pnl_pct", "reason", "regime", "strategy"]
 
     if not os.path.exists(path):
         with open(path, "w", newline="", encoding="utf-8") as f:
@@ -55,56 +58,57 @@ def ensure_trade_log_header(path: str):
     if header == expected:
         return
 
-    # Backward compatibility: old header without "regime" column.
-    legacy = expected[:-1]
-    if header == legacy:
+    legacy_7 = expected[:-1]
+    if header == legacy_7:
         migrated = [expected]
         for row in rows[1:]:
-            fixed = row[: len(legacy)]
-            while len(fixed) < len(legacy):
+            fixed = row[: len(legacy_7)]
+            while len(fixed) < len(legacy_7):
                 fixed.append("")
             fixed.append("")
             migrated.append(fixed)
-
         with open(path, "w", newline="", encoding="utf-8") as f:
             csv.writer(f).writerows(migrated)
-        print(f"[MIGRATE] {path} header updated: added 'regime' column")
+        print(f"[MIGRATE] {path} header updated: added 'strategy' column")
+        return
 
-
-def now_kst():
-    return dt.datetime.now()
+    # Unknown header, do not rewrite automatically.
+    print(f"[WARN] unexpected trade log header: {header}")
 
 
 def batch_get_prices(tickers):
-    """
-    pyupbit.get_current_price(list)-> dict
-    실패 시 빈 dict
-    """
     try:
         data = pyupbit.get_current_price(list(tickers))
         if data is None:
             return {}
         if isinstance(data, dict):
             return {k: float(v) for k, v in data.items() if v is not None}
-        return {}
     except Exception:
-        return {}
+        pass
+    return {}
 
 
-def estimate_equity(krw: float, state: dict, prices: dict, upbit, inactive_positions: dict = None) -> float:
+def _iter_all_states(strategy_state: dict, inactive_positions: dict = None):
+    for strat in STRATEGIES:
+        for ticker, s in (strategy_state.get(strat, {}) or {}).items():
+            yield strat, ticker, s
+    for ticker, s in (inactive_positions or {}).items():
+        yield "INACTIVE", ticker, s
+
+
+def estimate_equity(krw: float, strategy_state: dict, prices: dict, upbit, inactive_positions: dict = None) -> float:
     equity = float(krw)
-    for positions in (state, inactive_positions or {}):
-        for ticker, s in positions.items():
-            if not s.get("holding"):
-                continue
-            coin = ticker.split("-")[1]
-            vol = float(get_balance(upbit, coin))
-            if vol <= 0:
-                continue
-            p = prices.get(ticker)
-            if p is None:
-                continue
-            equity += vol * float(p)
+    for _, ticker, s in _iter_all_states(strategy_state, inactive_positions):
+        if not s.get("holding"):
+            continue
+        coin = ticker.split("-")[1]
+        vol = float(get_balance(upbit, coin))
+        if vol <= 0:
+            continue
+        p = prices.get(ticker)
+        if p is None:
+            continue
+        equity += vol * float(p)
     return float(equity)
 
 
@@ -113,7 +117,6 @@ def print_filter_summary(active, inactive, reasons):
     if not inactive:
         print("[FILTER] top inactive reasons: none")
         return
-
     c = Counter([reasons.get(t, "UNKNOWN") for t in inactive])
     top = ", ".join([f"{k}:{v}" for k, v in c.most_common(5)])
     print(f"[FILTER] top inactive reasons: {top}")
@@ -130,132 +133,112 @@ def _dedupe_keep_order(items):
     return out
 
 
-def get_slot_limits(max_holdings: int):
-    m = max(0, int(max_holdings))
-    if m <= 2:
-        return m, 0
-    return m - 1, 1
+def _count_strategy_holdings(state: dict) -> int:
+    return sum(1 for _, s in (state or {}).items() if s.get("holding", False))
 
 
-def count_slot_usage(state: dict, top_universe):
-    top_set = set(top_universe or [])
-    top_cnt = 0
-    momentum_cnt = 0
-    for ticker, s in state.items():
-        if not s.get("holding", False):
+def _count_total_holdings(strategy_state: dict) -> int:
+    return sum(_count_strategy_holdings(strategy_state.get(s, {})) for s in STRATEGIES)
+
+
+def _all_holding_tickers(strategy_state: dict):
+    out = set()
+    for s in STRATEGIES:
+        for ticker, st in (strategy_state.get(s, {}) or {}).items():
+            if st.get("holding", False):
+                out.add(ticker)
+    return out
+
+
+def _repair_cross_strategy_duplicate_holdings(strategy_state: dict):
+    main_state = strategy_state.get("MAIN", {}) or {}
+    scalp_state = strategy_state.get("SCALP", {}) or {}
+    repaired = 0
+
+    overlap = set(main_state.keys()) & set(scalp_state.keys())
+    for ticker in overlap:
+        main_h = bool(main_state.get(ticker, {}).get("holding", False))
+        scalp_h = bool(scalp_state.get(ticker, {}).get("holding", False))
+        if not (main_h and scalp_h):
             continue
-        if ticker in top_set:
-            top_cnt += 1
-        else:
-            momentum_cnt += 1
-    return int(top_cnt), int(momentum_cnt)
+
+        # Keep MAIN, release SCALP.
+        s = scalp_state[ticker]
+        s["holding"] = False
+        s["add_count"] = 0
+        s["invested_krw"] = 0.0
+        s["target_krw"] = 0.0
+        s["initial_volume"] = 0.0
+        s["realized_krw"] = 0.0
+        s["realized_cost_krw"] = 0.0
+        repaired += 1
+        print(f"[LOCK_REPAIR] duplicated holding released from SCALP: {ticker}")
+
+    return repaired
 
 
-def build_entry_universe(
-    state: dict,
-    top_universe,
-    momentum_candidates,
-    max_holdings: int,
-    now,
-    momentum_block_until: dict,
-):
-    top_universe = _dedupe_keep_order(top_universe or [])
-    top_set = set(top_universe)
-    momentum_candidates = [t for t in _dedupe_keep_order(momentum_candidates or []) if t not in top_set]
-
-    filtered_momentum = []
-    for ticker in momentum_candidates:
-        until = momentum_block_until.get(ticker)
-        if until is not None and now < until:
-            continue
-        filtered_momentum.append(ticker)
-
-    top_limit, momentum_limit = get_slot_limits(max_holdings)
-    top_holdings, momentum_holdings = count_slot_usage(state, top_universe)
-    allow_new_top = top_holdings < top_limit
-    allow_new_momentum = (max_holdings >= 3) and (momentum_holdings < momentum_limit)
-
-    holding_tickers = [t for t, s in state.items() if s.get("holding", False)]
-    entry_list = []
-    entry_list.extend(holding_tickers)  # allow ADD logic for existing holdings in MAIN mode
-    if allow_new_top:
-        entry_list.extend(top_universe)
-    if allow_new_momentum:
-        entry_list.extend(filtered_momentum)
-
-    return _dedupe_keep_order(entry_list), top_limit, momentum_limit, top_holdings, momentum_holdings
-
-
-def build_rotation_universe(raw_ranked, market_info, momentum_seen_at: dict, now):
+def _core_and_surge_from_ranked(raw_ranked, market_info):
     ranked = _dedupe_keep_order(raw_ranked or [])
-    top_n = int(getattr(config, "TOP_N", 10))
-    scan_n = int(getattr(config, "UNIVERSE_SCAN_N", 40))
-    scan_n = max(top_n, scan_n)
+    core_n = int(getattr(config, "CORE_TOP_N", getattr(config, "TOP_N", 10)))
+    surge_start = int(getattr(config, "SURGE_RANK_START", 11))
+    surge_end = int(getattr(config, "SURGE_RANK_END", 30))
+
+    scan_n = int(getattr(config, "UNIVERSE_SCAN_N", max(core_n, surge_end)))
+    scan_n = max(scan_n, core_n, surge_end)
     ranked = ranked[:scan_n]
 
-    raw_top = ranked[:top_n]
-    raw_outside = ranked[top_n:]
+    core_raw = ranked[:core_n]
+    if surge_end >= surge_start:
+        surge_raw = ranked[max(0, surge_start - 1) : surge_end]
+    else:
+        surge_raw = []
 
-    top_active, top_inactive, top_reasons = filter_tradeable_tickers(raw_top, market_info)
-    outside_active, outside_inactive, outside_reasons = filter_tradeable_tickers(raw_outside, market_info)
+    core_active, core_inactive, core_reasons = filter_tradeable_tickers(core_raw, market_info)
+    surge_active, surge_inactive, surge_reasons = filter_tradeable_tickers(surge_raw, market_info)
 
-    for ticker in outside_active:
+    # CORE keeps higher-timeframe trend.
+    core_filtered = []
+    for ticker in core_active:
+        try:
+            if not bool(check_filters(ticker)):
+                continue
+            if bool(getattr(config, "USE_INTRADAY_FILTER", False)) and (not bool(intraday_trend_ok(ticker))):
+                continue
+            core_filtered.append(ticker)
+        except Exception:
+            continue
+
+    inactive_all = _dedupe_keep_order(core_inactive + surge_inactive)
+    reasons_all = {}
+    reasons_all.update(core_reasons)
+    reasons_all.update(surge_reasons)
+    return core_filtered, surge_active, inactive_all, reasons_all
+
+
+def _update_surge_candidates(surge_pool, momentum_seen_at: dict, now):
+    surge_pool = _dedupe_keep_order(surge_pool or [])
+
+    for ticker in surge_pool:
         try:
             if detect_momentum_candidate(ticker):
                 momentum_seen_at[ticker] = now
         except Exception:
-            pass
+            continue
 
-    keep_after = now - dt.timedelta(minutes=15)
-    for ticker, seen_at in list(momentum_seen_at.items()):
-        if not isinstance(seen_at, dt.datetime):
+    keep_min = int(getattr(config, "SURGE_KEEP_MINUTES", 15))
+    cutoff = now - dt.timedelta(minutes=max(1, keep_min))
+    for ticker, ts in list(momentum_seen_at.items()):
+        if not isinstance(ts, dt.datetime):
             momentum_seen_at.pop(ticker, None)
             continue
-        if seen_at < keep_after:
+        if ts < cutoff:
             momentum_seen_at.pop(ticker, None)
 
-    momentum_candidates = [t for t in outside_active if t in momentum_seen_at]
-
-    inactive_all = _dedupe_keep_order(top_inactive + outside_inactive)
-    reason_all = {}
-    reason_all.update(top_reasons)
-    reason_all.update(outside_reasons)
-
-    return top_active, momentum_candidates, inactive_all, reason_all, momentum_seen_at
-
-
-def read_new_trade_rows(path: str, consumed_rows: int):
-    if not os.path.exists(path):
-        return [], max(0, int(consumed_rows))
-
-    try:
-        with open(path, "r", newline="", encoding="utf-8") as f:
-            rows = list(csv.reader(f))
-    except Exception:
-        return [], max(0, int(consumed_rows))
-
-    if not rows:
-        return [], 0
-
-    data = rows[1:]
-    idx = max(0, int(consumed_rows))
-    if idx > len(data):
-        idx = len(data)
-    return data[idx:], len(data)
-
-
-def update_momentum_stoploss_block(new_rows, now, momentum_entry_tickers: set, momentum_stoploss_until: dict):
-    for row in new_rows:
-        if len(row) < 6:
-            continue
-        ticker = str(row[1]).strip()
-        reason = str(row[5]).strip()
-        if reason != "stop_loss":
-            continue
-        if ticker not in momentum_entry_tickers:
-            continue
-        momentum_stoploss_until[ticker] = now + dt.timedelta(minutes=30)
-        print(f"[MOMENTUM BLOCK] {ticker} 30m (stop_loss)")
+    out = [t for t in surge_pool if t in momentum_seen_at]
+    cap = int(getattr(config, "SPIKE_CANDIDATE_MAX", 0))
+    if cap > 0:
+        out = out[:cap]
+    return out, momentum_seen_at
 
 
 def get_base_position_settings(equity):
@@ -263,30 +246,28 @@ def get_base_position_settings(equity):
     if float(equity) <= fixed_until:
         return float(config.TEST_PER_TRADE_KRW), 2
 
-    tier = {"max_holdings": 3}
-    tiers = sorted((config.ACCOUNT_TIERS or []), key=lambda x: float(x.get("min_equity", 0)))
+    tiers = sorted((getattr(config, "ACCOUNT_TIERS", []) or []), key=lambda x: float(x.get("min_equity", 0)))
+    max_holdings = 2
     for t in tiers:
         min_eq = float(t.get("min_equity", 0))
-        if min_eq <= fixed_until:
-            continue
         if equity >= min_eq:
-            tier = t
+            max_holdings = int(t.get("max_holdings", max_holdings))
 
-    max_holdings = int(tier.get("max_holdings", 3))
-    per_trade_amt = float(equity) / max_holdings
+    max_holdings = max(2, max_holdings)
+    per_trade_amt = float(equity) / float(max_holdings)
     return per_trade_amt, max_holdings
 
 
 def apply_market_regime(equity, base_per_trade, base_max_holdings, regime: str):
-    invest_frac = config.REGIME_INVEST_FRAC.get(regime, 0.7)
-    holdings_mult = config.REGIME_HOLDINGS_MULT.get(regime, 0.7)
+    invest_frac = float(config.REGIME_INVEST_FRAC.get(regime, 0.7))
+    holdings_mult = float(config.REGIME_HOLDINGS_MULT.get(regime, 0.7))
 
     if invest_frac <= 0 or holdings_mult <= 0:
-        return 0.0, 0  # HALT
+        return 0.0, 0
 
     eff_max_holdings = max(1, int(base_max_holdings * holdings_mult))
-    total_invest_budget = equity * invest_frac
-    per_trade_amt = total_invest_budget / eff_max_holdings
+    total_invest_budget = float(equity) * invest_frac
+    per_trade_amt = total_invest_budget / float(eff_max_holdings)
     per_trade_amt = max(float(config.MIN_ORDER_KRW), per_trade_amt)
     return float(per_trade_amt), int(eff_max_holdings)
 
@@ -316,199 +297,77 @@ def apply_runtime_params_by_holdings(max_holdings: int):
     base_table = BASE_TP_TABLE or copy.deepcopy(getattr(config, "TP_TABLE", {}))
     scaled_table = {}
     for regime, params in (base_table or {}).items():
-        tp1 = float(params.get("TP1_PCT", 0.0)) * scale
-        tp2 = float(params.get("TP2_PCT", 0.0)) * scale
-        trail_back = float(params.get("TRAIL_BACK_PCT", 0.0)) * scale
         scaled_table[regime] = {
-            "TP1_PCT": tp1,
-            "TP2_PCT": tp2,
-            "TRAIL_BACK_PCT": trail_back,
+            "TP1_PCT": float(params.get("TP1_PCT", 0.0)) * scale,
+            "TP2_PCT": float(params.get("TP2_PCT", 0.0)) * scale,
+            "TRAIL_BACK_PCT": float(params.get("TRAIL_BACK_PCT", 0.0)) * scale,
         }
 
     if scaled_table:
         config.TP_TABLE = scaled_table
-
-    # Keep ATR mode. This updates FIXED fallback only.
     config.STOP_LOSS_PCT = float(BASE_STOP_LOSS_PCT) * scale
     return key, scale
 
 
-def stop_bot_by_daily_limits(reason: str, day_tp1_count: int, consec_loss_count: int, persist_state_fn, state, cooldown_until):
-    print(f"[DAILY_STOP] reason={reason}")
-    print(f"[DAILY_STOP] stopping bot. tp1={day_tp1_count}, consec_loss={consec_loss_count}")
-    try:
-        persist_state_fn(state, cooldown_until)
-    finally:
-        sys.exit(0)
-
-
-def update_day_tp1_counter(state: dict, counted_tickers: set, day_tp1_count: int):
-    for ticker, s in state.items():
+def update_day_tp1_counter(state: dict, counted_tickers: set, day_tp1_count: int, strategy: str):
+    for ticker, s in (state or {}).items():
         holding = bool(s.get("holding", False))
         tp1 = bool(s.get("tp1", False))
         if holding and tp1 and ticker not in counted_tickers:
             counted_tickers.add(ticker)
             day_tp1_count += 1
-            print(f"[TP1_COUNT] {day_tp1_count}")
+            print(f"[TP1_COUNT][{strategy}] {day_tp1_count}")
         if (not holding) or (not tp1):
             counted_tickers.discard(ticker)
     return int(day_tp1_count)
 
 
-def update_consec_loss_from_rows(new_rows, consec_loss: int):
-    for row in new_rows:
-        if len(row) < 5:
-            continue
+def update_loss_seq_from_events(events, current: int, strategy: str):
+    cur = int(current)
+    for e in events or []:
         try:
-            pnl_pct = float(row[4])
+            pnl = float(e.get("pnl_pct", 0.0))
         except Exception:
-            continue
-        prev = consec_loss
-        if pnl_pct < 0:
-            consec_loss += 1
+            pnl = 0.0
+        prev = cur
+        if pnl < 0:
+            cur += 1
         else:
-            consec_loss = 0
-        if consec_loss != prev:
-            print(f"[LOSS_STREAK] {consec_loss}")
-    return int(consec_loss)
+            cur = 0
+        if cur != prev:
+            print(f"[LOSS_STREAK][{strategy}] {cur}")
+    return int(cur)
 
 
-def try_minute_test_entries(
-    upbit,
-    now,
-    top_universe,
-    momentum_candidates,
-    prices,
-    state,
-    cooldown_until,
-    max_holdings,
-    holding_cnt,
-    regime,
-    wait_for_filled_snapshot_fn,
-    save_state_fn,
-    momentum_block_until=None,
-    momentum_entry_tickers=None,
-    inactive_tickers=None,
-    inactive_positions=None,
-):
-    """
-    TEST 모드 전용:
-    - 일봉/4시간/돌파 로직/필터 전혀 안 씀
-    - indicators.minute_test_signal()만 보고 진입
-    - 쿨다운/보유수/잔고 체크만 적용
-    """
-    if not bool(getattr(config, "USE_MINUTE_TEST_STRATEGY", False)):
+def _is_dawn_hour(now: dt.datetime) -> bool:
+    h = int(now.hour)
+    start = int(getattr(config, "SCALP_DAWN_START_HOUR", 0))
+    end = int(getattr(config, "SCALP_DAWN_END_HOUR", 7))
+    if start == end:
         return False
+    if start < end:
+        return start <= h < end
+    return h >= start or h < end
 
-    test_krw = float(getattr(config, "MINUTE_TEST_PER_TRADE_KRW", 10_000))
-    if test_krw <= 0:
-        return False
 
-    if holding_cnt >= max_holdings:
-        return False
-
-    if prices.get("_krw", 0.0) < test_krw:
-        return False
-
-    top_universe = _dedupe_keep_order(top_universe or [])
-    top_set = set(top_universe)
-    momentum_candidates = [t for t in _dedupe_keep_order(momentum_candidates or []) if t not in top_set]
-    momentum_block_until = momentum_block_until or {}
-    momentum_entry_tickers = momentum_entry_tickers if isinstance(momentum_entry_tickers, set) else set()
-
-    filtered_momentum = []
-    for ticker in momentum_candidates:
-        until = momentum_block_until.get(ticker)
-        if until is not None and now < until:
-            continue
-        filtered_momentum.append(ticker)
-
-    top_limit, momentum_limit = get_slot_limits(max_holdings)
-    top_holdings, momentum_holdings = count_slot_usage(state, top_universe)
-    allow_new_top = top_holdings < top_limit
-    allow_new_momentum = (max_holdings >= 3) and (momentum_holdings < momentum_limit)
-    if not allow_new_top and not allow_new_momentum:
-        return False
-
-    entry_candidates = []
-    if allow_new_top:
-        entry_candidates.extend(top_universe)
-    if allow_new_momentum:
-        entry_candidates.extend(filtered_momentum)
-
-    inactive_tickers = set(inactive_tickers or [])
-    inactive_positions = inactive_positions or {}
-
-    for ticker in entry_candidates:
-        if ticker in inactive_tickers or ticker in inactive_positions:
-            continue
-
-        # 이미 보유면 스킵 (TEST는 분할매수 안 함)
-        holding = state.get(ticker, {}).get("holding", False)
-        if holding:
-            continue
-
-        # 쿨다운
-        until = cooldown_until.get(ticker)
-        if until is not None and now < until:
-            continue
-
-        cur = prices.get(ticker)
-        if cur is None or cur <= 0:
-            continue
-
-        # 신호
-        try:
-            sig = bool(minute_test_signal(ticker))
-        except Exception:
-            sig = False
-        if not sig:
-            continue
-
-        if ticker in top_set and not allow_new_top:
-            continue
-        if ticker not in top_set and not allow_new_momentum:
-            continue
-
-        print(f"[TEST ENTRY] BUY {ticker} | Regime={regime} | KRW={test_krw:,.0f}")
-
-        if config.REAL_ORDER:
-            if ticker in inactive_tickers or ticker in inactive_positions:
-                print(f"[BLOCK] inactive ticker buy blocked(TEST): {ticker}")
-                continue
-            upbit.buy_market_order(ticker, test_krw)
-            filled_vol, avg_buy = wait_for_filled_snapshot_fn(upbit, ticker, timeout_sec=3.0, interval=0.2)
-            initial_vol = float(filled_vol) if filled_vol > 0 else (test_krw / float(cur))
-            entry_price = float(avg_buy) if avg_buy > 0 else float(cur)
-        else:
-            initial_vol = test_krw / float(cur)
-            entry_price = float(cur)
-
-        state[ticker] = position_manager.init_position_state(
-            float(entry_price),
-            float(initial_vol),
-            float(test_krw),
-            regime,
-        )
-        if ticker in top_set:
-            state[ticker]["entry_bucket"] = "TOP10"
-        else:
-            state[ticker]["entry_bucket"] = "MOMENTUM"
-            momentum_entry_tickers.add(ticker)
-        save_state_fn(state, cooldown_until)
-        time.sleep(0.15)
-        return True
-
-    return False
+def _mode_to_strategy_flags(bot_mode: str):
+    mode = str(bot_mode or "").upper().strip()
+    if mode == "MAIN":
+        return True, False
+    if mode == "TEST":
+        return False, True
+    if mode == "DUAL":
+        return True, True
+    return bool(getattr(config, "ENABLE_MAIN_STRATEGY", True)), bool(getattr(config, "ENABLE_SCALP_STRATEGY", True))
 
 
 def run():
-    BOT_MODE = str(getattr(config, "BOT_MODE", "MAIN")).upper().strip()
+    bot_mode = str(getattr(config, "BOT_MODE", "TEST")).upper().strip()
+    enable_main, enable_scalp = _mode_to_strategy_flags(bot_mode)
 
     access, secret = load_keys()
     upbit = pyupbit.Upbit(access, secret)
 
-    # 실주문 확인 프롬프트(안전장치)
     if bool(getattr(config, "REAL_ORDER", False)) and bool(getattr(config, "REQUIRE_ORDER_CONFIRM", False)):
         print("[WARN] REAL_ORDER=True (live order mode)")
         ans = input("정말 실전 매매를 시작할까요? 진행하려면 'yes' 입력: ").strip().lower()
@@ -518,251 +377,296 @@ def run():
 
     ensure_trade_log_header(config.TRADE_LOG_PATH)
 
-    # state 복구
-    state, cooldown_until, inactive_positions = load_state()
-    verify_state_with_balance(upbit, state)
+    strategy_state, strategy_cooldowns, inactive_positions = load_state()
+    for s in STRATEGIES:
+        strategy_state.setdefault(s, {})
+        strategy_cooldowns.setdefault(s, {})
 
-    # 마켓 정보 로딩 (실패 시 스테이블/사용자 제외만 적용)
+    verify_state_with_balance(upbit, strategy_state)
+
+    repaired_dup = _repair_cross_strategy_duplicate_holdings(strategy_state)
+
     market_info = get_upbit_krw_markets()
     if market_info:
         print(f"[FILTER] loaded KRW market info: {len(market_info)}")
     else:
         print("[FILTER] market info unavailable. apply stable/user exclusions only")
 
-    # 거래 불가 코인 포지션 분리
-    state, moved_inactive, sanitize_repaired, moved_count = sanitize_positions(state, market_info)
-    if moved_inactive:
-        inactive_positions.update(moved_inactive)
+    sanitize_repaired = 0
+    moved_count = 0
+    for s in STRATEGIES:
+        active_state, moved_inactive, repaired, moved = sanitize_positions(strategy_state.get(s, {}), market_info)
+        strategy_state[s] = active_state
+        if moved_inactive:
+            inactive_positions.update(moved_inactive)
+        sanitize_repaired += int(repaired)
+        moved_count += int(moved)
+    sanitize_repaired += int(repaired_dup)
     if sanitize_repaired:
         print(f"[STATE] sanitize repaired fields: {sanitize_repaired}")
     if moved_count:
         print(f"[STATE] moved count: {moved_count}")
 
-    def persist_state(state_ref, cooldown_ref):
-        save_state(state_ref, cooldown_ref, inactive_positions=inactive_positions)
+    def persist_state(*_args, **_kwargs):
+        save_state(strategy_state, strategy_cooldowns, inactive_positions=inactive_positions)
 
-    if moved_count:
-        persist_state(state, cooldown_until)
+    if moved_count or repaired_dup:
+        persist_state()
 
+    now = now_kst()
     momentum_seen_at = {}
-    momentum_stoploss_until = {}
-    momentum_entry_tickers = set()
-    _, trade_log_consumed_rows = read_new_trade_rows(config.TRADE_LOG_PATH, 0)
+    surge_stoploss_until = {}
 
-    # 유니버스(Top10 + 모멘텀 후보) / K맵
     raw_ranked = get_top_tickers_by_value(
         int(getattr(config, "UNIVERSE_SCAN_N", config.TOP_N)),
         market_info=market_info,
     )
-    top_universe, momentum_candidates, inactive_universe, inactive_reasons, momentum_seen_at = build_rotation_universe(
-        raw_ranked, market_info, momentum_seen_at, now_kst()
-    )
-    universe = _dedupe_keep_order(top_universe + momentum_candidates)
-    top_set = set(top_universe)
-    for ticker, s in state.items():
-        if not s.get("holding", False):
-            continue
-        if s.get("entry_bucket") == "MOMENTUM" or ticker not in top_set:
-            momentum_entry_tickers.add(ticker)
-
+    core_universe, surge_pool, inactive_universe, inactive_reasons = _core_and_surge_from_ranked(raw_ranked, market_info)
+    surge_candidates, momentum_seen_at = _update_surge_candidates(surge_pool, momentum_seen_at, now)
+    active_universe = _dedupe_keep_order(core_universe + surge_candidates)
     inactive_tickers = set(inactive_universe) | set(inactive_positions.keys())
-    print_filter_summary(universe, inactive_universe, inactive_reasons)
-    print(f"[UNIVERSE] top={len(top_universe)} momentum={len(momentum_candidates)}")
-    if momentum_candidates:
-        print(f"[UNIVERSE] momentum picks: {', '.join(momentum_candidates[:5])}")
 
-    # MAIN에서만 K맵 필요(돌파 진입)
-    k_map = build_k_map(universe) if BOT_MODE == "MAIN" else {}
-    last_refresh = now_kst()
+    print_filter_summary(active_universe, inactive_universe, inactive_reasons)
+    print(f"[UNIVERSE] core={len(core_universe)} surge={len(surge_candidates)}")
+    if surge_candidates:
+        print(f"[UNIVERSE] surge picks: {', '.join(surge_candidates[:8])}")
 
-    last_status = now_kst()
-    last_state_save = now_kst()
-    trading_day = now_kst().date()
-    day_tp1_count = 0
-    consec_loss = 0
-    tp1_counted_tickers = {t for t, s in state.items() if bool(s.get("holding", False)) and bool(s.get("tp1", False))}
+    k_map = build_k_map(core_universe) if enable_main else {}
+    last_refresh = now
+    last_status = now
+    last_state_save = now
+    trading_day = now.date()
 
-    # 필터 캐시들 (MAIN 엔진에서만 사용)
+    day_tp1_count = {s: 0 for s in STRATEGIES}
+    loss_seq = {s: 0 for s in STRATEGIES}
+    tp1_counted = {
+        s: {
+            t
+            for t, st in (strategy_state.get(s, {}) or {}).items()
+            if bool(st.get("holding", False)) and bool(st.get("tp1", False))
+        }
+        for s in STRATEGIES
+    }
+    entry_blocked_prev = {s: False for s in STRATEGIES}
+
     day_cache = {}
     intraday_cache = {}
     minute_cache = {}
 
-    print(f"[BOT] start | MODE={BOT_MODE} | REAL_ORDER={config.REAL_ORDER}")
+    print(
+        f"[BOT] start | MODE={bot_mode} | REAL_ORDER={config.REAL_ORDER} "
+        f"| MAIN={'ON' if enable_main else 'OFF'} SCALP={'ON' if enable_scalp else 'OFF'}"
+    )
 
     while True:
         try:
             now = now_kst()
 
-            # 유니버스 갱신
-            if (now - last_refresh).total_seconds() >= config.REFRESH_MIN * 60:
-                print("\n[REFRESH] universe" + (" + K map" if BOT_MODE == "MAIN" else ""))
+            if (now - last_refresh).total_seconds() >= float(config.REFRESH_MIN) * 60.0:
+                print("\n[REFRESH] universe")
                 raw_ranked = get_top_tickers_by_value(
                     int(getattr(config, "UNIVERSE_SCAN_N", config.TOP_N)),
                     market_info=market_info,
                 )
-                top_universe, momentum_candidates, inactive_universe, inactive_reasons, momentum_seen_at = build_rotation_universe(
-                    raw_ranked, market_info, momentum_seen_at, now
+                core_universe, surge_pool, inactive_universe, inactive_reasons = _core_and_surge_from_ranked(
+                    raw_ranked, market_info
                 )
-                universe = _dedupe_keep_order(top_universe + momentum_candidates)
+                surge_candidates, momentum_seen_at = _update_surge_candidates(surge_pool, momentum_seen_at, now)
+                active_universe = _dedupe_keep_order(core_universe + surge_candidates)
                 inactive_tickers = set(inactive_universe) | set(inactive_positions.keys())
-                print_filter_summary(universe, inactive_universe, inactive_reasons)
-                print(f"[UNIVERSE] top={len(top_universe)} momentum={len(momentum_candidates)}")
-                if momentum_candidates:
-                    print(f"[UNIVERSE] momentum picks: {', '.join(momentum_candidates[:5])}")
-                k_map = build_k_map(universe) if BOT_MODE == "MAIN" else {}
-                last_refresh = now
 
-            keep_after = now - dt.timedelta(minutes=15)
-            for ticker, seen_at in list(momentum_seen_at.items()):
-                if not isinstance(seen_at, dt.datetime) or seen_at < keep_after:
-                    momentum_seen_at.pop(ticker, None)
-            momentum_candidates = [t for t in momentum_candidates if t in momentum_seen_at]
-            universe = _dedupe_keep_order(top_universe + momentum_candidates)
+                print_filter_summary(active_universe, inactive_universe, inactive_reasons)
+                print(f"[UNIVERSE] core={len(core_universe)} surge={len(surge_candidates)}")
+                if surge_candidates:
+                    print(f"[UNIVERSE] surge picks: {', '.join(surge_candidates[:8])}")
+
+                if enable_main:
+                    k_map = build_k_map(core_universe)
+                last_refresh = now
 
             today = now.date()
             if today != trading_day:
                 trading_day = today
-                day_tp1_count = 0
-                consec_loss = 0
-                tp1_counted_tickers = {
-                    t for t, s in state.items() if bool(s.get("holding", False)) and bool(s.get("tp1", False))
-                }
+                day_tp1_count = {s: 0 for s in STRATEGIES}
+                loss_seq = {s: 0 for s in STRATEGIES}
+                tp1_counted = {s: set() for s in STRATEGIES}
+                entry_blocked_prev = {s: False for s in STRATEGIES}
+                print("[DAY_RESET] counters reset")
 
-            # 시장 컨디션
             regime = "FULL"
-            if config.USE_MARKET_REGIME:
+            if bool(getattr(config, "USE_MARKET_REGIME", False)):
                 try:
                     regime = get_market_regime()
                 except Exception:
                     regime = "MID"
 
-            holding_tickers = [t for t, s in state.items() if s.get("holding")]
-            inactive_holding_tickers = [t for t, s in inactive_positions.items() if s.get("holding")]
-            price_targets = set(universe) | set(holding_tickers) | set(inactive_holding_tickers)
+            holding_tickers = _all_holding_tickers(strategy_state)
+            inactive_holding_tickers = [t for t, s in (inactive_positions or {}).items() if s.get("holding", False)]
+            price_targets = set(core_universe) | set(surge_candidates) | set(holding_tickers) | set(inactive_holding_tickers)
             prices = batch_get_prices(price_targets)
 
             krw = float(get_balance(upbit, "KRW"))
             prices["_krw"] = krw
             prices["_caches"] = (day_cache, intraday_cache, minute_cache)
-            prices["_inactive_tickers"] = inactive_tickers
-            prices["_inactive_positions"] = inactive_positions
-            prices["_momentum_candidates"] = set(momentum_candidates)
 
-            equity = estimate_equity(krw, state, prices, upbit, inactive_positions=inactive_positions)
-
+            equity = estimate_equity(krw, strategy_state, prices, upbit, inactive_positions=inactive_positions)
             base_per_trade, base_max_holdings = get_base_position_settings(equity)
-            per_trade_amt, max_holdings = apply_market_regime(equity, base_per_trade, base_max_holdings, regime)
-            active_holdings_key, active_scale = apply_runtime_params_by_holdings(max_holdings)
-            day_tp1_count = update_day_tp1_counter(state, tp1_counted_tickers, day_tp1_count)
+            per_trade_main, max_holdings = apply_market_regime(equity, base_per_trade, base_max_holdings, regime)
+            h_key, h_scale = apply_runtime_params_by_holdings(max_holdings)
+
+            total_holding = _count_total_holdings(strategy_state)
+
+            for s in STRATEGIES:
+                day_tp1_count[s] = update_day_tp1_counter(
+                    strategy_state.get(s, {}),
+                    tp1_counted[s],
+                    day_tp1_count[s],
+                    s,
+                )
 
             tp1_limit = int(getattr(config, "DAILY_TP1_EXIT_LIMIT", 3))
-            loss_limit = int(getattr(config, "CONSEC_LOSS_EXIT_LIMIT", 4))
-            if day_tp1_count >= tp1_limit:
-                stop_bot_by_daily_limits("TP1_LIMIT", day_tp1_count, consec_loss, persist_state, state, cooldown_until)
-            if consec_loss >= loss_limit:
-                stop_bot_by_daily_limits("LOSS_STREAK", day_tp1_count, consec_loss, persist_state, state, cooldown_until)
-
-            holding_cnt = sum(1 for s in state.values() if s.get("holding"))
-            entry_universe, top_limit, momentum_limit, top_holdings, momentum_holdings = build_entry_universe(
-                state, top_universe, momentum_candidates, max_holdings, now, momentum_stoploss_until
+            main_loss_limit = int(getattr(config, "MAIN_CONSEC_LOSS_LIMIT", getattr(config, "CONSEC_LOSS_EXIT_LIMIT", 4)))
+            scalp_loss_limit = int(
+                getattr(config, "SCALP_CONSEC_LOSS_LIMIT", getattr(config, "CONSEC_LOSS_EXIT_LIMIT", 4))
             )
 
-            if (now - last_status).total_seconds() >= config.STATUS_PRINT_SEC:
+            entry_allowed = {
+                "MAIN": (day_tp1_count["MAIN"] < tp1_limit) and (loss_seq["MAIN"] < main_loss_limit),
+                "SCALP": (day_tp1_count["SCALP"] < tp1_limit) and (loss_seq["SCALP"] < scalp_loss_limit),
+            }
+
+            for s in STRATEGIES:
+                blocked = not entry_allowed[s]
+                if blocked and not entry_blocked_prev[s]:
+                    if day_tp1_count[s] >= tp1_limit:
+                        print(f"[ENTRY_BLOCK][{s}] reason=TP1_LIMIT count={day_tp1_count[s]}")
+                    if (s == "MAIN" and loss_seq[s] >= main_loss_limit) or (
+                        s == "SCALP" and loss_seq[s] >= scalp_loss_limit
+                    ):
+                        print(f"[ENTRY_BLOCK][{s}] reason=LOSS_STREAK count={loss_seq[s]}")
+                entry_blocked_prev[s] = blocked
+
+            if (now - last_status).total_seconds() >= float(config.STATUS_PRINT_SEC):
+                main_h = _count_strategy_holdings(strategy_state.get("MAIN", {}))
+                scalp_h = _count_strategy_holdings(strategy_state.get("SCALP", {}))
                 print(
-                    f"[STATUS] Regime={regime} | Equity~{equity:,.0f} | "
-                    f"PerTrade~{per_trade_amt:,.0f} | Holding={holding_cnt}/{max_holdings} | "
-                    f"Top={top_holdings}/{top_limit} Momentum={momentum_holdings}/{momentum_limit} | "
-                    f"HKey={active_holdings_key} HScale={active_scale:.2f} "
-                    f"TP1Day={day_tp1_count} LossSeq={consec_loss}"
+                    f"[STATUS] Regime={regime} | Equity~{equity:,.0f} | PerTrade~{per_trade_main:,.0f} | "
+                    f"Holding={total_holding}/{max_holdings} | MAIN={main_h} SCALP={scalp_h} | "
+                    f"Core={len(core_universe)} Surge={len(surge_candidates)} | "
+                    f"HKey={h_key} HScale={h_scale:.2f} | TP1(M/S)={day_tp1_count['MAIN']}/{day_tp1_count['SCALP']} "
+                    f"Loss(M/S)={loss_seq['MAIN']}/{loss_seq['SCALP']}"
                 )
                 last_status = now
 
-            # 신규 진입
-            if max_holdings > 0:
-
-                if BOT_MODE == "TEST":
-                    # TEST 모드는 per_trade_amt(메인 예산) 안 씀. MINUTE_TEST_PER_TRADE_KRW만 씀.
-                    _ = try_minute_test_entries(
+            # MAIN entry
+            if enable_main and entry_allowed["MAIN"] and total_holding < max_holdings:
+                if float(per_trade_main) > 0:
+                    _ = try_main_entries(
                         upbit=upbit,
                         now=now,
-                        top_universe=top_universe,
-                        momentum_candidates=momentum_candidates,
+                        universe=core_universe,
                         prices=prices,
-                        state=state,
-                        cooldown_until=cooldown_until,
+                        k_map=k_map,
+                        state=strategy_state["MAIN"],
+                        cooldown_until=strategy_cooldowns["MAIN"],
+                        per_trade_amt=float(per_trade_main),
                         max_holdings=max_holdings,
-                        holding_cnt=holding_cnt,
+                        total_holding_cnt=total_holding,
                         regime=regime,
                         wait_for_filled_snapshot_fn=wait_for_filled_snapshot,
                         save_state_fn=persist_state,
-                        momentum_block_until=momentum_stoploss_until,
-                        momentum_entry_tickers=momentum_entry_tickers,
                         inactive_tickers=inactive_tickers,
                         inactive_positions=inactive_positions,
+                        global_holding_tickers=_all_holding_tickers(strategy_state),
                     )
+                    if _:
+                        total_holding = _count_total_holdings(strategy_state)
 
+            # SCALP entry
+            if enable_scalp and entry_allowed["SCALP"] and total_holding < max_holdings:
+                if _is_dawn_hour(now) and bool(getattr(config, "SCALP_DAWN_BLOCK", False)):
+                    pass
                 else:
-                    # MAIN 모드: 기존 엔진 사용 (일봉 + 4시간 + 분봉타이밍 + 돌파)
-                    if per_trade_amt > 0:
-                        _ = try_entries(
-                            upbit=upbit,
-                            now=now,
-                            universe=entry_universe,
-                            prices=prices,
-                            k_map=k_map,
-                            state=state,
-                            cooldown_until=cooldown_until,
-                            per_trade_amt=per_trade_amt,
-                            max_holdings=max_holdings,
-                            holding_cnt=holding_cnt,
-                            regime=regime,
-                            wait_for_filled_snapshot_fn=wait_for_filled_snapshot,
-                            save_state_fn=persist_state,
-                            inactive_tickers=inactive_tickers,
-                            inactive_positions=inactive_positions,
-                        )
+                    conservative = False
+                    if _is_dawn_hour(now) and bool(getattr(config, "SCALP_DAWN_CONSERVATIVE", True)):
+                        conservative = True
+                    if loss_seq["SCALP"] >= int(getattr(config, "SCALP_LOSSSEQ_CONSERVATIVE_TRIGGER", 2)):
+                        conservative = True
 
-            # 포지션 관리(항상)
-            manage_positions(
-                upbit,
-                now,
-                state,
-                prices,
-                cooldown_until,
-                save_state_fn=persist_state,
-                inactive_tickers=inactive_tickers,
-                inactive_positions=inactive_positions,
-            )
-            day_tp1_count = update_day_tp1_counter(state, tp1_counted_tickers, day_tp1_count)
-            if day_tp1_count >= tp1_limit:
-                stop_bot_by_daily_limits("TP1_LIMIT", day_tp1_count, consec_loss, persist_state, state, cooldown_until)
+                    scalp_universe = []
+                    for ticker in surge_candidates:
+                        until = surge_stoploss_until.get(ticker)
+                        if until is not None and now < until:
+                            continue
+                        scalp_universe.append(ticker)
 
-            top_set = set(top_universe)
-            for ticker, s in state.items():
-                if not s.get("holding", False):
-                    continue
-                if ticker not in top_set:
-                    momentum_entry_tickers.add(ticker)
+                    scalp_buy_krw = float(getattr(config, "MINUTE_TEST_PER_TRADE_KRW", config.TEST_PER_TRADE_KRW))
+                    _ = try_scalp_entries(
+                        upbit=upbit,
+                        now=now,
+                        universe=scalp_universe,
+                        prices=prices,
+                        state=strategy_state["SCALP"],
+                        cooldown_until=strategy_cooldowns["SCALP"],
+                        per_trade_amt=scalp_buy_krw,
+                        max_holdings=max_holdings,
+                        total_holding_cnt=total_holding,
+                        regime=regime,
+                        wait_for_filled_snapshot_fn=wait_for_filled_snapshot,
+                        save_state_fn=persist_state,
+                        inactive_tickers=inactive_tickers,
+                        inactive_positions=inactive_positions,
+                        global_holding_tickers=_all_holding_tickers(strategy_state),
+                        conservative=conservative,
+                    )
+                    if _:
+                        total_holding = _count_total_holdings(strategy_state)
 
-            new_rows, trade_log_consumed_rows = read_new_trade_rows(config.TRADE_LOG_PATH, trade_log_consumed_rows)
-            update_momentum_stoploss_block(new_rows, now, momentum_entry_tickers, momentum_stoploss_until)
-            consec_loss = update_consec_loss_from_rows(new_rows, consec_loss)
-            if consec_loss >= loss_limit:
-                stop_bot_by_daily_limits("LOSS_STREAK", day_tp1_count, consec_loss, persist_state, state, cooldown_until)
+            # Position management per strategy
+            for s in STRATEGIES:
+                events = manage_positions(
+                    upbit=upbit,
+                    now=now,
+                    state=strategy_state[s],
+                    prices=prices,
+                    cooldown_until=strategy_cooldowns[s],
+                    save_state_fn=persist_state,
+                    inactive_tickers=inactive_tickers,
+                    inactive_positions=inactive_positions,
+                    strategy=s,
+                )
+                if events:
+                    loss_seq[s] = update_loss_seq_from_events(events, loss_seq[s], s)
+                    if s == "SCALP":
+                        block_min = int(getattr(config, "SURGE_STOPLOSS_REENTRY_BLOCK_MIN", 30))
+                        for e in events:
+                            pnl = float(e.get("pnl_pct", 0.0))
+                            reason = str(e.get("reason", ""))
+                            if pnl < 0 and reason in {"stop_loss", "trailing"}:
+                                t = str(e.get("ticker", ""))
+                                if t:
+                                    surge_stoploss_until[t] = now + dt.timedelta(minutes=block_min)
+                                    print(f"[SURGE_BLOCK] {t} blocked {block_min}m ({reason})")
 
-            # 주기 저장
+                day_tp1_count[s] = update_day_tp1_counter(
+                    strategy_state.get(s, {}),
+                    tp1_counted[s],
+                    day_tp1_count[s],
+                    s,
+                )
+
             if (now - last_state_save).total_seconds() >= float(config.STATE_SAVE_INTERVAL_SEC):
-                persist_state(state, cooldown_until)
+                persist_state()
                 last_state_save = now
 
-            time.sleep(config.POLL_SEC)
+            time.sleep(float(config.POLL_SEC))
 
         except KeyboardInterrupt:
             print("\n사용자 종료(Ctrl+C)")
-            persist_state(state, cooldown_until)
+            persist_state()
             break
         except Exception as e:
-            print("에러:", e)
+            print("[ERROR]", e)
             time.sleep(1)
 
 

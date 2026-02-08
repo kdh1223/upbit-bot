@@ -113,6 +113,7 @@ class Metrics:
 
     by_reason: Dict[str, Dict[str, float]] = None
     by_regime: Dict[str, Dict[str, float]] = None
+    by_strategy: Dict[str, Dict[str, float]] = None
 
 
 def _summarize_group(arr: List[float]) -> Dict[str, float]:
@@ -130,6 +131,7 @@ def calc_metrics(header: List[str], rows: List[List[str]]) -> Metrics:
         cost_pp=cost_pp,
         by_reason={},
         by_regime={},
+        by_strategy={},
     )
 
     if not header or not rows:
@@ -139,12 +141,14 @@ def calc_metrics(header: List[str], rows: List[List[str]]) -> Metrics:
     idx_pnl = col.get("pnl_pct")
     idx_reason = col.get("reason")
     idx_regime = col.get("regime")
+    idx_strategy = col.get("strategy")
 
     pnls: List[float] = []
     pnls_net: List[float] = []
 
     reason_map: Dict[str, List[float]] = {}
     regime_map: Dict[str, List[float]] = {}
+    strategy_map: Dict[str, List[float]] = {}
 
     for row in rows:
         if idx_pnl is None or idx_pnl >= len(row):
@@ -156,9 +160,11 @@ def calc_metrics(header: List[str], rows: List[List[str]]) -> Metrics:
 
         reason = row[idx_reason] if idx_reason is not None and idx_reason < len(row) else ""
         regime = row[idx_regime] if idx_regime is not None and idx_regime < len(row) else ""
+        strategy = row[idx_strategy] if idx_strategy is not None and idx_strategy < len(row) else ""
 
         reason_map.setdefault(reason, []).append(pnl)
         regime_map.setdefault(regime, []).append(pnl)
+        strategy_map.setdefault(strategy, []).append(pnl)
 
     m.total = len(pnls)
     if m.total == 0:
@@ -206,6 +212,9 @@ def calc_metrics(header: List[str], rows: List[List[str]]) -> Metrics:
     for k, arr in regime_map.items():
         name = k if k else "(blank)"
         m.by_regime[name] = _summarize_group(arr)
+    for k, arr in strategy_map.items():
+        name = k if k else "(blank)"
+        m.by_strategy[name] = _summarize_group(arr)
 
     return m
 
@@ -237,6 +246,11 @@ def print_report(m: Metrics):
     if m.by_regime:
         print("[Regime] summary")
         for k, v in sorted(m.by_regime.items(), key=lambda x: -x[1]["count"]):
+            print(f"  {k:8s} | n={int(v['count']):3d} | win={v['winrate']:5.1f}% | avg={v['avg']:+.2f}%")
+
+    if m.by_strategy:
+        print("\n[Strategy] summary")
+        for k, v in sorted(m.by_strategy.items(), key=lambda x: -x[1]["count"]):
             print(f"  {k:8s} | n={int(v['count']):3d} | win={v['winrate']:5.1f}% | avg={v['avg']:+.2f}%")
 
     if m.by_reason:
@@ -293,13 +307,18 @@ def save_xlsx(
     ws.title = "Summary"
     ws.append(["metric", "value"])
     for k, v in asdict(m).items():
-        if k in ("by_reason", "by_regime"):
+        if k in ("by_reason", "by_regime", "by_strategy"):
             continue
         ws.append([k, v])
 
     ws.append([])
     ws.append(["Regime", "count", "winrate_pct", "avg_pct"])
     for k, v in sorted(m.by_regime.items(), key=lambda x: -x[1]["count"]):
+        ws.append([k, int(v["count"]), v["winrate"], v["avg"]])
+
+    ws.append([])
+    ws.append(["Strategy", "count", "winrate_pct", "avg_pct"])
+    for k, v in sorted(m.by_strategy.items(), key=lambda x: -x[1]["count"]):
         ws.append([k, int(v["count"]), v["winrate"], v["avg"]])
 
     ws.append([])

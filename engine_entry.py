@@ -1,8 +1,9 @@
 # engine_entry.py
 import time
+
 import config
 import position_manager
-from indicators import check_filters, intraday_trend_ok, minute_entry_ok, minute_test_signal
+from indicators import check_filters, intraday_trend_ok, minute_entry_ok, scalp_entry_signal
 from strategy import calc_target
 
 
@@ -26,7 +27,7 @@ def _is_blocked_ticker(ticker: str, inactive_tickers, inactive_positions) -> boo
 
 
 def entry_passes_filters(ticker: str, now, day_cache, intraday_cache, minute_cache) -> bool:
-    # 일봉 캐시
+    # Daily filter cache
     cached = day_cache.get(ticker)
     if cached and (now - cached[1]).total_seconds() < float(getattr(config, "DAY_FILTER_CACHE_SEC", 60)):
         ok_day = cached[0]
@@ -36,7 +37,7 @@ def entry_passes_filters(ticker: str, now, day_cache, intraday_cache, minute_cac
     if not ok_day:
         return False
 
-    # 4시간봉 캐시
+    # Intraday trend cache
     if bool(getattr(config, "USE_INTRADAY_FILTER", False)):
         cached2 = intraday_cache.get(ticker)
         if cached2 and (now - cached2[1]).total_seconds() < float(getattr(config, "INTRADAY_FILTER_CACHE_SEC", 30)):
@@ -50,7 +51,7 @@ def entry_passes_filters(ticker: str, now, day_cache, intraday_cache, minute_cac
         if not ok_4h:
             return False
 
-    # 분봉 캐시
+    # Minute timing cache
     cached3 = minute_cache.get(ticker)
     if cached3 and (now - cached3[1]).total_seconds() < float(getattr(config, "MINUTE_ENTRY_CACHE_SEC", 10)):
         ok_m = cached3[0]
@@ -66,7 +67,29 @@ def entry_passes_filters(ticker: str, now, day_cache, intraday_cache, minute_cac
     return True
 
 
-def try_entries(
+def _execute_buy(
+    upbit,
+    ticker: str,
+    buy_krw: float,
+    cur: float,
+    wait_for_filled_snapshot_fn,
+):
+    if bool(getattr(config, "REAL_ORDER", False)):
+        upbit.buy_market_order(ticker, buy_krw)
+        filled_vol, avg_buy = wait_for_filled_snapshot_fn(upbit, ticker, timeout_sec=3.0, interval=0.2)
+        initial_vol = float(filled_vol) if filled_vol > 0 else (float(buy_krw) / float(cur))
+        entry_price = float(avg_buy) if avg_buy > 0 else float(cur)
+    else:
+        initial_vol = float(buy_krw) / float(cur)
+        entry_price = float(cur)
+    return initial_vol, entry_price
+
+
+def _allow_add_buy() -> bool:
+    return bool(getattr(config, "ALLOW_ADD_BUY", False))
+
+
+def try_main_entries(
     upbit,
     now,
     universe,
@@ -76,45 +99,46 @@ def try_entries(
     cooldown_until,
     per_trade_amt,
     max_holdings,
-    holding_cnt,
+    total_holding_cnt,
     regime,
     wait_for_filled_snapshot_fn,
     save_state_fn,
     inactive_tickers=None,
     inactive_positions=None,
+    global_holding_tickers=None,
 ):
-    """
-    성공 시 True 반환 (한 번 진입하면 루프 탈출)
-    """
     day_cache, intraday_cache, minute_cache = _safe_caches(prices)
     krw = _safe_krw(prices)
     inactive_tickers = set(inactive_tickers or [])
     inactive_positions = inactive_positions or {}
+    global_holding_tickers = set(global_holding_tickers or [])
 
-    # ==========================
-    # 1) 메인 진입 우선 스캔
-    # ==========================
+    if total_holding_cnt >= int(max_holdings):
+        return False
+    if float(per_trade_amt) <= 0:
+        return False
+    if krw < float(per_trade_amt):
+        return False
+
     for ticker in universe:
         if _is_blocked_ticker(ticker, inactive_tickers, inactive_positions):
             continue
-
-        holding = state.get(ticker, {}).get("holding", False)
-        if holding_cnt >= max_holdings and not holding:
-            continue
+        if ticker in global_holding_tickers:
+            # Shared lock: no same ticker duplicate across strategies.
+            if not _allow_add_buy():
+                continue
+            # Add-buy is enabled only for the strategy already holding the ticker.
+            if not state.get(ticker, {}).get("holding", False):
+                continue
 
         until = cooldown_until.get(ticker)
         if until is not None and now < until:
             continue
 
-        # 잔고 체크 (메인/추가진입)
-        if (not holding) and (krw < float(per_trade_amt)):
-            continue
-        if holding and (krw < float(per_trade_amt)):
-            # 추가매수도 현금 없으면 스킵
-            continue
-
-        # 분할/신규 가능 여부
+        holding = bool(state.get(ticker, {}).get("holding", False))
         if holding:
+            if not _allow_add_buy():
+                continue
             can_add, _ = position_manager.can_add_position(state, ticker, per_trade_amt)
             if not can_add:
                 continue
@@ -127,76 +151,94 @@ def try_entries(
             continue
 
         cur = prices.get(ticker)
-        if cur is None:
+        if cur is None or float(cur) <= 0:
             continue
 
-        # 메인 돌파 진입
         k = float(k_map.get(ticker, getattr(config, "K_DEFAULT", 0.5)))
         try:
             target = float(calc_target(ticker, k))
         except Exception:
             continue
+        if float(cur) < target:
+            continue
 
-        if float(cur) >= target and float(per_trade_amt) > 0:
-            action = "ADD" if holding else "BUY"
-            print(f"[ENTRY] {action} {ticker} | Regime={regime} | KRW={per_trade_amt:,.0f}")
-
-            try:
-                if _is_blocked_ticker(ticker, inactive_tickers, inactive_positions):
-                    print(f"[BLOCK] inactive ticker buy blocked: {ticker}")
-                    continue
-                if bool(getattr(config, "REAL_ORDER", False)):
-                    upbit.buy_market_order(ticker, per_trade_amt)
-                    filled_vol, avg_buy = wait_for_filled_snapshot_fn(upbit, ticker, timeout_sec=3.0, interval=0.2)
-                    initial_vol = float(filled_vol) if filled_vol > 0 else (float(per_trade_amt) / float(cur))
-                    entry_price = float(avg_buy) if avg_buy > 0 else float(cur)
-                else:
-                    initial_vol = float(per_trade_amt) / float(cur)
-                    entry_price = float(cur)
-            except Exception as e:
-                print(f"[WARN] buy failed: {ticker} err={e}")
+        action = "ADD" if holding else "BUY"
+        print(f"[MAIN ENTRY] {action} {ticker} | Regime={regime} | KRW={per_trade_amt:,.0f}")
+        try:
+            if _is_blocked_ticker(ticker, inactive_tickers, inactive_positions):
+                print(f"[BLOCK] inactive ticker buy blocked: {ticker}")
                 continue
+            initial_vol, entry_price = _execute_buy(
+                upbit=upbit,
+                ticker=ticker,
+                buy_krw=float(per_trade_amt),
+                cur=float(cur),
+                wait_for_filled_snapshot_fn=wait_for_filled_snapshot_fn,
+            )
+        except Exception as e:
+            print(f"[WARN] buy failed(MAIN): {ticker} err={e}")
+            continue
 
-            if holding:
-                if bool(getattr(config, "REAL_ORDER", False)):
-                    position_manager.apply_add_snapshot(
-                        state, ticker, float(initial_vol), float(entry_price), float(per_trade_amt)
-                    )
-                else:
-                    add_vol = float(per_trade_amt) / float(cur)
-                    position_manager.apply_add_mock(state, ticker, float(cur), float(add_vol), float(per_trade_amt))
-            else:
-                state[ticker] = position_manager.init_position_state(
-                    float(entry_price), float(initial_vol), float(per_trade_amt), regime
+        if holding:
+            if bool(getattr(config, "REAL_ORDER", False)):
+                position_manager.apply_add_snapshot(
+                    state, ticker, float(initial_vol), float(entry_price), float(per_trade_amt)
                 )
-                momentum_candidates = set(prices.get("_momentum_candidates", set()) or set())
-                state[ticker]["entry_bucket"] = "MOMENTUM" if ticker in momentum_candidates else "TOP10"
-                holding_cnt += 1
+            else:
+                add_vol = float(per_trade_amt) / float(cur)
+                position_manager.apply_add_mock(state, ticker, float(cur), float(add_vol), float(per_trade_amt))
+        else:
+            state[ticker] = position_manager.init_position_state(
+                float(entry_price), float(initial_vol), float(per_trade_amt), regime
+            )
+            state[ticker]["entry_bucket"] = "CORE"
 
-            save_state_fn(state, cooldown_until)
-            time.sleep(0.15)
-            return True
+        save_state_fn()
+        time.sleep(0.15)
+        return True
 
-    # ==========================
-    # 2) 메인 진입이 없었을 때만 분봉 테스트 스캔
-    # ==========================
+    return False
+
+
+def try_scalp_entries(
+    upbit,
+    now,
+    universe,
+    prices,
+    state,
+    cooldown_until,
+    per_trade_amt,
+    max_holdings,
+    total_holding_cnt,
+    regime,
+    wait_for_filled_snapshot_fn,
+    save_state_fn,
+    inactive_tickers=None,
+    inactive_positions=None,
+    global_holding_tickers=None,
+    conservative=False,
+):
     if not bool(getattr(config, "USE_MINUTE_TEST_STRATEGY", False)):
         return False
 
-    test_krw = float(getattr(config, "MINUTE_TEST_PER_TRADE_KRW", 10_000))
-    if test_krw <= 0:
+    krw = _safe_krw(prices)
+    inactive_tickers = set(inactive_tickers or [])
+    inactive_positions = inactive_positions or {}
+    global_holding_tickers = set(global_holding_tickers or [])
+    buy_krw = float(per_trade_amt)
+
+    if total_holding_cnt >= int(max_holdings):
         return False
-    if krw < test_krw:
+    if buy_krw <= 0:
+        return False
+    if krw < buy_krw:
         return False
 
     for ticker in universe:
         if _is_blocked_ticker(ticker, inactive_tickers, inactive_positions):
             continue
-
-        holding = state.get(ticker, {}).get("holding", False)
-        if holding:
-            continue
-        if holding_cnt >= max_holdings:
+        if ticker in global_holding_tickers:
+            # Shared lock: never duplicate ticker in SCALP.
             continue
 
         until = cooldown_until.get(ticker)
@@ -207,46 +249,42 @@ def try_entries(
         if not can_new:
             continue
 
-        # (원하면) 테스트도 필터를 타게 할지 선택
-        # 지금은 기존 코드 흐름을 유지(필터 통과한 종목만 테스트 진입)
-        if not entry_passes_filters(ticker, now, day_cache, intraday_cache, minute_cache):
-            continue
-
         cur = prices.get(ticker)
-        if cur is None:
+        if cur is None or float(cur) <= 0:
             continue
 
         try:
-            if minute_test_signal(ticker):
-                print(f"[TEST ENTRY] BUY {ticker} | Regime={regime} | KRW={test_krw:,.0f}")
-
-                try:
-                    if _is_blocked_ticker(ticker, inactive_tickers, inactive_positions):
-                        print(f"[BLOCK] inactive ticker buy blocked(TEST): {ticker}")
-                        continue
-                    if bool(getattr(config, "REAL_ORDER", False)):
-                        upbit.buy_market_order(ticker, test_krw)
-                        filled_vol, avg_buy = wait_for_filled_snapshot_fn(upbit, ticker, timeout_sec=3.0, interval=0.2)
-                        initial_vol = float(filled_vol) if filled_vol > 0 else (test_krw / float(cur))
-                        entry_price = float(avg_buy) if avg_buy > 0 else float(cur)
-                    else:
-                        initial_vol = test_krw / float(cur)
-                        entry_price = float(cur)
-                except Exception as e:
-                    print(f"[WARN] buy failed(TEST): {ticker} err={e}")
-                    continue
-
-                state[ticker] = position_manager.init_position_state(
-                    float(entry_price),
-                    float(initial_vol),
-                    float(test_krw),
-                    regime,
-                )
-                momentum_candidates = set(prices.get("_momentum_candidates", set()) or set())
-                state[ticker]["entry_bucket"] = "MOMENTUM" if ticker in momentum_candidates else "TOP10"
-                save_state_fn(state, cooldown_until)
-                return True
+            sig = bool(scalp_entry_signal(ticker, conservative=bool(conservative)))
         except Exception:
-            pass
+            sig = False
+        if not sig:
+            continue
+
+        print(
+            f"[SCALP ENTRY] BUY {ticker} | Regime={regime} | KRW={buy_krw:,.0f} "
+            f"| cons={'Y' if conservative else 'N'}"
+        )
+        try:
+            if _is_blocked_ticker(ticker, inactive_tickers, inactive_positions):
+                print(f"[BLOCK] inactive ticker buy blocked(SCALP): {ticker}")
+                continue
+            initial_vol, entry_price = _execute_buy(
+                upbit=upbit,
+                ticker=ticker,
+                buy_krw=buy_krw,
+                cur=float(cur),
+                wait_for_filled_snapshot_fn=wait_for_filled_snapshot_fn,
+            )
+        except Exception as e:
+            print(f"[WARN] buy failed(SCALP): {ticker} err={e}")
+            continue
+
+        state[ticker] = position_manager.init_position_state(
+            float(entry_price), float(initial_vol), float(buy_krw), regime
+        )
+        state[ticker]["entry_bucket"] = "SURGE"
+        save_state_fn()
+        time.sleep(0.10)
+        return True
 
     return False

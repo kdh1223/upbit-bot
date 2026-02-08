@@ -62,7 +62,23 @@ def _normalize_market_warning(raw_warning: str) -> str:
     if sup in {"NONE", "NORMAL", "OK"}:
         return "NONE"
 
-    caution_tokens = ("CAUTION", "WARNING", "ALERT", "주의", "유의", "경고")
+    caution_tokens = (
+        "CAUTION",
+        "WARNING",
+        "ALERT",
+        "RISK",
+        "HALT",
+        "SUSPEND",
+        "DELIST",
+        "MANAGE",
+        "주의",
+        "유의",
+        "경고",
+        "위험",
+        "거래정지",
+        "상장폐지",
+        "관리",
+    )
     if any(tok in s for tok in caution_tokens) or any(tok in sup for tok in caution_tokens):
         return "CAUTION"
 
@@ -157,7 +173,7 @@ def filter_tradeable_tickers(tickers, market_info) -> Tuple[List[str], List[str]
                 reason = "NOT_LISTED_OR_HALTED"
             else:
                 warning = _normalize_market_warning(info.get("market_warning") or info.get("warning") or "NONE")
-                if exclude_caution and warning == "CAUTION":
+                if exclude_caution and warning != "NONE":
                     reason = "CAUTION"
 
         if reason:
@@ -167,6 +183,88 @@ def filter_tradeable_tickers(tickers, market_info) -> Tuple[List[str], List[str]
             active.append(t)
 
     return active, inactive, reasons
+
+
+def _chunked(items: List[str], size: int):
+    size = max(1, int(size))
+    for i in range(0, len(items), size):
+        yield items[i : i + size]
+
+
+def get_krw_market_snapshots_24h(
+    market_info: Dict[str, Dict[str, str]] = None,
+    sleep_sec: float = 0.03,
+    chunk_size: int = 80,
+) -> List[Dict[str, float]]:
+    """
+    Fetch KRW market snapshots and return rows sorted by rolling 24h traded value.
+    """
+    tickers = pyupbit.get_tickers(fiat="KRW")
+    market_info = market_info or {}
+    tickers, inactive, reasons = filter_tradeable_tickers(tickers, market_info)
+    for t in inactive:
+        reason = reasons.get(t, "UNKNOWN")
+        if reason == "CAUTION":
+            print(f"[FILTER] moved to inactive: {t} (CAUTION)")
+
+    total = len(tickers)
+    print(f"[SCAN] SNAP24 start: KRW active {total} tickers")
+
+    out: List[Dict[str, float]] = []
+    done = 0
+    for chunk in _chunked(tickers, chunk_size):
+        try:
+            rows = pyupbit.get_ticker(chunk)
+        except Exception:
+            rows = None
+
+        if isinstance(rows, dict):
+            rows = [rows]
+
+        for row in rows or []:
+            try:
+                market = str(row.get("market") or "").upper().strip()
+                if not market:
+                    continue
+                trade_price = float(row.get("trade_price") or 0.0)
+                value_24h = float(row.get("acc_trade_price_24h") or 0.0)
+                volume_24h = float(row.get("acc_trade_volume_24h") or 0.0)
+                if trade_price <= 0 or value_24h <= 0 or volume_24h <= 0:
+                    continue  # treat as non-orderable snapshot
+
+                out.append(
+                    {
+                        "market": market,
+                        "trade_price": trade_price,
+                        "acc_trade_price_24h": value_24h,
+                        "acc_trade_volume_24h": volume_24h,
+                    }
+                )
+            except Exception:
+                continue
+
+        done += len(chunk)
+        print(f"  진행: {done}/{total} ({done/total*100:.1f})", end="\r")
+        time.sleep(sleep_sec)
+
+    print()
+    out.sort(key=lambda x: x["acc_trade_price_24h"], reverse=True)
+    print("[SCAN] SNAP24 done")
+    return out
+
+
+def get_ranked_krw_by_24h_value(
+    n: int,
+    market_info: Dict[str, Dict[str, str]] = None,
+    sleep_sec: float = 0.03,
+) -> List[str]:
+    """
+    Return top N KRW tickers ranked by rolling 24h traded value.
+    """
+    snapshots = get_krw_market_snapshots_24h(market_info=market_info, sleep_sec=sleep_sec)
+    top = [r["market"] for r in snapshots[: int(max(1, n))]]
+    print(f"[SCAN] TOP{int(max(1, n))} done (rolling24h)")
+    return top
 
 
 def sanitize_positions(positions, market_info):
@@ -215,40 +313,8 @@ def get_top_tickers_by_value(
     3) CAUTION/비거래 대상 제외
     4) 남은 종목에서 거래대금 상위 N
     """
-    tickers = pyupbit.get_tickers(fiat="KRW")
-    market_info = market_info or {}
-    tickers, inactive, reasons = filter_tradeable_tickers(tickers, market_info)
-    for t in inactive:
-        reason = reasons.get(t, "UNKNOWN")
-        if reason == "CAUTION":
-            print(f"[FILTER] moved to inactive: {t} (CAUTION)")
-    total = len(tickers)
-
-    data = []
-    print(f"[SCAN] TOP{n} start: KRW active {total} tickers")
-
-    for i, t in enumerate(tickers, start=1):
-        try:
-            d = pyupbit.get_ohlcv(t, interval="day", count=1)
-            if d is None or d.empty:
-                continue
-
-            if "value" in d.columns:
-                value = float(d["value"].iloc[-1])
-            else:
-                value = float(d["volume"].iloc[-1]) * float(d["close"].iloc[-1])
-
-            data.append((t, value))
-        except Exception:
-            pass
-
-        if i % 15 == 0 or i == total:
-            print(f"  진행: {i}/{total} ({i/total*100:.1f}%)", end="\r")
-
-        time.sleep(sleep_sec)
-
-    print()
-    data.sort(key=lambda x: x[1], reverse=True)
-    top = [t for t, _ in data[:n]]
-    print(f"[SCAN] TOP{n} done")
-    return top
+    return get_ranked_krw_by_24h_value(
+        n=int(n),
+        market_info=market_info,
+        sleep_sec=sleep_sec,
+    )
