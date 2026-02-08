@@ -208,11 +208,18 @@ def _core_and_surge_from_ranked(raw_ranked, market_info):
         except Exception:
             continue
 
+    strict_prefilter = bool(getattr(config, "CORE_STRICT_PREFILTER", False))
+    core_min_active = max(0, int(getattr(config, "CORE_MIN_ACTIVE", 0)))
+    if strict_prefilter:
+        core_final = core_filtered
+    else:
+        core_final = core_filtered if len(core_filtered) >= max(1, core_min_active) else list(core_active)
+
     inactive_all = _dedupe_keep_order(core_inactive + surge_inactive)
     reasons_all = {}
     reasons_all.update(core_reasons)
     reasons_all.update(surge_reasons)
-    return core_filtered, surge_active, inactive_all, reasons_all
+    return core_final, surge_active, inactive_all, reasons_all
 
 
 def _update_surge_candidates(surge_pool, momentum_seen_at: dict, now):
@@ -439,6 +446,7 @@ def run():
 
     day_tp1_count = {s: 0 for s in STRATEGIES}
     loss_seq = {s: 0 for s in STRATEGIES}
+    scalp_pause_until = None
     tp1_counted = {
         s: {
             t
@@ -489,6 +497,7 @@ def run():
                 trading_day = today
                 day_tp1_count = {s: 0 for s in STRATEGIES}
                 loss_seq = {s: 0 for s in STRATEGIES}
+                scalp_pause_until = None
                 tp1_counted = {s: set() for s in STRATEGIES}
                 entry_blocked_prev = {s: False for s in STRATEGIES}
                 print("[DAY_RESET] counters reset")
@@ -532,7 +541,9 @@ def run():
 
             entry_allowed = {
                 "MAIN": (day_tp1_count["MAIN"] < tp1_limit) and (loss_seq["MAIN"] < main_loss_limit),
-                "SCALP": (day_tp1_count["SCALP"] < tp1_limit) and (loss_seq["SCALP"] < scalp_loss_limit),
+                "SCALP": (day_tp1_count["SCALP"] < tp1_limit)
+                and (loss_seq["SCALP"] < scalp_loss_limit)
+                and (scalp_pause_until is None or now >= scalp_pause_until),
             }
 
             for s in STRATEGIES:
@@ -544,17 +555,23 @@ def run():
                         s == "SCALP" and loss_seq[s] >= scalp_loss_limit
                     ):
                         print(f"[ENTRY_BLOCK][{s}] reason=LOSS_STREAK count={loss_seq[s]}")
+                    if s == "SCALP" and scalp_pause_until is not None and now < scalp_pause_until:
+                        remain = int((scalp_pause_until - now).total_seconds() / 60)
+                        print(f"[ENTRY_BLOCK][SCALP] reason=PAUSE remain_min={max(0, remain)}")
                 entry_blocked_prev[s] = blocked
 
             if (now - last_status).total_seconds() >= float(config.STATUS_PRINT_SEC):
                 main_h = _count_strategy_holdings(strategy_state.get("MAIN", {}))
                 scalp_h = _count_strategy_holdings(strategy_state.get("SCALP", {}))
+                pause_txt = "-"
+                if scalp_pause_until is not None and now < scalp_pause_until:
+                    pause_txt = f"{max(0, int((scalp_pause_until - now).total_seconds() / 60))}m"
                 print(
                     f"[STATUS] Regime={regime} | Equity~{equity:,.0f} | PerTrade~{per_trade_main:,.0f} | "
                     f"Holding={total_holding}/{max_holdings} | MAIN={main_h} SCALP={scalp_h} | "
                     f"Core={len(core_universe)} Surge={len(surge_candidates)} | "
                     f"HKey={h_key} HScale={h_scale:.2f} | TP1(M/S)={day_tp1_count['MAIN']}/{day_tp1_count['SCALP']} "
-                    f"Loss(M/S)={loss_seq['MAIN']}/{loss_seq['SCALP']}"
+                    f"Loss(M/S)={loss_seq['MAIN']}/{loss_seq['SCALP']} | SPause={pause_txt}"
                 )
                 last_status = now
 
@@ -636,8 +653,18 @@ def run():
                     strategy=s,
                 )
                 if events:
+                    prev_loss = int(loss_seq[s])
                     loss_seq[s] = update_loss_seq_from_events(events, loss_seq[s], s)
                     if s == "SCALP":
+                        if bool(getattr(config, "SCALP_PAUSE_ON_LOSSSEQ", True)):
+                            trig = int(getattr(config, "SCALP_PAUSE_LOSSSEQ_TRIGGER", 2))
+                            pause_min = int(getattr(config, "SCALP_PAUSE_MINUTES", 60))
+                            if prev_loss < trig <= int(loss_seq[s]):
+                                scalp_pause_until = now + dt.timedelta(minutes=max(1, pause_min))
+                                print(
+                                    f"[SCALP_PAUSE] reason=LOSS_STREAK "
+                                    f"loss_seq={loss_seq[s]} until={scalp_pause_until.strftime('%H:%M:%S')}"
+                                )
                         block_min = int(getattr(config, "SURGE_STOPLOSS_REENTRY_BLOCK_MIN", 30))
                         for e in events:
                             pnl = float(e.get("pnl_pct", 0.0))

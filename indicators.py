@@ -272,17 +272,19 @@ def scalp_entry_signal(ticker, conservative=False):
         return False
 
     close = df["close"]
+    open_ = df["open"]
     volume = df["volume"]
     rsi_series = get_rsi(df, 14)
 
     close_now = safe_last(close)
+    open_now = safe_last(open_)
     rsi_now = safe_last(rsi_series)
     ma_fast_now = safe_last(close.rolling(int(getattr(config, "SCALP_MA_FAST", 5))).mean())
     ma_slow_now = safe_last(close.rolling(int(getattr(config, "SCALP_MA_SLOW", 20))).mean())
     vol_now = safe_last(volume)
     vma_now = safe_last(volume.rolling(int(getattr(config, "SCALP_VOL_MA_PERIOD", 20))).mean())
 
-    if None in (close_now, rsi_now, ma_fast_now, ma_slow_now, vol_now, vma_now):
+    if None in (close_now, open_now, rsi_now, ma_fast_now, ma_slow_now, vol_now, vma_now):
         return False
     if float(vma_now) <= 0:
         return False
@@ -301,12 +303,15 @@ def scalp_entry_signal(ticker, conservative=False):
 
     # Confirm breakout for N+1 latest bars (N=0 means only current bar).
     latest_idx = len(df) - 1
+    latest_breakout_level = None
     for offset in range(confirm_bars + 1):
         ci = latest_idx - offset
         ws = ci - lookback
         if ws < 0:
             return False
         level = float(close.iloc[ws:ci].max())
+        if offset == 0:
+            latest_breakout_level = level
         if float(close.iloc[ci]) <= level:
             return False
 
@@ -318,6 +323,7 @@ def scalp_entry_signal(ticker, conservative=False):
         )
     )
     rsi_delta_min = float(getattr(config, "SCALP_RSI_DELTA_MIN", 0.2))
+    rsi_max = float(getattr(config, "SCALP_RSI_MAX", 72.0))
     vol_mult = float(
         getattr(
             config,
@@ -325,12 +331,22 @@ def scalp_entry_signal(ticker, conservative=False):
             1.5 if conservative else 1.2,
         )
     )
+    max_gap_pct = float(getattr(config, "SCALP_BREAKOUT_MAX_GAP_PCT", 0.008))
+    max_body_pct = float(getattr(config, "SCALP_MAX_CANDLE_BODY_PCT", 0.012))
 
-    cond_rsi = float(rsi_now) >= rsi_min and (float(rsi_now) - float(rsi_prev)) >= rsi_delta_min
+    cond_rsi = (
+        float(rsi_now) >= rsi_min
+        and float(rsi_now) <= rsi_max
+        and (float(rsi_now) - float(rsi_prev)) >= rsi_delta_min
+    )
     cond_ma = float(ma_fast_now) > float(ma_slow_now) and float(close_now) > float(ma_slow_now)
     cond_vol = float(vol_now) > float(vma_now) * vol_mult
+    cond_body = abs(float(close_now) - float(open_now)) / max(float(open_now), 1e-12) <= max_body_pct
+    cond_gap = True
+    if latest_breakout_level is not None and float(latest_breakout_level) > 0:
+        cond_gap = (float(close_now) / float(latest_breakout_level) - 1.0) <= max_gap_pct
 
-    if not (cond_rsi and cond_ma and cond_vol):
+    if not (cond_rsi and cond_ma and cond_vol and cond_body and cond_gap):
         return False
 
     if bool(getattr(config, "DEBUG_TRADE_FLOW", False)):
@@ -339,7 +355,8 @@ def scalp_entry_signal(ticker, conservative=False):
             f"cons={'Y' if conservative else 'N'} "
             f"rsi_prev={rsi_prev:.2f} rsi_now={float(rsi_now):.2f} "
             f"ma_fast={float(ma_fast_now):.6f} ma_slow={float(ma_slow_now):.6f} "
-            f"vol={float(vol_now):.6f} vma={float(vma_now):.6f} mult={vol_mult:.2f}"
+            f"vol={float(vol_now):.6f} vma={float(vma_now):.6f} mult={vol_mult:.2f} "
+            f"body_ok={int(cond_body)} gap_ok={int(cond_gap)}"
         )
     return True
 
