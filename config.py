@@ -1,5 +1,31 @@
 ﻿"""모드, 자금 배분, 필터, 리스크, 로그 설정을 모아둔 중앙 설정 파일."""
 
+import os
+
+
+def _env_str(name: str, default: str) -> str:
+    raw = os.getenv(name)
+    if raw is None or str(raw).strip() == "":
+        return str(default)
+    return str(raw).strip()
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None or str(raw).strip() == "":
+        try:
+            return int(default)
+        except Exception:
+            return 0
+    try:
+        return int(str(raw).strip())
+    except Exception:
+        try:
+            return int(default)
+        except Exception:
+            return 0
+
+
 # ===============================
 # BOT mode
 # ===============================
@@ -360,3 +386,16 @@ MINUTE_ENTRY_CACHE_SEC = 10
 ORDER_RETRY_MAX = 3
 ORDER_RETRY_SLEEP_SEC = 0.35
 ORDER_LOG_PATH = "order_log.csv"
+
+# ===============================
+# Telegram alerts
+# ===============================
+TELEGRAM_ENABLED = True
+TELEGRAM_TOKEN = ""
+TELEGRAM_CHAT_ID = 0
+TELEGRAM_ALERT_COOLDOWN_SEC = 60
+
+# Environment variables take precedence.
+TELEGRAM_TOKEN = _env_str("TELEGRAM_TOKEN", TELEGRAM_TOKEN)
+TELEGRAM_CHAT_ID = _env_int("TELEGRAM_CHAT_ID", TELEGRAM_CHAT_ID)
+TELEGRAM_ALERT_COOLDOWN_SEC = _env_int("TELEGRAM_ALERT_COOLDOWN_SEC", TELEGRAM_ALERT_COOLDOWN_SEC)

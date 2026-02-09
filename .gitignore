@@ -3,6 +3,9 @@
 venv/
 __pycache__/
 *.pyc
+*.log
+bot_console.log
+screenlog.*
 
 trade_log.csv
 order_log.csv

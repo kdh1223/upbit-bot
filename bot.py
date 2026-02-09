@@ -33,14 +33,39 @@ from market import (
 from order_utils import wait_for_filled_snapshot
 from state_store import STRATEGIES, load_state, save_state, verify_state_with_balance
 from strategy import build_k_map
+from utils.telegram import tg
 
 
 BASE_TP_TABLE = copy.deepcopy(getattr(config, "TP_TABLE", {}))
 BASE_STOP_LOSS_PCT = float(getattr(config, "STOP_LOSS_PCT", 0.01))
+_TG_LAST_ERR_AT = 0.0
+_TG_LAST_ERR_KEY = ""
 
 
 def now_kst():
     return dt.datetime.now()
+
+
+def _warn_missing_requests_dependency():
+    try:
+        import requests  # noqa: F401
+    except Exception:
+        print("[WARN] requests 미설치: pip install requests")
+
+
+def _notify_loop_error_once(exc: Exception):
+    global _TG_LAST_ERR_AT, _TG_LAST_ERR_KEY
+
+    cooldown = max(0, int(getattr(config, "TELEGRAM_ALERT_COOLDOWN_SEC", 60)))
+    err_key = str(type(exc).__name__)
+    now_ts = time.time()
+
+    if err_key == _TG_LAST_ERR_KEY and (now_ts - _TG_LAST_ERR_AT) < float(cooldown):
+        return
+
+    tg(f"🚨 ERROR: {type(exc).__name__}: {exc}")
+    _TG_LAST_ERR_AT = float(now_ts)
+    _TG_LAST_ERR_KEY = err_key
 
 
 def ensure_trade_log_header(path: str):
@@ -527,6 +552,7 @@ def _scalp_btc_close_position(
         log_order("SELL", ticker, qty, True, "scalp_btc_mock")
 
     if not ok:
+        tg(f"⚠️ ORDER 실패: SELL {ticker}")
         return False, f"sell_failed:{err_msg}"
 
     pnl = (cur / entry - 1.0) if entry > 0 else 0.0
@@ -693,6 +719,7 @@ def _try_scalp_btc_entry(
     except Exception as e:
         log_order("BUY", ticker, 0.0, False, f"scalp_btc_err={e}")
         print(f"[WARN] buy failed(SCALP_BTC): {ticker} err={e}")
+        tg(f"⚠️ ORDER 실패: BUY {ticker}")
         return False
     finally:
         ticker_lock.release(ticker)
@@ -701,6 +728,8 @@ def _try_scalp_btc_entry(
 def run():
     bot_mode = _resolve_mode()
     enable_main, enable_scalp_legacy, enable_scalp_btc, force_mock_order = _mode_to_strategy_flags(bot_mode)
+    _warn_missing_requests_dependency()
+    tg("🤖 봇 시작됨")
 
     if force_mock_order and bool(getattr(config, "REAL_ORDER", False)):
         print("[MODE] TEST mode detected: force REAL_ORDER=False")
@@ -1133,6 +1162,7 @@ def run():
             persist_state()
             break
         except Exception as e:
+            _notify_loop_error_once(e)
             print(f"[ERROR] {type(e).__name__}: {e}")
             traceback.print_exc(limit=2)
             time.sleep(1)
