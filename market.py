@@ -272,6 +272,7 @@ def get_krw_market_snapshots_24h(
 
     out: List[Dict[str, float]] = []
     done = 0
+    progress_log = bool(getattr(config, "SCAN_PROGRESS_LOG", False))
     for chunk in _chunked(tickers, chunk_size):
         # pyupbit does not provide get_ticker(); call Upbit ticker endpoint directly.
         try:
@@ -308,10 +309,12 @@ def get_krw_market_snapshots_24h(
                 continue
 
         done += len(chunk)
-        print(f"  진행: {done}/{total} ({done/total*100:.1f})", end="\r")
+        if progress_log and total > 0:
+            print(f"  진행: {done}/{total} ({done/total*100:.1f})", end="\r")
         time.sleep(sleep_sec)
 
-    print()
+    if progress_log:
+        print()
     out.sort(key=lambda x: x["acc_trade_price_24h"], reverse=True)
     print("[SCAN] SNAP24 done")
     return out
@@ -328,6 +331,10 @@ def get_ranked_krw_by_24h_value(
     snapshots = get_krw_market_snapshots_24h(market_info=market_info, sleep_sec=sleep_sec)
     top = [r["market"] for r in snapshots[: int(max(1, n))]]
     print(f"[SCAN] TOP{int(max(1, n))} done (rolling24h)")
+    show_topn = max(0, int(getattr(config, "SCAN_LOG_TOPN", 0)))
+    if show_topn > 0 and top:
+        head = top[: min(show_topn, len(top))]
+        print(f"[SCAN] TOP{len(head)} list: {', '.join(head)}")
     return top
 
 
