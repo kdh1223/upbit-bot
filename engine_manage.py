@@ -347,10 +347,11 @@ def manage_positions(
             save_state_fn(state, cooldown_until)
 
             if bool(getattr(config, "AUTO_REPORT", False)):
+                auto_xlsx = analyze.OUT_XLSX if bool(getattr(config, "AUTO_REPORT_SAVE_XLSX", False)) else ""
                 analyze.maybe_generate_report(
                     trade_log_path=trade_log_path,
                     out_csv=analyze.OUT_SUMMARY_CSV,
-                    out_xlsx=analyze.OUT_XLSX,
+                    out_xlsx=auto_xlsx,
                     min_interval_sec=float(getattr(config, "AUTO_REPORT_MIN_INTERVAL_SEC", 30)),
                     quiet=bool(getattr(config, "AUTO_REPORT_QUIET", True)),
                 )

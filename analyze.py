@@ -391,7 +391,8 @@ def generate_report(
         print_report(m)
 
     save_summary_csv(m, out_csv)
-    save_xlsx(header, rows, m, out_xlsx, equity_curve=equity_curve)
+    if str(out_xlsx or "").strip():
+        save_xlsx(header, rows, m, out_xlsx, equity_curve=equity_curve)
     return m
 
 
@@ -410,7 +411,10 @@ def maybe_generate_report(
     try:
         return generate_report(trade_log_path, out_csv, out_xlsx, quiet=quiet)
     except PermissionError:
-        print(f"[WARN] failed to save {out_xlsx}; file is open. Close it and retry.")
+        if str(out_xlsx or "").strip():
+            print(f"[WARN] failed to save {out_xlsx}; file is open. Close it and retry.")
+        else:
+            print("[WARN] failed to save report output (permission error)")
         return None
     except Exception as e:
         try:
