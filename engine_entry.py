@@ -122,6 +122,7 @@ def try_main_entries(
     inactive_positions=None,
     global_holding_tickers=None,
     before_buy_fn=None,
+    entry_params=None,
 ):
     day_cache, intraday_cache, minute_cache = _safe_caches(prices)
     krw = _safe_krw(prices)
@@ -230,6 +231,11 @@ def try_main_entries(
                 entry_ts=float(now.timestamp()),
             )
             state[ticker]["entry_bucket"] = "CORE"
+            if isinstance(entry_params, dict):
+                state[ticker]["sl_one_pct"] = abs(float(entry_params.get("sl_one", 0.0)))
+                state[ticker]["tp_one_pct"] = max(0.0, float(entry_params.get("tp_one", 0.0)))
+                state[ticker]["trail_from_pct"] = max(0.0, float(entry_params.get("trail_from", 0.0)))
+                state[ticker]["trail_giveback_pct"] = max(0.0, float(entry_params.get("trail_giveback", 0.0)))
 
         save_state_fn()
         notify_order(

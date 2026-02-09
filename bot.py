@@ -22,6 +22,7 @@ from indicators import (
     check_filters_with_reason,
     detect_momentum_candidate,
     get_market_regime,
+    get_rsi,
     intraday_trend_ok,
     scalp_btc_entry_signal,
 )
@@ -47,9 +48,96 @@ _TG_LAST_RISKCUT_AT = 0.0
 _INSTANCE_LOCK_FH = None
 KST = ZoneInfo("Asia/Seoul")
 
+AUTO_PARAM_SETS = {
+    "CONSERVATIVE": {
+        "SCALP_BTC": {
+            "sl_one": -0.0035,
+            "tp_one": 0.0055,
+            "trail_from": 0.0040,
+            "trail_giveback": 0.0035,
+            "timeout_profit_min": 0.0015,
+        },
+        "MAIN": {
+            "sl_one": -0.009,
+            "tp_one": 0.012,
+            "trail_from": 0.006,
+            "trail_giveback": 0.006,
+        },
+    },
+    "AGGRESSIVE": {
+        "SCALP_BTC": {
+            "sl_one": -0.006,
+            "tp_one": 0.009,
+            "trail_from": 0.006,
+            "trail_giveback": 0.006,
+            "timeout_profit_min": 0.0025,
+        },
+        "MAIN": {
+            "sl_one": -0.012,
+            "tp_one": 0.020,
+            "trail_from": 0.008,
+            "trail_giveback": 0.008,
+        },
+    },
+}
+
 
 def now_kst():
     return dt.datetime.now(KST)
+
+
+def _get_auto_params(mode: str):
+    m = str(mode or "CONSERVATIVE").upper().strip()
+    return AUTO_PARAM_SETS.get(m, AUTO_PARAM_SETS["CONSERVATIVE"])
+
+
+def _avg_rsi_for_tickers(tickers, interval: str, rsi_period: int = 14):
+    vals = []
+    for t in list(tickers or []):
+        try:
+            df = pyupbit.get_ohlcv(t, interval=interval, count=max(30, int(rsi_period) + 5))
+        except Exception:
+            df = None
+        if df is None or len(df) < (int(rsi_period) + 2):
+            continue
+        try:
+            rsi_series = get_rsi(df, int(rsi_period))
+            rsi_now = float(rsi_series.iloc[-1])
+        except Exception:
+            continue
+        if rsi_now != rsi_now:
+            continue
+        vals.append(float(rsi_now))
+    if not vals:
+        return None
+    return float(sum(vals) / len(vals))
+
+
+def _calc_auto_strategy_mode(market_info=None):
+    btc_4h = pyupbit.get_ohlcv("KRW-BTC", interval="minute240", count=80)
+    if btc_4h is None or len(btc_4h) < 60:
+        return "CONSERVATIVE", "btc_4h_data_missing"
+
+    ma20_4h = btc_4h["close"].rolling(20).mean().iloc[-1]
+    ma60_4h = btc_4h["close"].rolling(60).mean().iloc[-1]
+    cond_4h = bool(float(ma20_4h) > float(ma60_4h))
+
+    btc_day = pyupbit.get_ohlcv("KRW-BTC", interval="day", count=40)
+    if btc_day is None or len(btc_day) < 20:
+        return "CONSERVATIVE", "btc_day_data_missing"
+    day_ma20 = btc_day["close"].rolling(20).mean().iloc[-1]
+    day_close = float(btc_day["close"].iloc[-1])
+    cond_day = bool(day_close > float(day_ma20))
+
+    topn = max(1, int(getattr(config, "AUTO_STRATEGY_TOPN", 10)))
+    interval = str(getattr(config, "AUTO_STRATEGY_RSI_INTERVAL", "day"))
+    top_tickers = get_top_tickers_by_value(topn, market_info=market_info)
+    rsi_avg = _avg_rsi_for_tickers(top_tickers, interval=interval, rsi_period=14)
+    cond_rsi = bool(rsi_avg is not None and float(rsi_avg) > 55.0)
+
+    if cond_4h and cond_day and cond_rsi:
+        return "AGGRESSIVE", f"bull_ok rsi_avg={rsi_avg:.2f}"
+    return "CONSERVATIVE", f"bull_fail rsi_avg={rsi_avg:.2f}" if rsi_avg is not None else "bull_fail rsi_avg=None"
 
 
 def _release_instance_lock():
@@ -941,6 +1029,11 @@ def _scalp_btc_reset_position(state: dict):
     state["total_sell_krw"] = 0.0
     state["last_exit_reason"] = ""
     state["strategy_tag"] = "SCALP_BTC"
+    state["sl_one_pct"] = None
+    state["tp_one_pct"] = None
+    state["trail_from_pct"] = None
+    state["trail_giveback_pct"] = None
+    state["timeout_profit_min"] = None
 
 
 def _scalp_btc_close_position(
@@ -1139,15 +1232,29 @@ def _manage_scalp_btc_position(upbit, now: dt.datetime, state: dict, prices: dic
     pnl = (cur / entry) - 1.0
     from_peak = (cur / max(float(state.get("peak_price", cur)), 1e-12)) - 1.0
 
+    sl_one = _safe_float(state.get("sl_one_pct"), 0.0)
+    if sl_one <= 0:
+        sl_one = float(getattr(config, "SCALP_BTC_SL_PCT", 0.009))
+    tp_one = _safe_float(state.get("tp_one_pct"), 0.0)
+    if tp_one <= 0:
+        tp_one = float(getattr(config, "SCALP_BTC_TP_PCT", 0.012))
+    trail_from = _safe_float(state.get("trail_from_pct"), 0.0)
+    if trail_from <= 0:
+        trail_from = float(getattr(config, "SCALP_BTC_TRAIL_FROM", 0.010))
+    trail_giveback = _safe_float(state.get("trail_giveback_pct"), 0.0)
+    if trail_giveback <= 0:
+        trail_giveback = float(getattr(config, "SCALP_BTC_TRAIL_GIVEBACK", 0.006))
+    timeout_profit_min = _safe_float(state.get("timeout_profit_min"), 0.0)
+    if timeout_profit_min <= 0:
+        timeout_profit_min = float(getattr(config, "SCALP_BTC_TIMEOUT_PROFIT_MIN", 0.0))
+
     reason = None
-    if pnl <= -float(getattr(config, "SCALP_BTC_SL_PCT", 0.009)):
+    if pnl <= -float(sl_one):
         reason = "scalp_btc_stop_loss"
-    elif pnl >= float(getattr(config, "SCALP_BTC_TP_PCT", 0.012)):
+    elif pnl >= float(tp_one):
         reason = "scalp_btc_take_profit"
     elif bool(getattr(config, "SCALP_BTC_TRAIL_ON", True)):
-        trail_from = float(getattr(config, "SCALP_BTC_TRAIL_FROM", 0.010))
-        giveback = float(getattr(config, "SCALP_BTC_TRAIL_GIVEBACK", 0.006))
-        if pnl >= trail_from and from_peak <= -giveback:
+        if pnl >= float(trail_from) and from_peak <= -float(trail_giveback):
             reason = "scalp_btc_trailing"
 
     if reason is None:
@@ -1155,7 +1262,10 @@ def _manage_scalp_btc_position(upbit, now: dt.datetime, state: dict, prices: dic
         if isinstance(entry_time, dt.datetime):
             hold_min = (now - entry_time).total_seconds() / 60.0
             if hold_min >= float(getattr(config, "SCALP_BTC_MAX_HOLD_MIN", 90)):
-                reason = "scalp_btc_timeout"
+                if pnl >= float(timeout_profit_min):
+                    reason = "scalp_btc_timeout"
+                else:
+                    reason = None
 
     if reason is None:
         return False
@@ -1183,6 +1293,7 @@ def _try_scalp_btc_entry(
     main_state: dict,
     persist_state_fn,
     ticker_lock: _TickerLock,
+    entry_params: dict = None,
 ):
     ticker = str(getattr(config, "SCALP_BTC_TICKER", "KRW-BTC"))
 
@@ -1249,6 +1360,12 @@ def _try_scalp_btc_entry(
         state["total_sell_krw"] = 0.0
         state["last_exit_reason"] = ""
         state["strategy_tag"] = "SCALP_BTC"
+        if isinstance(entry_params, dict):
+            state["sl_one_pct"] = abs(float(entry_params.get("sl_one", 0.0)))
+            state["tp_one_pct"] = max(0.0, float(entry_params.get("tp_one", 0.0)))
+            state["trail_from_pct"] = max(0.0, float(entry_params.get("trail_from", 0.0)))
+            state["trail_giveback_pct"] = max(0.0, float(entry_params.get("trail_giveback", 0.0)))
+            state["timeout_profit_min"] = max(0.0, float(entry_params.get("timeout_profit_min", 0.0)))
         print(f"[SCALP_BTC ENTRY] BUY {ticker} | KRW={buy_krw:,.0f}")
         notify_order(
             event_type="ORDER_BUY_FILLED",
@@ -1311,6 +1428,10 @@ def run():
         print(f"[FILTER] loaded KRW market info: {len(market_info)}")
     else:
         print("[FILTER] market info unavailable. apply stable/user exclusions only")
+
+    entry_param_mode = "CONSERVATIVE"
+    entry_params = _get_auto_params(entry_param_mode)
+    last_auto_check_ts = 0.0
 
     sanitize_repaired = 0
     moved_count = 0
@@ -1457,6 +1578,21 @@ def run():
                     regime = get_market_regime()
                 except Exception:
                     regime = "MID"
+
+            if bool(getattr(config, "AUTO_STRATEGY_MODE", True)):
+                now_ts = float(now.timestamp())
+                recheck_sec = float(getattr(config, "AUTO_STRATEGY_RECHECK_SEC", 60))
+                if (now_ts - float(last_auto_check_ts)) >= recheck_sec:
+                    new_mode, why = _calc_auto_strategy_mode(market_info=market_info)
+                    if new_mode != entry_param_mode:
+                        print(f"[AUTO_MODE] {entry_param_mode} -> {new_mode} ({why})")
+                        notify_event(
+                            event_type="MODE_CHANGED",
+                            lines=[f"\u2699 \uC804\uB7B5 \uBAA8\uB4DC \uC804\uD658: {entry_param_mode} \u2192 {new_mode}"],
+                        )
+                        entry_param_mode = new_mode
+                        entry_params = _get_auto_params(entry_param_mode)
+                    last_auto_check_ts = now_ts
 
             btc_ticker = str(getattr(config, "SCALP_BTC_TICKER", "KRW-BTC"))
             holding_tickers = _all_holding_tickers_with_scalp_btc(strategy_state, scalp_btc_state)
@@ -1688,6 +1824,7 @@ def run():
                         inactive_positions=inactive_positions,
                         global_holding_tickers=_all_holding_tickers_with_scalp_btc(strategy_state, scalp_btc_state),
                         before_buy_fn=before_main_buy,
+                        entry_params=entry_params.get("MAIN") if isinstance(entry_params, dict) else None,
                     )
                 finally:
                     main_entry_intent = None
@@ -1744,6 +1881,7 @@ def run():
                     main_state=strategy_state["MAIN"],
                     persist_state_fn=persist_state,
                     ticker_lock=ticker_lock,
+                    entry_params=entry_params.get("SCALP_BTC") if isinstance(entry_params, dict) else None,
                 )
                 if did_scalp_btc:
                     total_holding = _count_total_holdings_with_scalp_btc(

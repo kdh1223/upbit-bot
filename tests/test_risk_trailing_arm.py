@@ -139,6 +139,16 @@ class RiskTrailingArmTests(unittest.TestCase):
         self.assertEqual(state.get("last_exit_reason"), "STOPLOSS")
         self.assertAlmostEqual(float(state.get("total_sell_krw", 0.0)), 98.9, places=8)
 
+    def test_tp_one_full_close(self):
+        state = self._base_state(entry_ts=1_000.0)
+        state["tp_one_pct"] = 0.01
+
+        result = apply_risk_rules(None, "KRW-TEST", state, 101.1, self._mock_sell, now=1_200.0)
+
+        self.assertTrue(result.get("closed", False))
+        self.assertEqual(state.get("last_exit_reason"), "TP2")
+        self.assertEqual(result.get("reason"), "tp2")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -103,6 +103,14 @@ BTC_REGIME_SLOW_MA = 20
 BTC_REGIME_RSI_PERIOD = 14
 
 # ===============================
+# Strategy auto mode
+# ===============================
+AUTO_STRATEGY_MODE = True
+AUTO_STRATEGY_RECHECK_SEC = 60
+AUTO_STRATEGY_TOPN = 10
+AUTO_STRATEGY_RSI_INTERVAL = "day"
+
+# ===============================
 # Account sizing
 # ===============================
 TEST_EQUITY_CAP = 200_000
@@ -153,6 +161,9 @@ TRAIL_BACK_PCT = 0.0070
 TRAIL_ARM_SEC = 120
 TRAIL_ARM_PCT = 0.5
 TRAIL_DRAWDOWN_PCT = None
+
+# MAIN one-shot take profit (ratio). 0 disables.
+MAIN_TP_ONE_PCT = 0.0
 
 TP_SL_BY_HOLDINGS = {
     2: {
@@ -340,6 +351,7 @@ SCALP_BTC_EMA_FAST = 9
 SCALP_BTC_TP_PCT = 0.012
 SCALP_BTC_SL_PCT = 0.009
 SCALP_BTC_MAX_HOLD_MIN = 90
+SCALP_BTC_TIMEOUT_PROFIT_MIN = 0.0
 
 SCALP_BTC_TRAIL_ON = True
 SCALP_BTC_TRAIL_FROM = 0.010

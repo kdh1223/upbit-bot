@@ -63,6 +63,18 @@ def _ensure_position_accounting(state: dict, strategy_tag: str):
     state["strategy_tag"] = tag or "MAIN"
 
 
+def _get_state_pct(state: dict, key: str, default=None):
+    if key not in state:
+        return default
+    try:
+        value = float(state.get(key))
+    except Exception:
+        return default
+    if value <= 0:
+        return default
+    return float(value)
+
+
 def _record_sell_krw(state: dict, qty: float, price: float):
     q = _as_nonneg_float(qty, 0.0)
     p = _as_nonneg_float(price, 0.0)
@@ -237,6 +249,10 @@ def apply_risk_rules(upbit, ticker: str, state: dict, cur: float, market_sell, n
 
     regime = state.get("regime", "MID")
     tp1, tp2, trail_back = _get_params_by_regime(regime)
+    sl_one = _get_state_pct(state, "sl_one_pct", None)
+    tp_one = _get_state_pct(state, "tp_one_pct", None)
+    trail_from = _get_state_pct(state, "trail_from_pct", None)
+    trail_giveback = _get_state_pct(state, "trail_giveback_pct", None)
     trail_arm_sec = max(0.0, float(getattr(config, "TRAIL_ARM_SEC", 120)))
     trail_arm_pct = float(getattr(config, "TRAIL_ARM_PCT", 0.5))
 
@@ -257,9 +273,9 @@ def apply_risk_rules(upbit, ticker: str, state: dict, cur: float, market_sell, n
     # 1) stop loss full close
     # In the early post-entry window, force fixed SL only (no ATR stop widening/tightening).
     if elapsed_sec < trail_arm_sec:
-        stop_pct = float(getattr(config, "STOP_LOSS_PCT", 0.01))
+        stop_pct = float(sl_one) if sl_one is not None else float(getattr(config, "STOP_LOSS_PCT", 0.01))
     else:
-        stop_pct = _calc_stop_pct(entry, ticker, regime)
+        stop_pct = float(sl_one) if sl_one is not None else _calc_stop_pct(entry, ticker, regime)
     if pnl <= -stop_pct:
         if bool(getattr(config, "DEBUG_TRADE_FLOW", False)):
             print(f"[손절] {ticker} pnl={pnl:.4f}")
@@ -289,8 +305,38 @@ def apply_risk_rules(upbit, ticker: str, state: dict, cur: float, market_sell, n
             "close_qty": float(max(0.0, vol)),
         }
 
+    # 1b) One-shot take profit full close
+    if tp_one is not None and pnl >= float(tp_one):
+        if bool(getattr(config, "DEBUG_TRADE_FLOW", False)):
+            print(f"[TP_ONE] {ticker} pnl={pnl:.4f}")
+        if vol > 0 and _can_order(float(cur), vol):
+            ok, err = _execute_sell(
+                upbit,
+                ticker,
+                vol,
+                market_sell,
+                "tp_one_sell_failed",
+                strategy_tag=strategy_tag,
+                cur_price=float(cur),
+            )
+            if not ok:
+                return {"closed": False, "reason": err}
+            _record_realized(state, vol, float(cur))
+            _record_sell_krw(state, vol, float(cur))
+            if not _is_real_order():
+                _mock_reduce_volume(state, vol)
+
+        state["holding"] = False
+        state["last_exit_reason"] = "TP2"
+        return {
+            "closed": True,
+            "reason": "tp2",
+            "exit_price": float(cur),
+            "close_qty": float(max(0.0, vol)),
+        }
+
     # 2) TP1 partial
-    if (not bool(state.get("tp1", False))) and tp1 > 0 and pnl >= tp1:
+    if (tp_one is None) and (not bool(state.get("tp1", False))) and tp1 > 0 and pnl >= tp1:
         vol = _get_volume(upbit, ticker, state)
         if vol > 0:
             sell_qty = min(vol * float(getattr(config, "TP1_SELL_RATIO", 0.5)), vol)
@@ -323,7 +369,7 @@ def apply_risk_rules(upbit, ticker: str, state: dict, cur: float, market_sell, n
                 )
 
     # 3) TP2 partial
-    if (not bool(state.get("tp2", False))) and tp2 > 0 and pnl >= tp2:
+    if (tp_one is None) and (not bool(state.get("tp2", False))) and tp2 > 0 and pnl >= tp2:
         vol = _get_volume(upbit, ticker, state)
         if vol > 0:
             sell_qty = vol * float(getattr(config, "TP2_SELL_RATIO", 0.5))
@@ -356,49 +402,66 @@ def apply_risk_rules(upbit, ticker: str, state: dict, cur: float, market_sell, n
                 )
 
     # 4) Trailing arm/close: arm only after elapsed time + minimum profit threshold.
-    if (not bool(state.get("trail_armed", False))) and elapsed_sec >= trail_arm_sec and pnl_pct >= trail_arm_pct:
-        state["trail_armed"] = True
-        state["trail_hwm"] = float(cur)
-        if bool(getattr(config, "DEBUG_TRADE_FLOW", False)):
-            print(f"[TRAIL_ARM] {ticker} pnl={pnl_pct:+.2f}% elapsed={elapsed_sec:.0f}s hwm={float(cur):.6f}")
+    if (not bool(state.get("trail_armed", False))) and elapsed_sec >= trail_arm_sec:
+        if trail_from is not None:
+            arm_ok = pnl >= float(trail_from)
+        else:
+            arm_ok = pnl_pct >= trail_arm_pct
+        if arm_ok:
+            state["trail_armed"] = True
+            state["trail_hwm"] = float(cur)
+            if bool(getattr(config, "DEBUG_TRADE_FLOW", False)):
+                print(
+                    f"[TRAIL_ARM] {ticker} pnl={pnl_pct:+.2f}% elapsed={elapsed_sec:.0f}s hwm={float(cur):.6f}"
+                )
 
     # Never evaluate trailing before arm.
     if bool(state.get("trail_armed", False)):
-        trail_drawdown_pct = _resolve_trail_drawdown_pct(trail_back)
-        if trail_drawdown_pct > 0:
-            state["trail_hwm"] = max(float(state.get("trail_hwm", float(cur))), float(cur))
-            trail_hwm = float(state.get("trail_hwm", float(cur)))
-            cut_price = trail_hwm * (1.0 - (trail_drawdown_pct / 100.0))
-            drawdown_pct = ((float(cur) / trail_hwm) - 1.0) * 100.0 if trail_hwm > 0 else 0.0
-            if trail_hwm > 0 and float(cur) <= cut_price:
-                vol = _get_volume(upbit, ticker, state)
-                if vol > 0 and _can_order(float(cur), vol):
-                    if bool(getattr(config, "DEBUG_TRADE_FLOW", False)):
-                        print(f"[트레일청산] {ticker} drawdown={drawdown_pct:.3f}% hwm={trail_hwm:.6f}")
-                    ok, err = _execute_sell(
-                        upbit,
-                        ticker,
-                        vol,
-                        market_sell,
-                        "trail_sell_failed",
-                        strategy_tag=strategy_tag,
-                        cur_price=float(cur),
-                    )
-                    if not ok:
-                        return {"closed": False, "reason": err}
-                    _record_realized(state, vol, float(cur))
-                    _record_sell_krw(state, vol, float(cur))
-                    if not _is_real_order():
-                        _mock_reduce_volume(state, vol)
+        state["trail_hwm"] = max(float(state.get("trail_hwm", float(cur))), float(cur))
+        trail_hwm = float(state.get("trail_hwm", float(cur)))
 
-                state["holding"] = False
-                state["last_exit_reason"] = "TRAILING"
-                return {
-                    "closed": True,
-                    "reason": "trailing",
-                    "exit_price": float(cur),
-                    "close_qty": float(max(0.0, vol)),
-                }
+        if trail_giveback is not None:
+            drawdown_pct = ((float(cur) / trail_hwm) - 1.0) * 100.0 if trail_hwm > 0 else 0.0
+            cut_price = trail_hwm * (1.0 - float(trail_giveback))
+            hit = trail_hwm > 0 and float(cur) <= cut_price
+        else:
+            trail_drawdown_pct = _resolve_trail_drawdown_pct(trail_back)
+            if trail_drawdown_pct <= 0:
+                hit = False
+            else:
+                drawdown_pct = ((float(cur) / trail_hwm) - 1.0) * 100.0 if trail_hwm > 0 else 0.0
+                cut_price = trail_hwm * (1.0 - (trail_drawdown_pct / 100.0))
+                hit = trail_hwm > 0 and float(cur) <= cut_price
+
+        if hit:
+            vol = _get_volume(upbit, ticker, state)
+            if vol > 0 and _can_order(float(cur), vol):
+                if bool(getattr(config, "DEBUG_TRADE_FLOW", False)):
+                    print(f"[트레일청산] {ticker} drawdown={drawdown_pct:.3f}% hwm={trail_hwm:.6f}")
+                ok, err = _execute_sell(
+                    upbit,
+                    ticker,
+                    vol,
+                    market_sell,
+                    "trail_sell_failed",
+                    strategy_tag=strategy_tag,
+                    cur_price=float(cur),
+                )
+                if not ok:
+                    return {"closed": False, "reason": err}
+                _record_realized(state, vol, float(cur))
+                _record_sell_krw(state, vol, float(cur))
+                if not _is_real_order():
+                    _mock_reduce_volume(state, vol)
+
+            state["holding"] = False
+            state["last_exit_reason"] = "TRAILING"
+            return {
+                "closed": True,
+                "reason": "trailing",
+                "exit_price": float(cur),
+                "close_qty": float(max(0.0, vol)),
+            }
 
     return {"closed": False}
 

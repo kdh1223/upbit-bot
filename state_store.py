@@ -31,6 +31,11 @@ def _default_scalp_btc_state():
         "total_sell_krw": 0.0,
         "last_exit_reason": "",
         "strategy_tag": "SCALP_BTC",
+        "sl_one_pct": None,
+        "tp_one_pct": None,
+        "trail_from_pct": None,
+        "trail_giveback_pct": None,
+        "timeout_profit_min": None,
     }
 
 
@@ -178,6 +183,22 @@ def _normalize_position_state(raw: dict):
     except Exception:
         s["realized_cost_krw"] = 0.0
 
+    def _as_optional_pct(key):
+        if key not in s:
+            return None
+        try:
+            value = float(s.get(key))
+        except Exception:
+            return None
+        if value <= 0:
+            return None
+        return float(value)
+
+    s["sl_one_pct"] = _as_optional_pct("sl_one_pct")
+    s["tp_one_pct"] = _as_optional_pct("tp_one_pct")
+    s["trail_from_pct"] = _as_optional_pct("trail_from_pct")
+    s["trail_giveback_pct"] = _as_optional_pct("trail_giveback_pct")
+
     try:
         buy_krw = float(s.get("total_buy_krw", s.get("invested_krw", 0.0)))
     except Exception:
@@ -244,6 +265,21 @@ def _normalize_scalp_btc_state(raw: dict):
     state["last_exit_reason"] = str(state.get("last_exit_reason") or "")
     tag = str(state.get("strategy_tag") or "SCALP_BTC").upper().strip()
     state["strategy_tag"] = tag or "SCALP_BTC"
+
+    def _as_optional_pct(value):
+        try:
+            v = float(value)
+        except Exception:
+            return None
+        if v <= 0:
+            return None
+        return float(v)
+
+    state["sl_one_pct"] = _as_optional_pct(state.get("sl_one_pct"))
+    state["tp_one_pct"] = _as_optional_pct(state.get("tp_one_pct"))
+    state["trail_from_pct"] = _as_optional_pct(state.get("trail_from_pct"))
+    state["trail_giveback_pct"] = _as_optional_pct(state.get("trail_giveback_pct"))
+    state["timeout_profit_min"] = _as_optional_pct(state.get("timeout_profit_min"))
 
     for key in SCALP_BTC_DT_FIELDS:
         state[key] = _parse_dt(state.get(key))
