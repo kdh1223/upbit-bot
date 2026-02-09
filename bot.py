@@ -1,4 +1,4 @@
-"""유니버스 갱신, 진입/청산, 상태 저장을 총괄하는 봇 메인 루프."""
+"""Main bot loop coordinating universe refresh, entries/exits, and state persistence."""
 
 import copy
 import calendar
@@ -35,7 +35,6 @@ from market import (
 from order_utils import wait_for_filled_snapshot
 from state_store import STRATEGIES, load_state, save_state, verify_state_with_balance
 from strategy import build_k_map
-from utils.telegram import tg
 
 
 BASE_TP_TABLE = copy.deepcopy(getattr(config, "TP_TABLE", {}))
@@ -54,20 +53,20 @@ def _warn_missing_requests_dependency():
     try:
         import requests  # noqa: F401
     except Exception:
-        print("[WARN] requests 미설치: pip install requests")
+        print("[WARN] requests not installed: pip install requests")
 
 
 def _notify_loop_error_once(exc: Exception):
     global _TG_LAST_ERR_AT, _TG_LAST_ERR_KEY
 
-    cooldown = max(0, int(getattr(config, "TELEGRAM_ALERT_COOLDOWN_SEC", 60)))
+    cooldown = max(0, int(60))
     err_key = str(type(exc).__name__)
     now_ts = time.time()
 
     if err_key == _TG_LAST_ERR_KEY and (now_ts - _TG_LAST_ERR_AT) < float(cooldown):
         return
 
-    tg(f"🚨 ERROR: {type(exc).__name__}: {exc}")
+    print(f"[ALERT] ERROR: {type(exc).__name__}: {exc}")
     _TG_LAST_ERR_AT = float(now_ts)
     _TG_LAST_ERR_KEY = err_key
 
@@ -191,7 +190,7 @@ def _update_global_risk_cut_state(now: dt.datetime, equity: float, risk_state: d
 
 def _notify_risk_cut_once(info: dict, equity: float):
     global _TG_LAST_RISKCUT_AT
-    cooldown = max(0, int(getattr(config, "TELEGRAM_ALERT_COOLDOWN_SEC", 60)))
+    cooldown = max(0, int(60))
     now_ts = time.time()
     if (now_ts - _TG_LAST_RISKCUT_AT) < float(cooldown):
         return
@@ -199,7 +198,7 @@ def _notify_risk_cut_once(info: dict, equity: float):
     reason = str(info.get("reason") or "RISK_CUT")
     daily = float(info.get("daily_loss_pct", 0.0))
     mdd = float(info.get("mdd_pct", 0.0))
-    tg(f"🛑 RISK CUT {reason} | equity={float(equity):,.0f} daily={daily:+.2f}% mdd={mdd:+.2f}%")
+    print(f"[ALERT] RISK CUT {reason} | equity={float(equity):,.0f} daily={daily:+.2f}% mdd={mdd:+.2f}%")
     _TG_LAST_RISKCUT_AT = float(now_ts)
 
 
@@ -264,13 +263,13 @@ def _calc_monthly_stats(now: dt.datetime, trade_log_path: str):
 def _notify_trade_result(ticker: str, qty: float, entry_price: float, exit_price: float, pnl_pct: float):
     symbol = _coin_symbol(ticker)
     qty_txt = _fmt_qty(qty)
-    icon = "🟢" if float(pnl_pct) >= 0 else "🔴"
+    icon = "+" if float(pnl_pct) >= 0 else "-"
     msg = (
-        f"{icon} 거래 완료: {ticker} {qty_txt}{symbol}\n"
-        f"가격: {float(entry_price):,.6f} -> {float(exit_price):,.6f}\n"
-        f"💰 수익률: {float(pnl_pct):+.2f}%"
+        f"{icon} trade closed: {ticker} {qty_txt}{symbol}\n"
+        f"price: {float(entry_price):,.6f} -> {float(exit_price):,.6f}\n"
+        f"pnl: {float(pnl_pct):+.2f}%"
     )
-    tg(msg)
+    print(msg)
 
 
 def _notify_monthly_stats(now: dt.datetime):
@@ -279,10 +278,10 @@ def _notify_monthly_stats(now: dt.datetime):
         return
 
     last_day = calendar.monthrange(int(now.year), int(now.month))[1]
-    period = f"{int(now.month)}월 1일~{int(last_day)}일"
-    tg(
-        f"📊 월간 누적 승률 ({period}): {float(stats['win_rate_pct']):.1f}%, "
-        f"💰 평균 수익률: {float(stats['avg_pnl_pct']):+.2f}% (총 {int(stats['total'])}건)"
+    period = f"{int(now.month)}/1-{int(last_day)}"
+    print(
+        f"[MONTHLY] ({period}) win_rate={float(stats['win_rate_pct']):.1f}% "
+        f"avg_pnl={float(stats['avg_pnl_pct']):+.2f}% total={int(stats['total'])}"
     )
 
 
@@ -402,7 +401,7 @@ def print_main_filter_reject_summary(stats: Counter):
     topn = max(1, int(getattr(config, "MAIN_FILTER_REJECT_SUMMARY_TOPN", 6)))
     total = sum(int(v) for v in stats.values())
     top = ", ".join([f"{k}:{v}" for k, v in stats.most_common(topn)])
-    print(f"[MAIN_일봉필터요약] total={total} | {top}")
+    print(f"[MAIN_FILTER_SUMMARY] total={total} | {top}")
 
 
 def _dedupe_keep_order(items):
@@ -793,7 +792,7 @@ def _scalp_btc_close_position(
         log_order("SELL", ticker, qty, True, "scalp_btc_mock")
 
     if not ok:
-        tg(f"⚠️ ORDER 실패: SELL {ticker}")
+        print(f"[WARN] ORDER failed: SELL {ticker}")
         return False, f"sell_failed:{err_msg}"
 
     pnl = (cur / entry - 1.0) if entry > 0 else 0.0
@@ -962,7 +961,7 @@ def _try_scalp_btc_entry(
     except Exception as e:
         log_order("BUY", ticker, 0.0, False, f"scalp_btc_err={e}")
         print(f"[WARN] buy failed(SCALP_BTC): {ticker} err={e}")
-        tg(f"⚠️ ORDER 실패: BUY {ticker}")
+        print(f"[WARN] ORDER failed: BUY {ticker}")
         return False
     finally:
         ticker_lock.release(ticker)
@@ -1436,7 +1435,7 @@ def run():
             time.sleep(float(config.POLL_SEC))
 
         except KeyboardInterrupt:
-            print("\n사용자 종료(Ctrl+C)")
+            print("\nUser interrupted (Ctrl+C)")
             persist_state()
             break
         except Exception as e:
@@ -1448,3 +1447,4 @@ def run():
 
 if __name__ == "__main__":
     run()
+

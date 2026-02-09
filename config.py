@@ -393,15 +393,3 @@ ORDER_RETRY_MAX = 3
 ORDER_RETRY_SLEEP_SEC = 0.35
 ORDER_LOG_PATH = "order_log.csv"
 
-# ===============================
-# Telegram alerts
-# ===============================
-TELEGRAM_ENABLED = True
-TELEGRAM_TOKEN = ""
-TELEGRAM_CHAT_ID = 0
-TELEGRAM_ALERT_COOLDOWN_SEC = 60
-
-# Environment variables take precedence.
-TELEGRAM_TOKEN = _env_str("TELEGRAM_TOKEN", TELEGRAM_TOKEN)
-TELEGRAM_CHAT_ID = _env_int("TELEGRAM_CHAT_ID", TELEGRAM_CHAT_ID)
-TELEGRAM_ALERT_COOLDOWN_SEC = _env_int("TELEGRAM_ALERT_COOLDOWN_SEC", TELEGRAM_ALERT_COOLDOWN_SEC)

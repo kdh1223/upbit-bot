@@ -8,7 +8,6 @@ import config
 import pyupbit
 from indicators import get_atr
 from market import get_balance
-from utils.telegram import tg
 
 
 def _get_params_by_regime(regime: str):
@@ -53,12 +52,12 @@ def _execute_sell(upbit, ticker: str, qty: float, market_sell, fail_reason: str)
         ok = bool(market_sell(upbit, ticker, qty))
     except Exception as e:
         if _is_real_order():
-            tg(f"⚠️ SELL 실패: {ticker} reason={fail_reason}")
+            print(f"⚠️ SELL 실패: {ticker} reason={fail_reason}")
             return False, f"{fail_reason}:{e}"
         ok = False
 
     if _is_real_order() and not ok:
-        tg(f"⚠️ SELL 실패: {ticker} reason={fail_reason}")
+        print(f"⚠️ SELL 실패: {ticker} reason={fail_reason}")
         return False, f"{fail_reason}:returned_false"
     return True, ""
 
@@ -269,3 +268,4 @@ def apply_risk_rules(upbit, ticker: str, state: dict, cur: float, market_sell, n
                 return {"closed": True, "reason": "trailing", "exit_price": float(cur)}
 
     return {"closed": False}
+

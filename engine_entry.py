@@ -1,4 +1,4 @@
-"""MAIN/SCALP 전략 신호 판단과 매수 실행을 담당하는 진입 엔진."""
+"""Entry engine for MAIN/SCALP signal checks and buy execution."""
 
 import time
 
@@ -6,7 +6,6 @@ import config
 import position_manager
 from indicators import check_filters, intraday_trend_ok, minute_entry_ok, scalp_entry_signal
 from strategy import calc_target
-from utils.telegram import tg
 
 
 def _safe_caches(prices):
@@ -201,7 +200,7 @@ def try_main_entries(
             )
         except Exception as e:
             print(f"[WARN] buy failed(MAIN): {ticker} err={e}")
-            tg(f"⚠️ ORDER 실패: BUY {ticker}")
+            print(f"[WARN] ORDER failed: BUY {ticker}")
             continue
 
         if holding:
@@ -306,7 +305,7 @@ def try_scalp_entries(
             )
         except Exception as e:
             print(f"[WARN] buy failed(SCALP): {ticker} err={e}")
-            tg(f"⚠️ ORDER 실패: BUY {ticker}")
+            print(f"[WARN] ORDER failed: BUY {ticker}")
             continue
 
         state[ticker] = position_manager.init_position_state(
@@ -322,3 +321,4 @@ def try_scalp_entries(
         return True
 
     return False
+
