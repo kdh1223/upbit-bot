@@ -4,6 +4,7 @@ import datetime as dt
 import json
 import os
 from typing import Dict, Tuple
+from zoneinfo import ZoneInfo
 
 import config
 from market import get_balance
@@ -11,6 +12,7 @@ from market import get_balance
 
 STRATEGIES = ("MAIN", "SCALP")
 SCALP_BTC_DT_FIELDS = ("entry_time", "cooldown_until", "paused_until")
+KST = ZoneInfo("Asia/Seoul")
 
 
 def _default_scalp_btc_state():
@@ -28,8 +30,19 @@ def _default_scalp_btc_state():
     }
 
 
+def _default_risk_state():
+    return {
+        "peak_equity": 0.0,
+        "day_start_equity": 0.0,
+        "day_key": "",
+        "halted_flag": False,
+        "halt_reason": "",
+        "halted_at_ts": 0.0,
+    }
+
+
 def now_kst():
-    return dt.datetime.now()
+    return dt.datetime.now(KST)
 
 
 def _empty_strategy_payload():
@@ -50,7 +63,9 @@ def _from_iso_map(raw: dict):
     out = {}
     for k, v in (raw or {}).items():
         try:
-            out[k] = dt.datetime.fromisoformat(v)
+            parsed = _parse_dt(v)
+            if parsed is not None:
+                out[k] = parsed
         except Exception:
             continue
     return out
@@ -60,9 +75,17 @@ def _parse_dt(value):
     if value is None:
         return None
     if isinstance(value, dt.datetime):
-        return value
+        if value.tzinfo is None:
+            return value.replace(tzinfo=KST)
+        try:
+            return value.astimezone(KST)
+        except Exception:
+            return value
     try:
-        return dt.datetime.fromisoformat(str(value))
+        parsed = dt.datetime.fromisoformat(str(value))
+        if parsed.tzinfo is None:
+            return parsed.replace(tzinfo=KST)
+        return parsed.astimezone(KST)
     except Exception:
         return None
 
@@ -80,6 +103,10 @@ def _parse_ts(value):
         pass
     try:
         parsed = dt.datetime.fromisoformat(str(value))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=KST)
+        else:
+            parsed = parsed.astimezone(KST)
         return float(parsed.timestamp())
     except Exception:
         return None
@@ -168,6 +195,32 @@ def _normalize_scalp_btc_state(raw: dict):
     return state
 
 
+def _normalize_risk_state(raw: dict):
+    state = dict(raw or {})
+    base = _default_risk_state()
+
+    for k, v in base.items():
+        state.setdefault(k, v)
+
+    try:
+        state["peak_equity"] = max(0.0, float(state.get("peak_equity", 0.0)))
+    except Exception:
+        state["peak_equity"] = 0.0
+    try:
+        state["day_start_equity"] = max(0.0, float(state.get("day_start_equity", 0.0)))
+    except Exception:
+        state["day_start_equity"] = 0.0
+    state["day_key"] = str(state.get("day_key") or "")
+    state["halted_flag"] = bool(state.get("halted_flag", False))
+    state["halt_reason"] = str(state.get("halt_reason") or "")
+    try:
+        state["halted_at_ts"] = max(0.0, float(state.get("halted_at_ts", 0.0)))
+    except Exception:
+        state["halted_at_ts"] = 0.0
+
+    return state
+
+
 def _scalp_btc_to_json(state: dict):
     out = dict(state or {})
     for key in SCALP_BTC_DT_FIELDS:
@@ -199,7 +252,13 @@ def _legacy_target_strategy() -> str:
     return "SCALP"
 
 
-def save_state(state: dict, cooldown_until: dict, inactive_positions: dict = None, scalp_btc_state: dict = None):
+def save_state(
+    state: dict,
+    cooldown_until: dict,
+    inactive_positions: dict = None,
+    scalp_btc_state: dict = None,
+    risk_state: dict = None,
+):
     """
     New format:
     - state: {"MAIN": {...}, "SCALP": {...}}
@@ -228,6 +287,7 @@ def save_state(state: dict, cooldown_until: dict, inactive_positions: dict = Non
             "inactive_positions": _normalize_position_map(inactive_positions or {}),
             "cooldown_until": cd_out,
             "scalp_btc": _scalp_btc_to_json(_normalize_scalp_btc_state(scalp_btc_state or {})),
+            "risk_state": _normalize_risk_state(risk_state or {}),
             "saved_at": now_kst().isoformat(),
             "schema": 2,
         }
@@ -237,9 +297,9 @@ def save_state(state: dict, cooldown_until: dict, inactive_positions: dict = Non
         print(f"[WARN] state save failed: {e}")
 
 
-def load_state() -> Tuple[Dict[str, dict], Dict[str, dict], dict, dict]:
+def load_state() -> Tuple[Dict[str, dict], Dict[str, dict], dict, dict, dict]:
     if not os.path.exists(config.STATE_FILE):
-        return _empty_strategy_payload(), _empty_strategy_payload(), {}, _default_scalp_btc_state()
+        return _empty_strategy_payload(), _empty_strategy_payload(), {}, _default_scalp_btc_state(), _default_risk_state()
 
     try:
         with open(config.STATE_FILE, "r", encoding="utf-8-sig") as f:
@@ -249,6 +309,7 @@ def load_state() -> Tuple[Dict[str, dict], Dict[str, dict], dict, dict]:
         state_raw = payload.get("state", {}) or {}
         cd_raw = payload.get("cooldown_until", {}) or {}
         scalp_btc_raw = payload.get("scalp_btc", {}) or {}
+        risk_raw = payload.get("risk_state", {}) or {}
 
         strategy_state = _empty_strategy_payload()
         strategy_cd = _empty_strategy_payload()
@@ -273,10 +334,11 @@ def load_state() -> Tuple[Dict[str, dict], Dict[str, dict], dict, dict]:
         loaded_scalp = len(strategy_state["SCALP"])
         print(f"[STATE] loaded positions: MAIN={loaded_main}, SCALP={loaded_scalp}")
         scalp_btc_state = _normalize_scalp_btc_state(scalp_btc_raw)
-        return strategy_state, strategy_cd, inactive_positions, scalp_btc_state
+        risk_state = _normalize_risk_state(risk_raw)
+        return strategy_state, strategy_cd, inactive_positions, scalp_btc_state, risk_state
     except Exception as e:
         print(f"[WARN] state load failed: {e}")
-        return _empty_strategy_payload(), _empty_strategy_payload(), {}, _default_scalp_btc_state()
+        return _empty_strategy_payload(), _empty_strategy_payload(), {}, _default_scalp_btc_state(), _default_risk_state()
 
 
 def _repair_strategy_state_with_balance(upbit, state: dict) -> int:

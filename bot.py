@@ -8,6 +8,7 @@ import sys
 import time
 import traceback
 from collections import Counter
+from zoneinfo import ZoneInfo
 
 import pyupbit
 
@@ -40,10 +41,12 @@ BASE_TP_TABLE = copy.deepcopy(getattr(config, "TP_TABLE", {}))
 BASE_STOP_LOSS_PCT = float(getattr(config, "STOP_LOSS_PCT", 0.01))
 _TG_LAST_ERR_AT = 0.0
 _TG_LAST_ERR_KEY = ""
+_TG_LAST_RISKCUT_AT = 0.0
+KST = ZoneInfo("Asia/Seoul")
 
 
 def now_kst():
-    return dt.datetime.now()
+    return dt.datetime.now(KST)
 
 
 def _warn_missing_requests_dependency():
@@ -66,6 +69,137 @@ def _notify_loop_error_once(exc: Exception):
     tg(f"🚨 ERROR: {type(exc).__name__}: {exc}")
     _TG_LAST_ERR_AT = float(now_ts)
     _TG_LAST_ERR_KEY = err_key
+
+
+def _safe_float(value, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except Exception:
+        return float(default)
+
+
+def _normalize_loss_limit_pct(value, fallback: float) -> float:
+    limit = _safe_float(value, fallback)
+    if limit > 0:
+        limit = -abs(limit)
+    return float(limit)
+
+
+def _default_runtime_risk_state():
+    return {
+        "peak_equity": 0.0,
+        "day_start_equity": 0.0,
+        "day_key": "",
+        "halted_flag": False,
+        "halt_reason": "",
+        "halted_at_ts": 0.0,
+    }
+
+
+def _normalize_runtime_risk_state(raw: dict):
+    s = dict(_default_runtime_risk_state())
+    if isinstance(raw, dict):
+        s.update(raw)
+    s["peak_equity"] = max(0.0, _safe_float(s.get("peak_equity", 0.0), 0.0))
+    s["day_start_equity"] = max(0.0, _safe_float(s.get("day_start_equity", 0.0), 0.0))
+    s["day_key"] = str(s.get("day_key") or "")
+    s["halted_flag"] = bool(s.get("halted_flag", False))
+    s["halt_reason"] = str(s.get("halt_reason") or "")
+    s["halted_at_ts"] = max(0.0, _safe_float(s.get("halted_at_ts", 0.0), 0.0))
+    return s
+
+
+def _pct_change(cur: float, base: float) -> float:
+    if base <= 0:
+        return 0.0
+    return (float(cur) / float(base) - 1.0) * 100.0
+
+
+def _update_global_risk_cut_state(now: dt.datetime, equity: float, risk_state: dict):
+    changed = False
+    triggered = False
+    s = risk_state
+
+    cur_eq = max(0.0, float(equity))
+    day_key = now.date().isoformat()
+    if str(s.get("day_key") or "") != day_key:
+        s["day_key"] = day_key
+        s["day_start_equity"] = float(cur_eq)
+        changed = True
+        print(
+            f"[RISK] day rollover | day_key={day_key} day_start_equity={float(s['day_start_equity']):,.0f}"
+        )
+
+    if float(s.get("day_start_equity", 0.0)) <= 0:
+        s["day_start_equity"] = float(cur_eq)
+        changed = True
+
+    prev_peak = float(s.get("peak_equity", 0.0))
+    if prev_peak <= 0:
+        s["peak_equity"] = float(cur_eq)
+        changed = True
+    elif cur_eq > prev_peak:
+        s["peak_equity"] = float(cur_eq)
+        changed = True
+
+    day_start = float(s.get("day_start_equity", 0.0))
+    peak_equity = float(s.get("peak_equity", 0.0))
+    daily_loss_pct = _pct_change(cur_eq, day_start)
+    mdd_pct = _pct_change(cur_eq, peak_equity)
+
+    daily_limit = _normalize_loss_limit_pct(getattr(config, "DAILY_MAX_LOSS_PCT", -5.0), -5.0)
+    mdd_limit = _normalize_loss_limit_pct(getattr(config, "GLOBAL_MDD_LIMIT_PCT", -15.0), -15.0)
+
+    halt_reason = ""
+    if daily_loss_pct <= daily_limit:
+        halt_reason = "DAILY_LOSS_LIMIT"
+    if mdd_pct <= mdd_limit:
+        halt_reason = "TOTAL_MDD_LIMIT"
+
+    prev_halted = bool(s.get("halted_flag", False))
+    prev_reason = str(s.get("halt_reason") or "")
+    if halt_reason:
+        s["halted_flag"] = True
+        s["halt_reason"] = halt_reason
+        if not prev_halted:
+            s["halted_at_ts"] = float(now.timestamp())
+            triggered = True
+            changed = True
+        elif prev_reason != halt_reason:
+            changed = True
+    else:
+        if prev_halted or prev_reason:
+            changed = True
+        s["halted_flag"] = False
+        s["halt_reason"] = ""
+        s["halted_at_ts"] = 0.0
+
+    info = {
+        "halted": bool(s.get("halted_flag", False)),
+        "reason": str(s.get("halt_reason") or ""),
+        "daily_loss_pct": float(daily_loss_pct),
+        "mdd_pct": float(mdd_pct),
+        "daily_limit": float(daily_limit),
+        "mdd_limit": float(mdd_limit),
+        "day_key": str(day_key),
+        "day_start_equity": float(day_start),
+        "peak_equity": float(peak_equity),
+    }
+    return info, changed, triggered
+
+
+def _notify_risk_cut_once(info: dict, equity: float):
+    global _TG_LAST_RISKCUT_AT
+    cooldown = max(0, int(getattr(config, "TELEGRAM_ALERT_COOLDOWN_SEC", 60)))
+    now_ts = time.time()
+    if (now_ts - _TG_LAST_RISKCUT_AT) < float(cooldown):
+        return
+
+    reason = str(info.get("reason") or "RISK_CUT")
+    daily = float(info.get("daily_loss_pct", 0.0))
+    mdd = float(info.get("mdd_pct", 0.0))
+    tg(f"🛑 RISK CUT {reason} | equity={float(equity):,.0f} daily={daily:+.2f}% mdd={mdd:+.2f}%")
+    _TG_LAST_RISKCUT_AT = float(now_ts)
 
 
 def ensure_trade_log_header(path: str):
@@ -743,7 +877,8 @@ def run():
 
     ensure_trade_log_header(config.TRADE_LOG_PATH)
 
-    strategy_state, strategy_cooldowns, inactive_positions, scalp_btc_state = load_state()
+    strategy_state, strategy_cooldowns, inactive_positions, scalp_btc_state, runtime_risk_state = load_state()
+    runtime_risk_state = _normalize_runtime_risk_state(runtime_risk_state)
     for s in STRATEGIES:
         strategy_state.setdefault(s, {})
         strategy_cooldowns.setdefault(s, {})
@@ -778,6 +913,7 @@ def run():
             strategy_cooldowns,
             inactive_positions=inactive_positions,
             scalp_btc_state=scalp_btc_state,
+            risk_state=runtime_risk_state,
         )
 
     if moved_count or repaired_dup:
@@ -926,6 +1062,30 @@ def run():
                 strategy_state, scalp_btc_state, include_legacy_scalp=enable_scalp_legacy
             )
 
+            prev_day_key = str(runtime_risk_state.get("day_key", ""))
+            prev_halted = bool(runtime_risk_state.get("halted_flag", False))
+            risk_info, _, risk_triggered = _update_global_risk_cut_state(now, equity, runtime_risk_state)
+            risk_halted = bool(risk_info.get("halted", False))
+            halt_reason = str(risk_info.get("reason", ""))
+
+            if risk_triggered:
+                print(
+                    f"[RISK_CUT] HALT reason={halt_reason} equity={equity:,.0f} "
+                    f"daily={float(risk_info.get('daily_loss_pct', 0.0)):+.2f}% "
+                    f"mdd={float(risk_info.get('mdd_pct', 0.0)):+.2f}%"
+                )
+                _notify_risk_cut_once(risk_info, equity)
+
+            if prev_halted and (not risk_halted):
+                print(
+                    f"[RISK_CUT] cleared | day={risk_info.get('day_key')} "
+                    f"daily={float(risk_info.get('daily_loss_pct', 0.0)):+.2f}% "
+                    f"mdd={float(risk_info.get('mdd_pct', 0.0)):+.2f}%"
+                )
+
+            if (str(runtime_risk_state.get("day_key", "")) != prev_day_key) or (prev_halted != risk_halted) or risk_triggered:
+                persist_state()
+
             day_tp1_count_main = update_day_tp1_counter(
                 strategy_state.get("MAIN", {}),
                 tp1_counted_main,
@@ -935,7 +1095,7 @@ def run():
 
             tp1_limit = int(getattr(config, "DAILY_TP1_EXIT_LIMIT", 3))
             main_loss_limit = int(getattr(config, "MAIN_CONSEC_LOSS_LIMIT", getattr(config, "CONSEC_LOSS_EXIT_LIMIT", 4)))
-            main_entry_allowed = (day_tp1_count_main < tp1_limit) and (loss_seq_main < main_loss_limit)
+            main_entry_allowed = (day_tp1_count_main < tp1_limit) and (loss_seq_main < main_loss_limit) and (not risk_halted)
 
             blocked_main = not main_entry_allowed
             if blocked_main and not main_entry_blocked_prev:
@@ -943,6 +1103,12 @@ def run():
                     print(f"[ENTRY_BLOCK][MAIN] reason=TP1_LIMIT count={day_tp1_count_main}")
                 if loss_seq_main >= main_loss_limit:
                     print(f"[ENTRY_BLOCK][MAIN] reason=LOSS_STREAK count={loss_seq_main}")
+                if risk_halted:
+                    print(
+                        f"[ENTRY_BLOCK][GLOBAL] reason={halt_reason} "
+                        f"daily={float(risk_info.get('daily_loss_pct', 0.0)):+.2f}% "
+                        f"mdd={float(risk_info.get('mdd_pct', 0.0)):+.2f}%"
+                    )
             main_entry_blocked_prev = blocked_main
 
             if (now - last_status).total_seconds() >= float(config.STATUS_PRINT_SEC):
@@ -958,7 +1124,9 @@ def run():
                     f"Holding={total_holding}/{max_holdings} | MAIN={main_h} LEGACY={legacy_h} SCALP_BTC={scalp_btc_h} | "
                     f"Core={len(core_universe)} Surge={len(surge_candidates)} | "
                     f"HKey={h_key} HScale={h_scale:.2f} | TP1_MAIN={day_tp1_count_main} "
-                    f"Loss_MAIN={loss_seq_main} SBtcLoss={int(scalp_btc_state.get('loss_streak', 0))} SBtcPause={pause_txt}"
+                    f"Loss_MAIN={loss_seq_main} SBtcLoss={int(scalp_btc_state.get('loss_streak', 0))} SBtcPause={pause_txt} | "
+                    f"RiskHalt={'Y' if risk_halted else 'N'} Day={risk_info.get('day_key', '')} "
+                    f"DayStart={float(risk_info.get('day_start_equity', 0.0)):,.0f} Peak={float(risk_info.get('peak_equity', 0.0)):,.0f}"
                 )
                 last_status = now
 
@@ -1099,7 +1267,7 @@ def run():
                     )
 
             # 4) Legacy SCALP entry (optional)
-            if enable_scalp_legacy and total_holding < max_holdings:
+            if enable_scalp_legacy and (not risk_halted) and total_holding < max_holdings:
                 scalp_universe = []
                 for ticker in surge_candidates:
                     until = surge_stoploss_until.get(ticker)
@@ -1132,7 +1300,7 @@ def run():
                     )
 
             # 5) SCALP_BTC entry (always last)
-            if enable_scalp_btc and total_holding < max_holdings:
+            if enable_scalp_btc and (not risk_halted) and total_holding < max_holdings:
                 did_scalp_btc = _try_scalp_btc_entry(
                     upbit=upbit,
                     now=now,

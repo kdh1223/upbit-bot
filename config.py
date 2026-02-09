@@ -207,6 +207,12 @@ SCALP_CONSEC_LOSS_LIMIT = 4
 COOLDOWN_PROFIT_MIN = 10
 COOLDOWN_LOSS_MIN = 30
 
+# Global risk-cut (account-level circuit breaker)
+# negative percent values: -5 means -5%
+DAILY_MAX_LOSS_PCT = -5.0
+GLOBAL_MDD_LIMIT_PCT = -15.0
+RISK_CUT_FORCE_CLOSE = False
+
 # ===============================
 # MAIN strategy
 # ===============================
