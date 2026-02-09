@@ -37,6 +37,7 @@ from market import (
 from order_utils import wait_for_filled_snapshot
 from state_store import STRATEGIES, load_state, save_state, verify_state_with_balance
 from strategy import build_k_map
+from utils.log_paths import trade_log_path_for
 from utils.telegram_notify import notify_event, notify_order
 
 
@@ -534,7 +535,7 @@ def _notify_trade_result(ticker: str, qty: float, entry_price: float, exit_price
 
 
 def _notify_monthly_stats(now: dt.datetime):
-    stats = _calc_monthly_stats(now, config.TRADE_LOG_PATH)
+    stats = _calc_monthly_stats(now, trade_log_path_for(now))
     if not stats:
         return
 
@@ -1086,7 +1087,7 @@ def _scalp_btc_close_position(
             realized_krw = float(total_sell_krw) - float(total_buy_krw)
             realized_pct = (realized_krw / float(total_buy_krw) * 100.0) if total_buy_krw > 0 else 0.0
             append_trade_log(
-                config.TRADE_LOG_PATH,
+                trade_log_path_for(now),
                 [
                     now.strftime("%Y-%m-%d %H:%M:%S"),
                     ticker,
@@ -1173,7 +1174,7 @@ def _scalp_btc_close_position(
         state["loss_streak"] = 0
 
     append_trade_log(
-        config.TRADE_LOG_PATH,
+        trade_log_path_for(now),
         [
             now.strftime("%Y-%m-%d %H:%M:%S"),
             ticker,
@@ -1412,7 +1413,7 @@ def run():
     if bool(getattr(config, "REAL_ORDER", False)):
         print("[WARN] REAL_ORDER=True (live order mode) | auto-start (confirmation disabled)")
 
-    ensure_trade_log_header(config.TRADE_LOG_PATH)
+    ensure_trade_log_header(trade_log_path_for(now_kst()))
 
     strategy_state, strategy_cooldowns, inactive_positions, scalp_btc_state, runtime_risk_state = load_state()
     runtime_risk_state = _normalize_runtime_risk_state(runtime_risk_state)

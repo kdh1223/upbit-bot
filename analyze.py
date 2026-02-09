@@ -8,9 +8,10 @@ from datetime import datetime
 from typing import Dict, List, Tuple
 
 import config
+from utils.log_paths import trade_log_path_for
 
 
-TRADE_LOG = getattr(config, "TRADE_LOG_PATH", "trade_log.csv")
+TRADE_LOG = trade_log_path_for()
 OUT_XLSX = "trading_summary.xlsx"
 OUT_SUMMARY_CSV = "trading_summary.csv"
 

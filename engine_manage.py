@@ -10,9 +10,11 @@ import analyze
 import config
 from market import get_balance
 from risk import apply_risk_rules
+from utils.log_paths import trade_log_path_for
 
 
 ORDER_LOG_PATH = getattr(config, "ORDER_LOG_PATH", "order_log.csv")
+TRADE_LOG_HEADER = ["time", "ticker", "entry_price", "exit_price", "pnl_pct", "reason", "regime", "strategy"]
 
 
 def _ensure_order_log_header(path: str):
@@ -106,6 +108,9 @@ def append_trade_log(path: str, row):
     lock_path = f"{path}.lock"
     lock_fd = _acquire_lockfile(lock_path, wait_sec=1.0, stale_sec=30.0)
     try:
+        if not os.path.exists(path):
+            with open(path, "w", newline="", encoding="utf-8") as f:
+                csv.writer(f).writerow(TRADE_LOG_HEADER)
         last_row = _read_last_csv_row(path)
         if last_row == row_norm:
             return False
@@ -289,8 +294,9 @@ def manage_positions(
                 f"[CLOSE] {ticker} pnl={pnl_pct:+.2f}% | cooldown={cd_min}m | reason={result.get('reason')}"
             )
 
+            trade_log_path = trade_log_path_for(now)
             append_trade_log(
-                config.TRADE_LOG_PATH,
+                trade_log_path,
                 [
                     now.strftime("%Y-%m-%d %H:%M:%S"),
                     ticker,
@@ -342,7 +348,7 @@ def manage_positions(
 
             if bool(getattr(config, "AUTO_REPORT", False)):
                 analyze.maybe_generate_report(
-                    trade_log_path=config.TRADE_LOG_PATH,
+                    trade_log_path=trade_log_path,
                     out_csv=analyze.OUT_SUMMARY_CSV,
                     out_xlsx=analyze.OUT_XLSX,
                     min_interval_sec=float(getattr(config, "AUTO_REPORT_MIN_INTERVAL_SEC", 30)),

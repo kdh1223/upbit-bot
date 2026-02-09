@@ -1,0 +1,472 @@
+"""Send daily 21:00(KST) report text + monthly equity PNG to Telegram."""
+
+import argparse
+import csv
+import datetime as dt
+import os
+import traceback
+from typing import Dict, List
+from zoneinfo import ZoneInfo
+
+import requests
+
+import config
+from utils.log_paths import list_trade_log_paths, report_log_path_for, trade_log_path_for
+
+
+KST = ZoneInfo("Asia/Seoul")
+SUMMARY_CSV = "trading_summary.csv"
+SUMMARY_XLSX = "trading_summary.xlsx"
+MONTH_PNG = "equity_month.png"
+
+
+def now_kst() -> dt.datetime:
+    return dt.datetime.now(KST)
+
+
+def _to_float(value, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except Exception:
+        return float(default)
+
+
+def _safe_initial_capital() -> float:
+    try:
+        return float(getattr(config, "INITIAL_CAPITAL", 1_000_000))
+    except Exception:
+        return 1_000_000.0
+
+
+def _strip_quotes(value: str) -> str:
+    s = str(value or "").strip()
+    if len(s) >= 2 and ((s[0] == s[-1] == '"') or (s[0] == s[-1] == "'")):
+        return s[1:-1].strip()
+    return s
+
+
+def load_env_file(path: str = "/etc/default/telegram-bot"):
+    if not os.path.exists(path):
+        return
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+    except Exception:
+        return
+
+    for raw in lines:
+        line = str(raw or "").strip()
+        if (not line) or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[7:].strip()
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = str(key or "").strip()
+        if not key:
+            continue
+        if key in os.environ:
+            continue
+        os.environ[key] = _strip_quotes(value)
+
+
+def _parse_trade_time(raw: str):
+    s = str(raw or "").strip()
+    if not s:
+        return None
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
+        try:
+            return dt.datetime.strptime(s, fmt).replace(tzinfo=KST)
+        except Exception:
+            pass
+    try:
+        parsed = dt.datetime.fromisoformat(s)
+        if parsed.tzinfo is None:
+            return parsed.replace(tzinfo=KST)
+        return parsed.astimezone(KST)
+    except Exception:
+        return None
+
+
+def _dedupe_key(row: Dict[str, str]):
+    return (
+        str(row.get("time", "")).strip(),
+        str(row.get("ticker", "")).strip(),
+        str(row.get("entry_price", "")).strip(),
+        str(row.get("exit_price", "")).strip(),
+        str(row.get("pnl_pct", "")).strip(),
+        str(row.get("reason", "")).strip(),
+        str(row.get("strategy", "")).strip(),
+    )
+
+
+def _read_trade_rows(path: str):
+    if not os.path.exists(path):
+        return []
+    out = []
+    try:
+        with open(path, "r", newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                ts = _parse_trade_time(row.get("time", ""))
+                if ts is None:
+                    continue
+                out.append(
+                    {
+                        "time_dt": ts,
+                        "time": str(row.get("time", "")).strip(),
+                        "ticker": str(row.get("ticker", "")).strip(),
+                        "entry_price": str(row.get("entry_price", "")).strip(),
+                        "exit_price": str(row.get("exit_price", "")).strip(),
+                        "pnl_pct": str(row.get("pnl_pct", "")).strip(),
+                        "reason": str(row.get("reason", "")).strip(),
+                        "regime": str(row.get("regime", "")).strip(),
+                        "strategy": str(row.get("strategy", "")).strip().upper(),
+                    }
+                )
+    except Exception:
+        return []
+    return out
+
+
+def load_all_trades(base_dir: str = "."):
+    files = list_trade_log_paths(base_dir=base_dir)
+    rows = []
+    for path in files:
+        rows.extend(_read_trade_rows(path))
+    rows.sort(key=lambda x: x["time_dt"])
+
+    deduped = []
+    seen = set()
+    for row in rows:
+        key = _dedupe_key(row)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(row)
+    return deduped, files
+
+
+def report_window_21_to_21(now: dt.datetime):
+    today_21 = now.replace(hour=21, minute=0, second=0, microsecond=0)
+    end = today_21 if now >= today_21 else (today_21 - dt.timedelta(days=1))
+    start = end - dt.timedelta(days=1)
+    return start, end
+
+
+def month_window(end: dt.datetime):
+    return end.replace(day=1, hour=21, minute=0, second=0, microsecond=0), end
+
+
+def filter_rows(rows: List[Dict[str, str]], start: dt.datetime = None, end: dt.datetime = None):
+    out = []
+    for row in rows:
+        ts = row["time_dt"]
+        if (start is not None) and ts < start:
+            continue
+        if (end is not None) and ts >= end:
+            continue
+        out.append(row)
+    out.sort(key=lambda x: x["time_dt"])
+    return out
+
+
+def _is_stop_reason(reason: str) -> bool:
+    s = str(reason or "").strip().lower()
+    if not s:
+        return False
+    if s in {"sl", "stoploss", "stop_loss"}:
+        return True
+    if "stop" in s:
+        return True
+    if "loss" in s and "timeout" not in s:
+        return True
+    return False
+
+
+def _compound_return_pct(rows: List[Dict[str, str]]) -> float:
+    mult = 1.0
+    for row in rows:
+        pnl = _to_float(row.get("pnl_pct", 0.0), 0.0)
+        mult *= (1.0 + pnl / 100.0)
+    return (mult - 1.0) * 100.0
+
+
+def _mdd_pct(rows: List[Dict[str, str]], initial_capital: float) -> float:
+    equity = float(initial_capital)
+    peak = float(initial_capital)
+    mdd = 0.0
+    for row in rows:
+        pnl = _to_float(row.get("pnl_pct", 0.0), 0.0)
+        equity *= (1.0 + pnl / 100.0)
+        if equity > peak:
+            peak = equity
+        if peak > 0:
+            dd = (equity / peak - 1.0) * 100.0
+            if dd < mdd:
+                mdd = dd
+    return float(mdd)
+
+
+def build_metrics(rows: List[Dict[str, str]]):
+    n = len(rows)
+    pnls = [_to_float(row.get("pnl_pct", 0.0), 0.0) for row in rows]
+    wins = sum(1 for x in pnls if x > 0)
+    wr = (wins / n * 100.0) if n > 0 else 0.0
+    avg = (sum(pnls) / n) if n > 0 else 0.0
+    cum = _compound_return_pct(rows) if n > 0 else 0.0
+    max_pnl = max(pnls) if pnls else 0.0
+    min_pnl = min(pnls) if pnls else 0.0
+    sl_cnt = sum(1 for row in rows if _is_stop_reason(row.get("reason", "")))
+    sl_ratio = (sl_cnt / n * 100.0) if n > 0 else 0.0
+    recent = pnls[-10:]
+    avg10 = (sum(recent) / len(recent)) if recent else 0.0
+    return {
+        "n": int(n),
+        "wr": float(wr),
+        "avg": float(avg),
+        "cum": float(cum),
+        "max": float(max_pnl),
+        "min": float(min_pnl),
+        "sl_ratio": float(sl_ratio),
+        "avg10": float(avg10),
+    }
+
+
+def build_strategy_metrics_month(rows_month: List[Dict[str, str]]):
+    out = {}
+    for strategy in ("MAIN", "SCALP_BTC"):
+        part = [r for r in rows_month if str(r.get("strategy", "")).upper() == strategy]
+        m = build_metrics(part)
+        out[strategy] = {"n": m["n"], "wr": m["wr"], "avg": m["avg"]}
+    return out
+
+
+def write_summary_csv(path: str, daily: dict, month: dict, overall: dict, by_strategy: dict):
+    rows = [
+        ["section", "metric", "value"],
+        ["daily", "trades", daily["n"]],
+        ["daily", "winrate_pct", f"{daily['wr']:.4f}"],
+        ["daily", "avg_pnl_pct", f"{daily['avg']:.4f}"],
+        ["daily", "compound_pct", f"{daily['cum']:.4f}"],
+        ["daily", "max_pnl_pct", f"{daily['max']:.4f}"],
+        ["daily", "min_pnl_pct", f"{daily['min']:.4f}"],
+        ["daily", "stoploss_ratio_pct", f"{daily['sl_ratio']:.4f}"],
+        ["daily", "recent10_avg_pnl_pct", f"{daily['avg10']:.4f}"],
+        ["month", "trades", month["n"]],
+        ["month", "winrate_pct", f"{month['wr']:.4f}"],
+        ["month", "avg_pnl_pct", f"{month['avg']:.4f}"],
+        ["month", "compound_pct", f"{month['cum']:.4f}"],
+        ["overall", "compound_pct", f"{overall['cum']:.4f}"],
+        ["overall", "mdd_pct", f"{overall['mdd']:.4f}"],
+    ]
+    for strategy in ("MAIN", "SCALP_BTC"):
+        s = by_strategy.get(strategy, {"n": 0, "wr": 0.0, "avg": 0.0})
+        rows.append([f"month_{strategy}", "trades", s["n"]])
+        rows.append([f"month_{strategy}", "winrate_pct", f"{s['wr']:.4f}"])
+        rows.append([f"month_{strategy}", "avg_pnl_pct", f"{s['avg']:.4f}"])
+
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        csv.writer(f).writerows(rows)
+
+
+def write_xlsx_if_requested(path: str, daily: dict, month: dict, overall: dict, by_strategy: dict):
+    try:
+        from openpyxl import Workbook
+    except Exception:
+        return False, "openpyxl_missing"
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "summary"
+    ws.append(["section", "metric", "value"])
+
+    for section, data in (("daily", daily), ("month", month), ("overall", overall)):
+        for k, v in data.items():
+            ws.append([section, k, v])
+    for strategy in ("MAIN", "SCALP_BTC"):
+        s = by_strategy.get(strategy, {"n": 0, "wr": 0.0, "avg": 0.0})
+        ws.append([f"month_{strategy}", "n", s["n"]])
+        ws.append([f"month_{strategy}", "wr", s["wr"]])
+        ws.append([f"month_{strategy}", "avg", s["avg"]])
+
+    wb.save(path)
+    return True, ""
+
+
+def save_month_equity_png(path: str, rows_month: List[Dict[str, str]], start: dt.datetime, end: dt.datetime):
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    initial = _safe_initial_capital()
+    xs = [start]
+    ys = [initial]
+    equity = initial
+    for row in rows_month:
+        pnl = _to_float(row.get("pnl_pct", 0.0), 0.0)
+        equity *= (1.0 + pnl / 100.0)
+        xs.append(row["time_dt"])
+        ys.append(equity)
+    if len(xs) == 1:
+        xs.append(end)
+        ys.append(initial)
+
+    fig = plt.figure(figsize=(10, 4.8))
+    ax = fig.add_subplot(111)
+    ax.plot(xs, ys, linewidth=1.8)
+    ax.set_title(f"Monthly Equity Curve ({start.strftime('%Y-%m')}, KST 21->21)")
+    ax.set_xlabel("Time")
+    ax.set_ylabel("Equity (KRW)")
+    ax.grid(alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(path, dpi=130)
+    plt.close(fig)
+
+
+def fmt_pct(value: float, signed: bool = True) -> str:
+    v = _to_float(value, 0.0)
+    if signed:
+        return f"{v:+.2f}%"
+    return f"{v:.2f}%"
+
+
+def build_report_text(report_end: dt.datetime, day_start: dt.datetime, day: dict, month: dict, overall: dict, by_strategy: dict):
+    mdd_warn = abs(_to_float(getattr(config, "DAILY_REPORT_MDD_WARN_PCT", 10.0), 10.0))
+    status = "\U0001F7E2"
+    status_reason = ""
+    if overall["mdd"] <= -mdd_warn:
+        status = "\U0001F6A8"
+        status_reason = f"\uC804\uCCB4 MDD {fmt_pct(overall['mdd'])} <= -{mdd_warn:.2f}%"
+    elif day["avg10"] < 0:
+        status = "\u26A0\uFE0F"
+        status_reason = f"\uCD5C\uADFC10\uD3C9\uADE0 {fmt_pct(day['avg10'])} < 0%"
+
+    lines = [
+        f"\U0001F4CA \uC77C\uC77C \uC131\uC801 \uB9AC\uD3EC\uD2B8 (KST) | {report_end.strftime('%Y-%m-%d 21:00')}",
+        f"\uAE30\uAC04: {day_start.strftime('%m/%d %H:%M')} ~ {report_end.strftime('%m/%d %H:%M')}",
+        "",
+    ]
+    if day["n"] > 0:
+        lines.extend(
+            [
+                f"\uC77C\uC77C: \uAC70\uB798 {day['n']} | \uC2B9\uB960 {fmt_pct(day['wr'], signed=False)} | \uD3C9\uADE0 {fmt_pct(day['avg'])} | \uB204\uC801(\uBCF5\uB9AC) {fmt_pct(day['cum'])}",
+                f"      \uCD5C\uB300\uC775\uC808 {fmt_pct(day['max'])} | \uCD5C\uB300\uC190\uC808 {fmt_pct(day['min'])}",
+                f"      \uC190\uC808\uBE44\uC911 {fmt_pct(day['sl_ratio'], signed=False)} | \uCD5C\uADFC10\uD3C9\uADE0 {fmt_pct(day['avg10'])}",
+                "",
+            ]
+        )
+    else:
+        lines.extend(
+            [
+                "\uC77C\uC77C: \uC624\uB298 \uAC70\uB798 \uC5C6\uC74C",
+                "",
+            ]
+        )
+
+    lines.extend(
+        [
+            f"\uC774\uBC88\uB2EC({report_end.strftime('%Y-%m')})",
+            f"\uAC70\uB798 {month['n']} | \uC2B9\uB960 {fmt_pct(month['wr'], signed=False)} | \uD3C9\uADE0 {fmt_pct(month['avg'])} | \uB204\uC801(\uBCF5\uB9AC) {fmt_pct(month['cum'])}",
+            "",
+            "\uC804\uCCB4",
+            f"\uB204\uC801(\uBCF5\uB9AC) {fmt_pct(overall['cum'])} | MDD {fmt_pct(overall['mdd'])}",
+            "",
+            "\uC804\uB7B5\uBCC4(\uC774\uBC88\uB2EC)",
+            f"- MAIN: \uAC70\uB798 {by_strategy['MAIN']['n']} | \uC2B9\uB960 {fmt_pct(by_strategy['MAIN']['wr'], signed=False)} | \uD3C9\uADE0 {fmt_pct(by_strategy['MAIN']['avg'])}",
+            f"- SCALP_BTC: \uAC70\uB798 {by_strategy['SCALP_BTC']['n']} | \uC2B9\uB960 {fmt_pct(by_strategy['SCALP_BTC']['wr'], signed=False)} | \uD3C9\uADE0 {fmt_pct(by_strategy['SCALP_BTC']['avg'])}",
+            "",
+            f"\uC0C1\uD0DC: {status}",
+        ]
+    )
+    if status_reason:
+        lines.append(f"\uC0AC\uC720: {status_reason}")
+    return "\n".join(lines)
+
+
+def tg_send_message(token: str, chat_id: str, text: str):
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    requests.post(url, data={"chat_id": chat_id, "text": text, "disable_web_page_preview": True}, timeout=10)
+
+
+def tg_send_photo(token: str, chat_id: str, path: str):
+    url = f"https://api.telegram.org/bot{token}/sendPhoto"
+    with open(path, "rb") as f:
+        requests.post(url, data={"chat_id": chat_id}, files={"photo": f}, timeout=20)
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--xlsx", action="store_true")
+    args = parser.parse_args()
+
+    now = now_kst()
+    report_log_path = report_log_path_for(now)
+
+    def log_line(msg: str):
+        line = f"[{now_kst().strftime('%Y-%m-%d %H:%M:%S')}] {msg}"
+        print(line)
+        try:
+            with open(report_log_path, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+        except Exception:
+            pass
+
+    load_env_file("/etc/default/telegram-bot")
+    token = str(os.getenv("TELEGRAM_TOKEN") or "").strip()
+    chat_id = str(os.getenv("TELEGRAM_CHAT_ID") or "").strip()
+
+    rows_all, files = load_all_trades(".")
+    day_start, report_end = report_window_21_to_21(now)
+    month_start, _ = month_window(report_end)
+
+    month_file = trade_log_path_for(report_end - dt.timedelta(seconds=1))
+    if not os.path.exists(month_file):
+        log_line(f"[INFO] monthly trade file missing: {month_file}")
+    if not files:
+        log_line("[INFO] no trade_log_YYYY-MM.csv files found")
+
+    rows_daily = filter_rows(rows_all, start=day_start, end=report_end)
+    rows_month = filter_rows(rows_all, start=month_start, end=report_end)
+    rows_total = list(rows_all)
+
+    day_metrics = build_metrics(rows_daily)
+    month_metrics = build_metrics(rows_month)
+    total_metrics = build_metrics(rows_total)
+    total_metrics["mdd"] = _mdd_pct(rows_total, _safe_initial_capital()) if rows_total else 0.0
+    by_strategy = build_strategy_metrics_month(rows_month)
+
+    write_summary_csv(SUMMARY_CSV, day_metrics, month_metrics, total_metrics, by_strategy)
+    save_month_equity_png(MONTH_PNG, rows_month, month_start, report_end)
+    log_line(f"[OK] wrote {SUMMARY_CSV} and {MONTH_PNG}")
+
+    if args.xlsx:
+        ok, err = write_xlsx_if_requested(SUMMARY_XLSX, day_metrics, month_metrics, total_metrics, by_strategy)
+        if ok:
+            log_line(f"[OK] wrote {SUMMARY_XLSX}")
+        else:
+            log_line(f"[WARN] xlsx skipped: {err}")
+
+    text = build_report_text(report_end, day_start, day_metrics, month_metrics, total_metrics, by_strategy)
+
+    if (not token) or (not chat_id):
+        log_line("[WARN] TELEGRAM_TOKEN/TELEGRAM_CHAT_ID missing; skip telegram send")
+        return
+
+    try:
+        tg_send_message(token, chat_id, text)
+        log_line("[OK] telegram text sent")
+    except Exception:
+        log_line(f"[ERR] telegram text send failed\n{traceback.format_exc().strip()}")
+
+    try:
+        tg_send_photo(token, chat_id, MONTH_PNG)
+        log_line("[OK] telegram photo sent")
+    except Exception:
+        log_line(f"[ERR] telegram photo send failed\n{traceback.format_exc().strip()}")
+
+
+if __name__ == "__main__":
+    main()
