@@ -13,3 +13,7 @@ trading_summary.csv
 trading_summary.xlsx
 bot_state.json
 
+*.log
+bot.log
+bot_console.log
+screenlog.*
