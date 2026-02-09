@@ -212,7 +212,11 @@ def try_main_entries(
                 position_manager.apply_add_mock(state, ticker, float(cur), float(add_vol), float(per_trade_amt))
         else:
             state[ticker] = position_manager.init_position_state(
-                float(entry_price), float(initial_vol), float(per_trade_amt), regime
+                float(entry_price),
+                float(initial_vol),
+                float(per_trade_amt),
+                regime,
+                entry_ts=float(now.timestamp()),
             )
             state[ticker]["entry_bucket"] = "CORE"
 
@@ -303,7 +307,11 @@ def try_scalp_entries(
             continue
 
         state[ticker] = position_manager.init_position_state(
-            float(entry_price), float(initial_vol), float(buy_krw), regime
+            float(entry_price),
+            float(initial_vol),
+            float(buy_krw),
+            regime,
+            entry_ts=float(now.timestamp()),
         )
         state[ticker]["entry_bucket"] = "SURGE"
         save_state_fn()

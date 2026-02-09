@@ -188,6 +188,9 @@ def _repair_cross_strategy_duplicate_holdings(strategy_state: dict):
         s["initial_volume"] = 0.0
         s["realized_krw"] = 0.0
         s["realized_cost_krw"] = 0.0
+        s["entry_ts"] = 0.0
+        s["trail_armed"] = False
+        s["trail_hwm"] = 0.0
         repaired += 1
         print(f"[LOCK_REPAIR] duplicated holding released from SCALP: {ticker}")
 
@@ -980,7 +983,7 @@ def run():
                     for e in events_scalp:
                         pnl = float(e.get("pnl_pct", 0.0))
                         reason = str(e.get("reason", ""))
-                        if pnl < 0 and reason in {"stop_loss", "trailing"}:
+                        if pnl < 0 and reason in {"stoploss", "stop_loss", "trailing"}:
                             t = str(e.get("ticker", ""))
                             if t:
                                 surge_stoploss_until[t] = now + dt.timedelta(minutes=block_min)

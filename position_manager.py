@@ -1,11 +1,23 @@
 """신규/추가 매수 가능 여부와 평균단가 상태 갱신을 처리하는 포지션 유틸."""
 
+import time
+
 import config
 
 
 def _get_target_krw(per_trade_amt: float) -> float:
     mult = float(getattr(config, "POSITION_TARGET_MULT", 2.0))
     return float(per_trade_amt) * mult
+
+
+def _safe_entry_ts(entry_ts=None) -> float:
+    try:
+        ts = float(entry_ts)
+        if ts > 0:
+            return ts
+    except Exception:
+        pass
+    return float(time.time())
 
 
 def can_open_new_position(state: dict, ticker: str):
@@ -52,11 +64,16 @@ def init_position_state(
     initial_vol: float,
     per_trade_amt: float,
     regime: str,
+    entry_ts: float = None,
 ):
+    ts = _safe_entry_ts(entry_ts)
     return {
         "holding": True,
         "entry": float(entry_price),
         "peak": float(entry_price),
+        "entry_ts": float(ts),
+        "trail_armed": False,
+        "trail_hwm": 0.0,
         "tp1": False,
         "tp2": False,
         "regime": regime,

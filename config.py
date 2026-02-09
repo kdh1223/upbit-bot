@@ -121,6 +121,13 @@ TP1_SELL_RATIO = 0.50
 TP2_SELL_RATIO = 0.50
 TRAIL_BACK_PCT = 0.0070
 
+# Trailing arm guard (percent-based fields, not ratio):
+# - TRAIL_ARM_PCT: minimum unrealized profit (%) to enable trailing
+# - TRAIL_DRAWDOWN_PCT: optional trailing drawdown (%) override; None = use regime TRAIL_BACK_PCT
+TRAIL_ARM_SEC = 120
+TRAIL_ARM_PCT = 0.5
+TRAIL_DRAWDOWN_PCT = None
+
 TP_SL_BY_HOLDINGS = {
     2: {
         "tp1": 0.008,

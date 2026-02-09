@@ -134,7 +134,7 @@ def manage_positions(
                 inactive_positions=inactive_positions,
             )
 
-        result = apply_risk_rules(upbit, ticker, s, float(cur), sell_fn)
+        result = apply_risk_rules(upbit, ticker, s, float(cur), sell_fn, now=now)
 
         if result.get("closed"):
             if bool(getattr(config, "REAL_ORDER", False)):
@@ -199,6 +199,9 @@ def manage_positions(
             s["tp2"] = False
             s["realized_krw"] = 0.0
             s["realized_cost_krw"] = 0.0
+            s["entry_ts"] = 0.0
+            s["trail_armed"] = False
+            s["trail_hwm"] = 0.0
 
             save_state_fn(state, cooldown_until)
 

@@ -67,6 +67,70 @@ def _parse_dt(value):
         return None
 
 
+def _parse_ts(value):
+    if value is None:
+        return None
+    if isinstance(value, dt.datetime):
+        return float(value.timestamp())
+    try:
+        ts = float(value)
+        if ts > 0:
+            return ts
+    except Exception:
+        pass
+    try:
+        parsed = dt.datetime.fromisoformat(str(value))
+        return float(parsed.timestamp())
+    except Exception:
+        return None
+
+
+def _normalize_position_state(raw: dict):
+    s = dict(raw or {})
+    s["holding"] = bool(s.get("holding", False))
+
+    try:
+        entry = float(s.get("entry", 0.0))
+    except Exception:
+        entry = 0.0
+    s["entry"] = float(entry)
+
+    try:
+        s["peak"] = float(s.get("peak", entry if entry > 0 else 0.0))
+    except Exception:
+        s["peak"] = float(entry if entry > 0 else 0.0)
+
+    entry_ts = _parse_ts(s.get("entry_ts"))
+    if entry_ts is None and bool(s.get("holding", False)):
+        entry_ts = float(now_kst().timestamp())
+    s["entry_ts"] = float(entry_ts) if entry_ts is not None else 0.0
+
+    s["trail_armed"] = bool(s.get("trail_armed", False))
+    try:
+        trail_hwm = float(s.get("trail_hwm", 0.0))
+    except Exception:
+        trail_hwm = 0.0
+
+    if trail_hwm < 0:
+        trail_hwm = 0.0
+    if bool(s.get("trail_armed", False)) and trail_hwm <= 0:
+        s["trail_armed"] = False
+
+    if not bool(s.get("holding", False)):
+        s["trail_armed"] = False
+        trail_hwm = 0.0
+    s["trail_hwm"] = float(trail_hwm)
+
+    return s
+
+
+def _normalize_position_map(raw: dict):
+    out = {}
+    for ticker, pos in (raw or {}).items():
+        out[ticker] = _normalize_position_state(pos if isinstance(pos, dict) else {})
+    return out
+
+
 def _normalize_scalp_btc_state(raw: dict):
     state = dict(raw or {})
     base = _default_scalp_btc_state()
@@ -148,10 +212,10 @@ def save_state(state: dict, cooldown_until: dict, inactive_positions: dict = Non
         if _is_strategy_dict(state):
             state_out = _empty_strategy_payload()
             for s in STRATEGIES:
-                state_out[s] = dict((state or {}).get(s, {}) or {})
+                state_out[s] = _normalize_position_map((state or {}).get(s, {}) or {})
         else:
             state_out = _empty_strategy_payload()
-            state_out[_legacy_target_strategy()] = dict(state or {})
+            state_out[_legacy_target_strategy()] = _normalize_position_map(state or {})
 
         if _is_strategy_dict(cooldown_until):
             cd_out = {s: _to_iso_map((cooldown_until or {}).get(s, {}) or {}) for s in STRATEGIES}
@@ -161,7 +225,7 @@ def save_state(state: dict, cooldown_until: dict, inactive_positions: dict = Non
 
         payload = {
             "state": state_out,
-            "inactive_positions": inactive_positions or {},
+            "inactive_positions": _normalize_position_map(inactive_positions or {}),
             "cooldown_until": cd_out,
             "scalp_btc": _scalp_btc_to_json(_normalize_scalp_btc_state(scalp_btc_state or {})),
             "saved_at": now_kst().isoformat(),
@@ -192,10 +256,12 @@ def load_state() -> Tuple[Dict[str, dict], Dict[str, dict], dict, dict]:
         # New schema
         if _is_strategy_dict(state_raw):
             for s in STRATEGIES:
-                strategy_state[s] = dict(state_raw.get(s, {}) or {})
+                strategy_state[s] = _normalize_position_map(state_raw.get(s, {}) or {})
         else:
             # Legacy flat schema
-            strategy_state[_legacy_target_strategy()] = dict(state_raw or {})
+            strategy_state[_legacy_target_strategy()] = _normalize_position_map(state_raw or {})
+
+        inactive_positions = _normalize_position_map(inactive_positions)
 
         if _is_strategy_dict(cd_raw):
             for s in STRATEGIES:
@@ -216,6 +282,13 @@ def load_state() -> Tuple[Dict[str, dict], Dict[str, dict], dict, dict]:
 def _repair_strategy_state_with_balance(upbit, state: dict) -> int:
     fixed = 0
     for ticker, s in list((state or {}).items()):
+        src = s if isinstance(s, dict) else {}
+        normalized = _normalize_position_state(src)
+        if (not isinstance(s, dict)) or (normalized != src):
+            state[ticker] = normalized
+            s = state[ticker]
+            fixed += 1
+
         if not s.get("holding"):
             continue
 
@@ -230,6 +303,9 @@ def _repair_strategy_state_with_balance(upbit, state: dict) -> int:
             s["initial_volume"] = 0.0
             s["realized_krw"] = 0.0
             s["realized_cost_krw"] = 0.0
+            s["entry_ts"] = 0.0
+            s["trail_armed"] = False
+            s["trail_hwm"] = 0.0
             fixed += 1
             continue
 
