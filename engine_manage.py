@@ -40,9 +40,80 @@ def log_order(side: str, ticker: str, qty: float, ok: bool, message: str):
         )
 
 
+def _normalize_csv_row(row) -> list:
+    return [str(x) for x in list(row or [])]
+
+
+def _read_last_csv_row(path: str):
+    if not os.path.exists(path):
+        return None
+    last = None
+    try:
+        with open(path, "r", newline="", encoding="utf-8") as f:
+            for row in csv.reader(f):
+                if row:
+                    last = [str(x) for x in row]
+    except Exception:
+        return None
+    return last
+
+
+def _acquire_lockfile(lock_path: str, wait_sec: float = 1.0, stale_sec: float = 30.0):
+    wait_deadline = time.time() + max(0.0, float(wait_sec))
+    while True:
+        try:
+            fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            try:
+                stamp = f"{os.getpid()} {time.time():.6f}\n"
+                os.write(fd, stamp.encode("ascii", "ignore"))
+            except Exception:
+                pass
+            return fd
+        except FileExistsError:
+            try:
+                age = time.time() - float(os.path.getmtime(lock_path))
+                if age > float(stale_sec):
+                    os.remove(lock_path)
+                    continue
+            except FileNotFoundError:
+                continue
+            except Exception:
+                pass
+            if time.time() >= wait_deadline:
+                return None
+            time.sleep(0.01)
+        except Exception:
+            return None
+
+
+def _release_lockfile(fd, lock_path: str):
+    if fd is None:
+        return
+    try:
+        os.close(fd)
+    except Exception:
+        pass
+    try:
+        os.remove(lock_path)
+    except FileNotFoundError:
+        pass
+    except Exception:
+        pass
+
+
 def append_trade_log(path: str, row):
-    with open(path, "a", newline="", encoding="utf-8") as f:
-        csv.writer(f).writerow(row)
+    row_norm = _normalize_csv_row(row)
+    lock_path = f"{path}.lock"
+    lock_fd = _acquire_lockfile(lock_path, wait_sec=1.0, stale_sec=30.0)
+    try:
+        last_row = _read_last_csv_row(path)
+        if last_row == row_norm:
+            return False
+        with open(path, "a", newline="", encoding="utf-8") as f:
+            csv.writer(f).writerow(row_norm)
+        return True
+    finally:
+        _release_lockfile(lock_fd, lock_path)
 
 
 def _sell_with_retry(

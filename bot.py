@@ -5,6 +5,7 @@ import calendar
 import csv
 import datetime as dt
 import os
+import atexit
 import sys
 import time
 import traceback
@@ -43,11 +44,78 @@ BASE_STOP_LOSS_PCT = float(getattr(config, "STOP_LOSS_PCT", 0.01))
 _TG_LAST_ERR_AT = 0.0
 _TG_LAST_ERR_KEY = ""
 _TG_LAST_RISKCUT_AT = 0.0
+_INSTANCE_LOCK_FH = None
 KST = ZoneInfo("Asia/Seoul")
 
 
 def now_kst():
     return dt.datetime.now(KST)
+
+
+def _release_instance_lock():
+    global _INSTANCE_LOCK_FH
+    fh = _INSTANCE_LOCK_FH
+    _INSTANCE_LOCK_FH = None
+    if fh is None:
+        return
+    try:
+        if os.name == "posix":
+            import fcntl
+
+            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+        elif os.name == "nt":
+            import msvcrt
+
+            fh.seek(0)
+            msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+    except Exception:
+        pass
+    try:
+        fh.close()
+    except Exception:
+        pass
+
+
+def _acquire_instance_lock() -> bool:
+    global _INSTANCE_LOCK_FH
+    if _INSTANCE_LOCK_FH is not None:
+        return True
+
+    lock_path = str(getattr(config, "INSTANCE_LOCK_PATH", ".upbit_bot.instance.lock") or ".upbit_bot.instance.lock")
+    try:
+        fh = open(lock_path, "a+", encoding="utf-8")
+    except Exception as e:
+        print(f"[LOCK] unable to open instance lock file: {e}")
+        return True
+
+    try:
+        if os.name == "posix":
+            import fcntl
+
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        elif os.name == "nt":
+            import msvcrt
+
+            fh.seek(0)
+            msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+    except Exception:
+        try:
+            fh.close()
+        except Exception:
+            pass
+        print("[LOCK] another bot instance is already running. exit this process.")
+        return False
+
+    try:
+        fh.seek(0)
+        fh.truncate(0)
+        fh.write(f"pid={os.getpid()} started={now_kst().isoformat()}\n")
+        fh.flush()
+    except Exception:
+        pass
+
+    _INSTANCE_LOCK_FH = fh
+    return True
 
 
 def _warn_missing_requests_dependency():
@@ -1212,6 +1280,9 @@ def _try_scalp_btc_entry(
 def run():
     bot_mode = _resolve_mode()
     enable_main, enable_scalp_legacy, enable_scalp_btc, force_mock_order = _mode_to_strategy_flags(bot_mode)
+    if not _acquire_instance_lock():
+        return
+    atexit.register(_release_instance_lock)
     _warn_missing_requests_dependency()
 
     if force_mock_order and bool(getattr(config, "REAL_ORDER", False)):
