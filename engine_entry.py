@@ -226,6 +226,7 @@ def try_main_entries(
                 float(initial_vol),
                 float(per_trade_amt),
                 regime,
+                strategy_tag="MAIN",
                 entry_ts=float(now.timestamp()),
             )
             state[ticker]["entry_bucket"] = "CORE"
@@ -320,6 +321,7 @@ def try_scalp_entries(
             f"[SCALP ENTRY] BUY {ticker} | Regime={regime} | KRW={buy_krw:,.0f} "
             f"| cons={'Y' if conservative else 'N'}"
         )
+        strategy_tag = "SCALP_BTC" if str(ticker).upper() == "KRW-BTC" else "SCALP"
         try:
             if _is_blocked_ticker(ticker, inactive_tickers, inactive_positions):
                 print(f"[BLOCK] inactive ticker buy blocked(SCALP): {ticker}")
@@ -336,7 +338,7 @@ def try_scalp_entries(
             print(f"[WARN] ORDER failed: BUY {ticker}")
             notify_order(
                 event_type="ORDER_BUY_FAILED",
-                strategy_tag="SCALP",
+                strategy_tag=strategy_tag,
                 ticker=ticker,
                 price=float(cur),
                 qty=0.0,
@@ -349,13 +351,14 @@ def try_scalp_entries(
             float(initial_vol),
             float(buy_krw),
             regime,
+            strategy_tag=strategy_tag,
             entry_ts=float(now.timestamp()),
         )
         state[ticker]["entry_bucket"] = "SURGE"
         save_state_fn()
         notify_order(
             event_type="ORDER_BUY_FILLED",
-            strategy_tag="SCALP",
+            strategy_tag=strategy_tag,
             ticker=ticker,
             price=float(entry_price),
             qty=float(initial_vol),

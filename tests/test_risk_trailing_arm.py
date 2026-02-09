@@ -67,6 +67,10 @@ class RiskTrailingArmTests(unittest.TestCase):
             "add_count": 1,
             "realized_krw": 0.0,
             "realized_cost_krw": 0.0,
+            "total_buy_krw": 100.0,
+            "total_sell_krw": 0.0,
+            "last_exit_reason": "",
+            "strategy_tag": "MAIN",
         }
 
     def test_no_trailing_close_before_arm_window(self):
@@ -106,6 +110,34 @@ class RiskTrailingArmTests(unittest.TestCase):
         self.assertTrue(result.get("closed", False))
         self.assertEqual(result.get("reason"), "stoploss")
         self.assertNotEqual(result.get("reason"), "trailing")
+
+    def test_partial_take_profit_updates_total_sell_only(self):
+        self._set(
+            "TP_TABLE",
+            {
+                "LOW": {"TP1_PCT": 0.01, "TP2_PCT": 0.0, "TRAIL_BACK_PCT": 0.006},
+                "MID": {"TP1_PCT": 0.01, "TP2_PCT": 0.0, "TRAIL_BACK_PCT": 0.006},
+                "FULL": {"TP1_PCT": 0.01, "TP2_PCT": 0.0, "TRAIL_BACK_PCT": 0.006},
+                "HALT": {"TP1_PCT": 0.0, "TP2_PCT": 0.0, "TRAIL_BACK_PCT": 0.0},
+            },
+        )
+        state = self._base_state(entry_ts=1_000.0)
+
+        result = apply_risk_rules(None, "KRW-TEST", state, 101.0, self._mock_sell, now=1_130.0)
+
+        self.assertFalse(result.get("closed", False))
+        self.assertTrue(state.get("tp1", False))
+        self.assertEqual(state.get("last_exit_reason", ""), "")
+        self.assertAlmostEqual(float(state.get("total_sell_krw", 0.0)), 50.5, places=8)
+
+    def test_full_close_sets_last_exit_reason_and_total_sell(self):
+        state = self._base_state(entry_ts=1_000.0)
+
+        result = apply_risk_rules(None, "KRW-TEST", state, 98.9, self._mock_sell, now=1_060.0)
+
+        self.assertTrue(result.get("closed", False))
+        self.assertEqual(state.get("last_exit_reason"), "STOPLOSS")
+        self.assertAlmostEqual(float(state.get("total_sell_krw", 0.0)), 98.9, places=8)
 
 
 if __name__ == "__main__":

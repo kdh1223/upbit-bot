@@ -27,6 +27,10 @@ def _default_scalp_btc_state():
         "loss_streak": 0,
         "paused_until": None,
         "switch_fail_count": 0,
+        "total_buy_krw": 0.0,
+        "total_sell_krw": 0.0,
+        "last_exit_reason": "",
+        "strategy_tag": "SCALP_BTC",
     }
 
 
@@ -148,6 +152,46 @@ def _normalize_position_state(raw: dict):
         trail_hwm = 0.0
     s["trail_hwm"] = float(trail_hwm)
 
+    try:
+        s["initial_volume"] = max(0.0, float(s.get("initial_volume", 0.0)))
+    except Exception:
+        s["initial_volume"] = 0.0
+    try:
+        s["invested_krw"] = max(0.0, float(s.get("invested_krw", 0.0)))
+    except Exception:
+        s["invested_krw"] = 0.0
+    try:
+        s["target_krw"] = max(0.0, float(s.get("target_krw", 0.0)))
+    except Exception:
+        s["target_krw"] = 0.0
+    try:
+        s["add_count"] = max(0, int(s.get("add_count", 0)))
+    except Exception:
+        s["add_count"] = 0
+
+    try:
+        s["realized_krw"] = float(s.get("realized_krw", 0.0))
+    except Exception:
+        s["realized_krw"] = 0.0
+    try:
+        s["realized_cost_krw"] = float(s.get("realized_cost_krw", 0.0))
+    except Exception:
+        s["realized_cost_krw"] = 0.0
+
+    try:
+        buy_krw = float(s.get("total_buy_krw", s.get("invested_krw", 0.0)))
+    except Exception:
+        buy_krw = 0.0
+    try:
+        sell_krw = float(s.get("total_sell_krw", 0.0))
+    except Exception:
+        sell_krw = 0.0
+    s["total_buy_krw"] = max(0.0, float(buy_krw))
+    s["total_sell_krw"] = max(0.0, float(sell_krw))
+    s["last_exit_reason"] = str(s.get("last_exit_reason") or "")
+    tag = str(s.get("strategy_tag") or "MAIN").upper().strip()
+    s["strategy_tag"] = tag or "MAIN"
+
     return s
 
 
@@ -189,6 +233,17 @@ def _normalize_scalp_btc_state(raw: dict):
         state["switch_fail_count"] = int(state.get("switch_fail_count", 0))
     except Exception:
         state["switch_fail_count"] = 0
+    try:
+        state["total_buy_krw"] = max(0.0, float(state.get("total_buy_krw", 0.0)))
+    except Exception:
+        state["total_buy_krw"] = 0.0
+    try:
+        state["total_sell_krw"] = max(0.0, float(state.get("total_sell_krw", 0.0)))
+    except Exception:
+        state["total_sell_krw"] = 0.0
+    state["last_exit_reason"] = str(state.get("last_exit_reason") or "")
+    tag = str(state.get("strategy_tag") or "SCALP_BTC").upper().strip()
+    state["strategy_tag"] = tag or "SCALP_BTC"
 
     for key in SCALP_BTC_DT_FIELDS:
         state[key] = _parse_dt(state.get(key))
@@ -341,7 +396,7 @@ def load_state() -> Tuple[Dict[str, dict], Dict[str, dict], dict, dict, dict]:
         return _empty_strategy_payload(), _empty_strategy_payload(), {}, _default_scalp_btc_state(), _default_risk_state()
 
 
-def _repair_strategy_state_with_balance(upbit, state: dict) -> int:
+def _repair_strategy_state_with_balance(upbit, state: dict, strategy_tag: str = "MAIN") -> int:
     fixed = 0
     for ticker, s in list((state or {}).items()):
         src = s if isinstance(s, dict) else {}
@@ -365,6 +420,9 @@ def _repair_strategy_state_with_balance(upbit, state: dict) -> int:
             s["initial_volume"] = 0.0
             s["realized_krw"] = 0.0
             s["realized_cost_krw"] = 0.0
+            s["total_buy_krw"] = 0.0
+            s["total_sell_krw"] = 0.0
+            s["last_exit_reason"] = ""
             s["entry_ts"] = 0.0
             s["trail_armed"] = False
             s["trail_hwm"] = 0.0
@@ -382,6 +440,18 @@ def _repair_strategy_state_with_balance(upbit, state: dict) -> int:
         if "realized_cost_krw" not in s:
             s["realized_cost_krw"] = 0.0
             fixed += 1
+        if "total_buy_krw" not in s:
+            s["total_buy_krw"] = float(s.get("invested_krw", 0.0))
+            fixed += 1
+        if "total_sell_krw" not in s:
+            s["total_sell_krw"] = 0.0
+            fixed += 1
+        if "last_exit_reason" not in s:
+            s["last_exit_reason"] = ""
+            fixed += 1
+        if "strategy_tag" not in s:
+            s["strategy_tag"] = str(strategy_tag or "MAIN").upper().strip() or "MAIN"
+            fixed += 1
 
     return fixed
 
@@ -394,11 +464,15 @@ def verify_state_with_balance(upbit, state):
     if _is_strategy_dict(state):
         fixed_total = 0
         for s in STRATEGIES:
-            fixed_total += _repair_strategy_state_with_balance(upbit, state.get(s, {}) or {})
+            fixed_total += _repair_strategy_state_with_balance(
+                upbit,
+                state.get(s, {}) or {},
+                strategy_tag=s,
+            )
         if fixed_total:
             print(f"[STATE] repaired fields: {fixed_total}")
         return
 
-    fixed = _repair_strategy_state_with_balance(upbit, state or {})
+    fixed = _repair_strategy_state_with_balance(upbit, state or {}, strategy_tag=_legacy_target_strategy())
     if fixed:
         print(f"[STATE] repaired fields: {fixed}")

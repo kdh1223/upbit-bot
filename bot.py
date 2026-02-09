@@ -281,33 +281,88 @@ def _calc_monthly_stats(now: dt.datetime, trade_log_path: str):
 
 
 def _normalize_order_reason(raw_reason: str) -> str:
-    s = str(raw_reason or "").lower()
+    s_raw = str(raw_reason or "").strip()
+    s = s_raw.lower()
+    s_up = s_raw.upper()
+    if s_up in {"ENTRY", "TP1", "TP2", "TRAILING", "SL", "FORCE_CLOSE"}:
+        return s_up
     if "tp1" in s:
         return "TP1"
     if "tp2" in s or "take_profit" in s:
         return "TP2"
     if "trail" in s:
         return "TRAILING"
-    if "stop" in s:
+    if "stop" in s or "sl" in s:
         return "SL"
-    if "switch" in s or "timeout" in s or "force" in s:
-        return "FORCE"
+    if "switch" in s or "timeout" in s or "force" in s or "dust" in s:
+        return "FORCE_CLOSE"
     return "ENTRY"
 
 
-def _close_event_type(raw_reason: str) -> str:
-    s = str(raw_reason or "").lower()
-    if "tp1" in s:
-        return "TP1_HIT"
+def _normalize_exit_reason(raw_reason: str) -> str:
+    s_raw = str(raw_reason or "").strip()
+    s = s_raw.lower()
+    s_up = s_raw.upper()
+    if s_up in {"TP2", "TRAILING", "STOPLOSS", "FORCE_CLOSE"}:
+        return s_up
     if "tp2" in s or "take_profit" in s:
-        return "TP2_HIT"
+        return "TP2"
     if "trail" in s:
+        return "TRAILING"
+    if "stop" in s or "sl" in s:
+        return "STOPLOSS"
+    if "switch" in s or "timeout" in s or "force" in s or "dust" in s:
+        return "FORCE_CLOSE"
+    return "FORCE_CLOSE"
+
+
+def _close_event_type(raw_reason: str) -> str:
+    exit_reason = _normalize_exit_reason(raw_reason)
+    if exit_reason == "TP2":
+        return "TP2_HIT"
+    if exit_reason == "TRAILING":
         return "TRAILING_EXIT"
-    if "stop" in s:
+    if exit_reason == "STOPLOSS":
         return "STOPLOSS_HIT"
-    if "switch" in s or "timeout" in s or "force" in s:
+    if exit_reason == "FORCE_CLOSE":
         return "FORCE_CLOSE"
     return ""
+
+
+def _fmt_krw(value: float) -> str:
+    try:
+        return f"{float(value):,.0f}"
+    except Exception:
+        return "0"
+
+
+def _notify_close_settlement(
+    strategy_tag: str,
+    ticker: str,
+    total_buy_krw: float,
+    total_sell_krw: float,
+    last_exit_reason: str,
+):
+    buy_krw = max(0.0, _safe_float(total_buy_krw, 0.0))
+    sell_krw = max(0.0, _safe_float(total_sell_krw, 0.0))
+    realized_krw = float(sell_krw) - float(buy_krw)
+    realized_pct = (float(realized_krw) / float(buy_krw) * 100.0) if buy_krw > 0 else 0.0
+    pnl_label = "\uC218\uC775\uAE08" if realized_krw >= 0 else "\uC190\uC2E4\uAE08"
+    event_type = _close_event_type(last_exit_reason)
+
+    notify_event(
+        event_type=event_type,
+        lines=[
+            f"\uC804\uB7B5: {str(strategy_tag or 'MAIN').upper().strip() or 'MAIN'}",
+            f"\uC885\uBAA9: {ticker}",
+            f"\uCD1D\uB9E4\uC218: {_fmt_krw(buy_krw)} KRW",
+            f"\uCD1D\uB9E4\uB3C4: {_fmt_krw(sell_krw)} KRW",
+            f"{pnl_label}: {_fmt_krw(abs(realized_krw))} KRW",
+            f"\uC218\uC775\uB960: {realized_pct:+.2f}%",
+            f"\uCD5C\uC885 \uC0AC\uC720: {_normalize_exit_reason(last_exit_reason)}",
+        ],
+    )
+    return float(realized_krw), float(realized_pct)
 
 
 def _notify_trade_result(ticker: str, qty: float, entry_price: float, exit_price: float, pnl_pct: float):
@@ -343,16 +398,21 @@ def _notify_closed_trade_events(events):
         qty = _safe_float(e.get("qty", 0.0), 0.0)
         entry_price = _safe_float(e.get("entry_price", 0.0), 0.0)
         exit_price = _safe_float(e.get("exit_price", 0.0), 0.0)
-        pnl_pct = _safe_float(e.get("pnl_pct", 0.0), 0.0)
-        strategy_tag = str(e.get("strategy", "MAIN") or "MAIN").upper().strip()
-        raw_reason = str(e.get("reason", "") or "")
+        strategy_tag = str(e.get("strategy_tag", e.get("strategy", "MAIN")) or "MAIN").upper().strip()
+        raw_reason = str(e.get("last_exit_reason", e.get("reason", "")) or "")
         reason_code = _normalize_order_reason(raw_reason)
-        event_type = _close_event_type(raw_reason)
+        exit_reason = _normalize_exit_reason(raw_reason)
+        total_buy_krw = max(0.0, _safe_float(e.get("total_buy_krw", 0.0), 0.0))
+        total_sell_krw = max(0.0, _safe_float(e.get("total_sell_krw", 0.0), 0.0))
+        if total_buy_krw <= 0 and entry_price > 0 and qty > 0:
+            total_buy_krw = float(entry_price) * float(qty)
+        if total_sell_krw <= 0 and exit_price > 0 and qty > 0:
+            total_sell_krw = float(exit_price) * float(qty)
         close_time = e.get("time")
         if not isinstance(close_time, dt.datetime):
             close_time = now_kst()
 
-        if not raw_reason.startswith("dust"):
+        if "dust" not in str(e.get("reason", "") or "").lower():
             notify_order(
                 event_type="ORDER_SELL_FILLED",
                 strategy_tag=strategy_tag,
@@ -361,17 +421,13 @@ def _notify_closed_trade_events(events):
                 qty=float(qty),
                 reason=reason_code,
             )
-        if event_type:
-            notify_event(
-                event_type=event_type,
-                lines=[
-                    f"\uC804\uB7B5: {strategy_tag}",
-                    f"\uC885\uBAA9: {ticker}",
-                    f"\uAC00\uACA9: {float(exit_price):,.0f}",
-                    f"\uC218\uB7C9: {_fmt_qty(float(qty))}",
-                    f"\uC0AC\uC720: {reason_code}",
-                ],
-            )
+        _, pnl_pct = _notify_close_settlement(
+            strategy_tag=strategy_tag,
+            ticker=ticker,
+            total_buy_krw=float(total_buy_krw),
+            total_sell_krw=float(total_sell_krw),
+            last_exit_reason=exit_reason,
+        )
 
         _notify_trade_result(
             ticker=ticker,
@@ -813,6 +869,10 @@ def _scalp_btc_reset_position(state: dict):
     state["qty"] = 0.0
     state["entry_time"] = None
     state["peak_price"] = 0.0
+    state["total_buy_krw"] = 0.0
+    state["total_sell_krw"] = 0.0
+    state["last_exit_reason"] = ""
+    state["strategy_tag"] = "SCALP_BTC"
 
 
 def _scalp_btc_close_position(
@@ -837,6 +897,11 @@ def _scalp_btc_close_position(
         return False, "price_unavailable"
     cur = float(cur)
 
+    strategy_tag = str(state.get("strategy_tag") or "SCALP_BTC").upper().strip() or "SCALP_BTC"
+    state["strategy_tag"] = strategy_tag
+    exit_reason = _normalize_exit_reason(reason)
+    order_reason = _normalize_order_reason(exit_reason)
+
     entry = float(state.get("entry_price", 0.0))
     qty = float(state.get("qty", 0.0))
     if bool(getattr(config, "REAL_ORDER", False)):
@@ -847,9 +912,46 @@ def _scalp_btc_close_position(
         persist_state_fn()
         return True, None
 
+    total_buy_krw = max(0.0, _safe_float(state.get("total_buy_krw", 0.0), 0.0))
+    if total_buy_krw <= 0 and entry > 0 and qty > 0:
+        total_buy_krw = float(entry) * float(qty)
+    state["total_buy_krw"] = float(total_buy_krw)
+
     order_value = qty * cur
     if order_value < float(getattr(config, "MIN_ORDER_KRW", 5_000)):
         if bool(getattr(config, "DUST_CLOSE_AS_CLOSED", True)):
+            state["last_exit_reason"] = exit_reason
+            total_sell_krw = max(0.0, _safe_float(state.get("total_sell_krw", 0.0), 0.0))
+            realized_krw = float(total_sell_krw) - float(total_buy_krw)
+            realized_pct = (realized_krw / float(total_buy_krw) * 100.0) if total_buy_krw > 0 else 0.0
+            append_trade_log(
+                config.TRADE_LOG_PATH,
+                [
+                    now.strftime("%Y-%m-%d %H:%M:%S"),
+                    ticker,
+                    f"{entry:.6f}",
+                    f"{cur:.6f}",
+                    f"{realized_pct:.2f}",
+                    exit_reason,
+                    "SCALP_BTC",
+                    "SCALP_BTC",
+                ],
+            )
+            _, notify_pct = _notify_close_settlement(
+                strategy_tag=strategy_tag,
+                ticker=ticker,
+                total_buy_krw=float(total_buy_krw),
+                total_sell_krw=float(total_sell_krw),
+                last_exit_reason=exit_reason,
+            )
+            _notify_trade_result(
+                ticker=ticker,
+                qty=float(qty),
+                entry_price=float(entry),
+                exit_price=float(cur),
+                pnl_pct=float(notify_pct),
+            )
+            _notify_monthly_stats(now)
             _scalp_btc_reset_position(state)
             persist_state_fn()
             return True, None
@@ -878,21 +980,26 @@ def _scalp_btc_close_position(
         print(f"[WARN] ORDER failed: SELL {ticker}")
         notify_order(
             event_type="ORDER_SELL_FAILED",
-            strategy_tag="SCALP_BTC",
+            strategy_tag=strategy_tag,
             ticker=ticker,
             price=float(cur),
             qty=float(qty),
-            reason=_normalize_order_reason(reason),
+            reason=order_reason,
         )
         return False, f"sell_failed:{err_msg}"
 
-    pnl = (cur / entry - 1.0) if entry > 0 else 0.0
+    state["total_sell_krw"] = max(0.0, _safe_float(state.get("total_sell_krw", 0.0), 0.0)) + (float(qty) * float(cur))
+    state["last_exit_reason"] = exit_reason
+    total_sell_krw = float(state.get("total_sell_krw", 0.0))
+    realized_krw = float(total_sell_krw) - float(total_buy_krw)
+    realized_pct = (realized_krw / float(total_buy_krw) * 100.0) if total_buy_krw > 0 else 0.0
+
     cd_min = int(getattr(config, "SCALP_BTC_COOLDOWN_PROFIT_MIN", 10))
-    if pnl < 0:
+    if realized_krw < 0:
         cd_min = int(getattr(config, "SCALP_BTC_COOLDOWN_LOSS_MIN", 30))
     state["cooldown_until"] = now + dt.timedelta(minutes=max(1, cd_min))
 
-    if pnl < 0:
+    if realized_krw < 0:
         state["loss_streak"] = int(state.get("loss_streak", 0)) + 1
         print(f"[LOSS_STREAK][SCALP_BTC] {state['loss_streak']}")
         max_streak = int(getattr(config, "SCALP_BTC_MAX_LOSS_STREAK", 2))
@@ -911,36 +1018,36 @@ def _scalp_btc_close_position(
             ticker,
             f"{entry:.6f}",
             f"{cur:.6f}",
-            f"{(pnl * 100.0):.2f}",
-            reason,
+            f"{realized_pct:.2f}",
+            exit_reason,
             "SCALP_BTC",
             "SCALP_BTC",
         ],
     )
-    reason_code = _normalize_order_reason(reason)
     notify_order(
         event_type="ORDER_SELL_FILLED",
-        strategy_tag="SCALP_BTC",
+        strategy_tag=strategy_tag,
         ticker=ticker,
         price=float(cur),
         qty=float(qty),
-        reason=reason_code,
+        reason=order_reason,
     )
-    event_type = _close_event_type(reason)
-    if event_type:
-        notify_event(
-            event_type=event_type,
-            lines=[
-                "\uC804\uB7B5: SCALP_BTC",
-                f"\uC885\uBAA9: {ticker}",
-                f"\uAC00\uACA9: {float(cur):,.0f}",
-                f"\uC218\uB7C9: {_fmt_qty(float(qty))}",
-                f"\uC0AC\uC720: {reason_code}",
-            ],
-        )
-    _notify_trade_result(ticker=ticker, qty=float(qty), entry_price=float(entry), exit_price=float(cur), pnl_pct=float(pnl * 100.0))
+    _, notify_pct = _notify_close_settlement(
+        strategy_tag=strategy_tag,
+        ticker=ticker,
+        total_buy_krw=float(total_buy_krw),
+        total_sell_krw=float(total_sell_krw),
+        last_exit_reason=exit_reason,
+    )
+    _notify_trade_result(
+        ticker=ticker,
+        qty=float(qty),
+        entry_price=float(entry),
+        exit_price=float(cur),
+        pnl_pct=float(notify_pct),
+    )
     _notify_monthly_stats(now)
-    print(f"[CLOSE][SCALP_BTC] {ticker} pnl={(pnl * 100.0):+.2f}% reason={reason}")
+    print(f"[CLOSE][SCALP_BTC] {ticker} pnl={realized_pct:+.2f}% reason={exit_reason}")
     _scalp_btc_reset_position(state)
     persist_state_fn()
     return True, None
@@ -1067,6 +1174,13 @@ def _try_scalp_btc_entry(
         state["qty"] = float(qty)
         state["entry_time"] = now
         state["peak_price"] = float(entry)
+        filled_buy_krw = float(entry) * float(qty)
+        if filled_buy_krw <= 0:
+            filled_buy_krw = float(buy_krw)
+        state["total_buy_krw"] = float(filled_buy_krw)
+        state["total_sell_krw"] = 0.0
+        state["last_exit_reason"] = ""
+        state["strategy_tag"] = "SCALP_BTC"
         print(f"[SCALP_BTC ENTRY] BUY {ticker} | KRW={buy_krw:,.0f}")
         notify_order(
             event_type="ORDER_BUY_FILLED",

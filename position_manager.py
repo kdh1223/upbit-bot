@@ -64,9 +64,12 @@ def init_position_state(
     initial_vol: float,
     per_trade_amt: float,
     regime: str,
+    strategy_tag: str = "MAIN",
     entry_ts: float = None,
 ):
     ts = _safe_entry_ts(entry_ts)
+    tag = str(strategy_tag or "MAIN").upper().strip() or "MAIN"
+    buy_krw = max(0.0, float(per_trade_amt))
     return {
         "holding": True,
         "entry": float(entry_price),
@@ -83,6 +86,10 @@ def init_position_state(
         "add_count": 1,
         "realized_krw": 0.0,
         "realized_cost_krw": 0.0,
+        "total_buy_krw": float(buy_krw),
+        "total_sell_krw": 0.0,
+        "last_exit_reason": "",
+        "strategy_tag": tag,
     }
 
 
@@ -98,6 +105,7 @@ def apply_add_snapshot(state: dict, ticker: str, total_vol: float, avg_buy: floa
 
     s["invested_krw"] = float(s.get("invested_krw", 0.0)) + float(add_krw)
     s["add_count"] = int(s.get("add_count", 0)) + 1
+    s["total_buy_krw"] = float(s.get("total_buy_krw", s.get("invested_krw", 0.0))) + float(add_krw)
 
 
 def apply_add_mock(state: dict, ticker: str, add_price: float, add_vol: float, add_krw: float):
@@ -116,3 +124,4 @@ def apply_add_mock(state: dict, ticker: str, add_price: float, add_vol: float, a
 
     s["invested_krw"] = float(s.get("invested_krw", 0.0)) + float(add_krw)
     s["add_count"] = int(s.get("add_count", 0)) + 1
+    s["total_buy_krw"] = float(s.get("total_buy_krw", s.get("invested_krw", 0.0))) + float(add_krw)

@@ -8,7 +8,7 @@ import config
 import pyupbit
 from indicators import get_atr
 from market import get_balance
-from utils.telegram_notify import notify_event, notify_order
+from utils.telegram_notify import notify_order
 
 
 def _get_params_by_regime(regime: str):
@@ -46,6 +46,29 @@ def _record_realized(state: dict, qty: float, price: float):
     entry = float(state.get("entry", 0.0))
     state["realized_krw"] = float(state.get("realized_krw", 0.0)) + (q * p)
     state["realized_cost_krw"] = float(state.get("realized_cost_krw", 0.0)) + (q * entry)
+
+
+def _as_nonneg_float(value, default: float = 0.0) -> float:
+    try:
+        return max(0.0, float(value))
+    except Exception:
+        return max(0.0, float(default))
+
+
+def _ensure_position_accounting(state: dict, strategy_tag: str):
+    state["total_buy_krw"] = _as_nonneg_float(state.get("total_buy_krw", state.get("invested_krw", 0.0)), 0.0)
+    state["total_sell_krw"] = _as_nonneg_float(state.get("total_sell_krw", 0.0), 0.0)
+    state["last_exit_reason"] = str(state.get("last_exit_reason") or "")
+    tag = str(state.get("strategy_tag") or strategy_tag or "MAIN").upper().strip()
+    state["strategy_tag"] = tag or "MAIN"
+
+
+def _record_sell_krw(state: dict, qty: float, price: float):
+    q = _as_nonneg_float(qty, 0.0)
+    p = _as_nonneg_float(price, 0.0)
+    if q <= 0 or p <= 0:
+        return
+    state["total_sell_krw"] = _as_nonneg_float(state.get("total_sell_krw", 0.0), 0.0) + (q * p)
 
 
 def _reason_code_from_fail_reason(fail_reason: str) -> str:
@@ -203,6 +226,7 @@ def apply_risk_rules(upbit, ticker: str, state: dict, cur: float, market_sell, n
     entry = float(state.get("entry", 0.0))
     if entry <= 0:
         return {"closed": False}
+    _ensure_position_accounting(state, strategy_tag=strategy_tag)
 
     _ensure_trail_state(state, now_ts)
     state["peak"] = max(float(state.get("peak", entry)), float(cur))
@@ -221,7 +245,13 @@ def apply_risk_rules(upbit, ticker: str, state: dict, cur: float, market_sell, n
     if vol > 0 and not _can_order(float(cur), vol):
         if bool(getattr(config, "DUST_CLOSE_AS_CLOSED", True)):
             state["holding"] = False
-            return {"closed": True, "reason": "dust(<min_order)", "exit_price": float(cur)}
+            state["last_exit_reason"] = "FORCE_CLOSE"
+            return {
+                "closed": True,
+                "reason": "dust(<min_order)",
+                "exit_price": float(cur),
+                "close_qty": float(vol),
+            }
         return {"closed": False}
 
     # 1) stop loss full close
@@ -246,11 +276,18 @@ def apply_risk_rules(upbit, ticker: str, state: dict, cur: float, market_sell, n
             if not ok:
                 return {"closed": False, "reason": err}
             _record_realized(state, vol, float(cur))
+            _record_sell_krw(state, vol, float(cur))
             if not _is_real_order():
                 _mock_reduce_volume(state, vol)
 
         state["holding"] = False
-        return {"closed": True, "reason": "stoploss", "exit_price": float(cur)}
+        state["last_exit_reason"] = "STOPLOSS"
+        return {
+            "closed": True,
+            "reason": "stoploss",
+            "exit_price": float(cur),
+            "close_qty": float(max(0.0, vol)),
+        }
 
     # 2) TP1 partial
     if (not bool(state.get("tp1", False))) and tp1 > 0 and pnl >= tp1:
@@ -272,26 +309,17 @@ def apply_risk_rules(upbit, ticker: str, state: dict, cur: float, market_sell, n
                 if not ok:
                     return {"closed": False, "reason": err}
                 _record_realized(state, sell_qty, float(cur))
+                _record_sell_krw(state, sell_qty, float(cur))
                 if not _is_real_order():
                     _mock_reduce_volume(state, sell_qty)
                 state["tp1"] = True
                 notify_order(
-                    event_type="ORDER_SELL_FILLED",
+                    event_type="ORDER_PARTIAL_FILL",
                     strategy_tag=strategy_tag,
                     ticker=ticker,
                     price=float(cur),
                     qty=float(sell_qty),
                     reason="TP1",
-                )
-                notify_event(
-                    event_type="TP1_HIT",
-                    lines=[
-                        f"전략: {strategy_tag}",
-                        f"종목: {ticker}",
-                        f"가격: {float(cur):,.0f}",
-                        f"수량: {float(sell_qty):.8f}".rstrip("0").rstrip("."),
-                        "사유: TP1",
-                    ],
                 )
 
     # 3) TP2 partial
@@ -314,26 +342,17 @@ def apply_risk_rules(upbit, ticker: str, state: dict, cur: float, market_sell, n
                 if not ok:
                     return {"closed": False, "reason": err}
                 _record_realized(state, sell_qty, float(cur))
+                _record_sell_krw(state, sell_qty, float(cur))
                 if not _is_real_order():
                     _mock_reduce_volume(state, sell_qty)
                 state["tp2"] = True
                 notify_order(
-                    event_type="ORDER_SELL_FILLED",
+                    event_type="ORDER_PARTIAL_FILL",
                     strategy_tag=strategy_tag,
                     ticker=ticker,
                     price=float(cur),
                     qty=float(sell_qty),
                     reason="TP2",
-                )
-                notify_event(
-                    event_type="TP2_HIT",
-                    lines=[
-                        f"전략: {strategy_tag}",
-                        f"종목: {ticker}",
-                        f"가격: {float(cur):,.0f}",
-                        f"수량: {float(sell_qty):.8f}".rstrip("0").rstrip("."),
-                        "사유: TP2",
-                    ],
                 )
 
     # 4) Trailing arm/close: arm only after elapsed time + minimum profit threshold.
@@ -368,11 +387,18 @@ def apply_risk_rules(upbit, ticker: str, state: dict, cur: float, market_sell, n
                     if not ok:
                         return {"closed": False, "reason": err}
                     _record_realized(state, vol, float(cur))
+                    _record_sell_krw(state, vol, float(cur))
                     if not _is_real_order():
                         _mock_reduce_volume(state, vol)
 
                 state["holding"] = False
-                return {"closed": True, "reason": "trailing", "exit_price": float(cur)}
+                state["last_exit_reason"] = "TRAILING"
+                return {
+                    "closed": True,
+                    "reason": "trailing",
+                    "exit_price": float(cur),
+                    "close_qty": float(max(0.0, vol)),
+                }
 
     return {"closed": False}
 

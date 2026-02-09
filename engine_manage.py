@@ -102,6 +102,24 @@ def _calc_close_qty(state: dict, entry: float) -> float:
     return max(0.0, float(state.get("initial_volume", 0.0)))
 
 
+def _safe_nonneg_float(value, default: float = 0.0) -> float:
+    try:
+        return max(0.0, float(value))
+    except Exception:
+        return max(0.0, float(default))
+
+
+def _normalize_exit_reason(raw_reason: str) -> str:
+    s = str(raw_reason or "").lower().strip()
+    if ("stop" in s) or ("sl" in s):
+        return "STOPLOSS"
+    if "trail" in s:
+        return "TRAILING"
+    if ("tp2" in s) or ("take_profit" in s):
+        return "TP2"
+    return "FORCE_CLOSE"
+
+
 def manage_positions(
     upbit,
     now,
@@ -173,8 +191,25 @@ def manage_positions(
 
             entry = float(s.get("entry", 0.0))
             exit_price = float(result.get("exit_price", float(cur)))
-            pnl_pct = _calc_close_pnl_pct(s, float(cur))
-            close_qty = _calc_close_qty(s, entry)
+            total_buy_krw = _safe_nonneg_float(s.get("total_buy_krw", s.get("invested_krw", 0.0)), 0.0)
+            total_sell_krw = _safe_nonneg_float(s.get("total_sell_krw", s.get("realized_krw", 0.0)), 0.0)
+            if total_buy_krw <= 0:
+                total_buy_krw = _safe_nonneg_float(s.get("realized_cost_krw", 0.0), 0.0)
+            if total_sell_krw <= 0:
+                total_sell_krw = _safe_nonneg_float(s.get("realized_krw", 0.0), 0.0)
+            realized_krw = float(total_sell_krw) - float(total_buy_krw)
+            if total_buy_krw > 0:
+                pnl_pct = (float(realized_krw) / float(total_buy_krw)) * 100.0
+            else:
+                pnl_pct = _calc_close_pnl_pct(s, float(cur))
+            close_qty = _safe_nonneg_float(result.get("close_qty", 0.0), 0.0)
+            if close_qty <= 0:
+                close_qty = _calc_close_qty(s, entry)
+            last_exit_reason = str(s.get("last_exit_reason") or "")
+            if not last_exit_reason:
+                last_exit_reason = _normalize_exit_reason(result.get("reason", ""))
+            s["last_exit_reason"] = str(last_exit_reason)
+            strategy_tag = str(s.get("strategy_tag") or strategy).upper().strip() or str(strategy).upper().strip()
 
             cd_min = config.COOLDOWN_PROFIT_MIN if pnl_pct > 0 else config.COOLDOWN_LOSS_MIN
             cooldown_until[ticker] = now + dt.timedelta(minutes=cd_min)
@@ -206,6 +241,12 @@ def manage_positions(
                     "pnl_pct": float(pnl_pct),
                     "reason": str(result.get("reason", "")),
                     "strategy": strategy,
+                    "strategy_tag": strategy_tag,
+                    "total_buy_krw": float(total_buy_krw),
+                    "total_sell_krw": float(total_sell_krw),
+                    "realized_krw": float(realized_krw),
+                    "realized_pct": float(pnl_pct),
+                    "last_exit_reason": str(last_exit_reason),
                 }
             )
 
@@ -218,6 +259,10 @@ def manage_positions(
             s["tp2"] = False
             s["realized_krw"] = 0.0
             s["realized_cost_krw"] = 0.0
+            s["total_buy_krw"] = 0.0
+            s["total_sell_krw"] = 0.0
+            s["last_exit_reason"] = ""
+            s["strategy_tag"] = strategy
             s["entry_ts"] = 0.0
             s["trail_armed"] = False
             s["trail_hwm"] = 0.0
