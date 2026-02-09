@@ -1,6 +1,7 @@
 """유니버스 갱신, 진입/청산, 상태 저장을 총괄하는 봇 메인 루프."""
 
 import copy
+import calendar
 import csv
 import datetime as dt
 import os
@@ -200,6 +201,112 @@ def _notify_risk_cut_once(info: dict, equity: float):
     mdd = float(info.get("mdd_pct", 0.0))
     tg(f"🛑 RISK CUT {reason} | equity={float(equity):,.0f} daily={daily:+.2f}% mdd={mdd:+.2f}%")
     _TG_LAST_RISKCUT_AT = float(now_ts)
+
+
+def _coin_symbol(ticker: str) -> str:
+    try:
+        return str(ticker).split("-")[1].upper()
+    except Exception:
+        return ""
+
+
+def _fmt_qty(qty: float) -> str:
+    try:
+        txt = f"{float(qty):.8f}".rstrip("0").rstrip(".")
+    except Exception:
+        txt = "0"
+    return txt or "0"
+
+
+def _calc_monthly_stats(now: dt.datetime, trade_log_path: str):
+    month_prefix = now.strftime("%Y-%m")
+    total = 0
+    wins = 0
+    pnl_sum = 0.0
+
+    try:
+        with open(trade_log_path, "r", newline="", encoding="utf-8") as f:
+            for i, row in enumerate(csv.reader(f)):
+                if not row:
+                    continue
+                if i == 0 and str(row[0]).strip().lower() == "time":
+                    continue
+                if len(row) < 5:
+                    continue
+
+                ts = str(row[0]).strip()
+                if not ts.startswith(month_prefix):
+                    continue
+
+                try:
+                    pnl_pct = float(row[4])
+                except Exception:
+                    continue
+
+                total += 1
+                if pnl_pct > 0:
+                    wins += 1
+                pnl_sum += pnl_pct
+    except Exception:
+        return None
+
+    if total <= 0:
+        return None
+
+    return {
+        "total": int(total),
+        "wins": int(wins),
+        "win_rate_pct": (float(wins) / float(total)) * 100.0,
+        "avg_pnl_pct": float(pnl_sum) / float(total),
+    }
+
+
+def _notify_trade_result(ticker: str, qty: float, entry_price: float, exit_price: float, pnl_pct: float):
+    symbol = _coin_symbol(ticker)
+    qty_txt = _fmt_qty(qty)
+    icon = "🟢" if float(pnl_pct) >= 0 else "🔴"
+    msg = (
+        f"{icon} 거래 완료: {ticker} {qty_txt}{symbol}\n"
+        f"가격: {float(entry_price):,.6f} -> {float(exit_price):,.6f}\n"
+        f"💰 수익률: {float(pnl_pct):+.2f}%"
+    )
+    tg(msg)
+
+
+def _notify_monthly_stats(now: dt.datetime):
+    stats = _calc_monthly_stats(now, config.TRADE_LOG_PATH)
+    if not stats:
+        return
+
+    last_day = calendar.monthrange(int(now.year), int(now.month))[1]
+    period = f"{int(now.month)}월 1일~{int(last_day)}일"
+    tg(
+        f"📊 월간 누적 승률 ({period}): {float(stats['win_rate_pct']):.1f}%, "
+        f"💰 평균 수익률: {float(stats['avg_pnl_pct']):+.2f}% (총 {int(stats['total'])}건)"
+    )
+
+
+def _notify_closed_trade_events(events):
+    for e in events or []:
+        ticker = str(e.get("ticker", "") or "")
+        if not ticker:
+            continue
+        qty = _safe_float(e.get("qty", 0.0), 0.0)
+        entry_price = _safe_float(e.get("entry_price", 0.0), 0.0)
+        exit_price = _safe_float(e.get("exit_price", 0.0), 0.0)
+        pnl_pct = _safe_float(e.get("pnl_pct", 0.0), 0.0)
+        close_time = e.get("time")
+        if not isinstance(close_time, dt.datetime):
+            close_time = now_kst()
+
+        _notify_trade_result(
+            ticker=ticker,
+            qty=qty,
+            entry_price=entry_price,
+            exit_price=exit_price,
+            pnl_pct=pnl_pct,
+        )
+        _notify_monthly_stats(close_time)
 
 
 def ensure_trade_log_header(path: str):
@@ -720,6 +827,8 @@ def _scalp_btc_close_position(
             "SCALP_BTC",
         ],
     )
+    _notify_trade_result(ticker=ticker, qty=float(qty), entry_price=float(entry), exit_price=float(cur), pnl_pct=float(pnl * 100.0))
+    _notify_monthly_stats(now)
     print(f"[CLOSE][SCALP_BTC] {ticker} pnl={(pnl * 100.0):+.2f}% reason={reason}")
     _scalp_btc_reset_position(state)
     persist_state_fn()
@@ -1144,6 +1253,7 @@ def run():
                     strategy="MAIN",
                 )
                 if events_main:
+                    _notify_closed_trade_events(events_main)
                     loss_seq_main = update_loss_seq_from_events(events_main, loss_seq_main, "MAIN")
                     day_tp1_count_main = update_day_tp1_counter(
                         strategy_state.get("MAIN", {}),
@@ -1176,6 +1286,7 @@ def run():
                     strategy="SCALP",
                 )
                 if events_scalp:
+                    _notify_closed_trade_events(events_scalp)
                     block_min = int(getattr(config, "SURGE_STOPLOSS_REENTRY_BLOCK_MIN", 30))
                     for e in events_scalp:
                         pnl = float(e.get("pnl_pct", 0.0))

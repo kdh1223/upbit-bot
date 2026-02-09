@@ -95,6 +95,13 @@ def _is_dust_value(krw_value: float) -> bool:
     return float(krw_value) < float(getattr(config, "MIN_ORDER_KRW", 5_000))
 
 
+def _calc_close_qty(state: dict, entry: float) -> float:
+    realized_cost_krw = float(state.get("realized_cost_krw", 0.0))
+    if realized_cost_krw > 0 and entry > 0:
+        return max(0.0, realized_cost_krw / entry)
+    return max(0.0, float(state.get("initial_volume", 0.0)))
+
+
 def manage_positions(
     upbit,
     now,
@@ -159,6 +166,7 @@ def manage_positions(
             entry = float(s.get("entry", 0.0))
             exit_price = float(result.get("exit_price", float(cur)))
             pnl_pct = _calc_close_pnl_pct(s, float(cur))
+            close_qty = _calc_close_qty(s, entry)
 
             cd_min = config.COOLDOWN_PROFIT_MIN if pnl_pct > 0 else config.COOLDOWN_LOSS_MIN
             cooldown_until[ticker] = now + dt.timedelta(minutes=cd_min)
@@ -184,6 +192,9 @@ def manage_positions(
                 {
                     "time": now,
                     "ticker": ticker,
+                    "qty": float(close_qty),
+                    "entry_price": float(entry),
+                    "exit_price": float(exit_price),
                     "pnl_pct": float(pnl_pct),
                     "reason": str(result.get("reason", "")),
                     "strategy": strategy,
