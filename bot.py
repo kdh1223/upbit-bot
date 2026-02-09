@@ -972,7 +972,6 @@ def run():
     bot_mode = _resolve_mode()
     enable_main, enable_scalp_legacy, enable_scalp_btc, force_mock_order = _mode_to_strategy_flags(bot_mode)
     _warn_missing_requests_dependency()
-    tg("🤖 봇 시작됨")
 
     if force_mock_order and bool(getattr(config, "REAL_ORDER", False)):
         print("[MODE] TEST mode detected: force REAL_ORDER=False")

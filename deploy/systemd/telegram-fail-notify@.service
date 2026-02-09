@@ -1,0 +1,9 @@
+[Unit]
+Description=Telegram fail notify for %i
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=-/etc/default/telegram-bot
+ExecStart=/bin/bash -lc 'mkdir -p /run/upbit-bot; touch /run/upbit-bot/%i.failed_flag; MSG="🔴 봇 비정상 종료(크래시) | 확인: journalctl -u %i -n 200 --no-pager"; if [ -n "${TELEGRAM_TOKEN:-}" ] && [ -n "${TELEGRAM_CHAT_ID:-}" ]; then curl -sS --max-time 5 -X POST "https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage" -d "chat_id=${TELEGRAM_CHAT_ID}" --data-urlencode "text=${MSG}" -d "disable_web_page_preview=true" >/dev/null || true; fi'
