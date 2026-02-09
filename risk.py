@@ -8,6 +8,7 @@ import config
 import pyupbit
 from indicators import get_atr
 from market import get_balance
+from utils.telegram_notify import notify_event, notify_order
 
 
 def _get_params_by_regime(regime: str):
@@ -47,17 +48,55 @@ def _record_realized(state: dict, qty: float, price: float):
     state["realized_cost_krw"] = float(state.get("realized_cost_krw", 0.0)) + (q * entry)
 
 
-def _execute_sell(upbit, ticker: str, qty: float, market_sell, fail_reason: str):
+def _reason_code_from_fail_reason(fail_reason: str) -> str:
+    raw = str(fail_reason or "").lower()
+    if "tp1" in raw:
+        return "TP1"
+    if "tp2" in raw:
+        return "TP2"
+    if "trail" in raw:
+        return "TRAILING"
+    if "stop" in raw:
+        return "SL"
+    return "ENTRY"
+
+
+def _execute_sell(
+    upbit,
+    ticker: str,
+    qty: float,
+    market_sell,
+    fail_reason: str,
+    strategy_tag: str,
+    cur_price: float,
+):
+    reason_code = _reason_code_from_fail_reason(fail_reason)
     try:
         ok = bool(market_sell(upbit, ticker, qty))
     except Exception as e:
         if _is_real_order():
             print(f"⚠️ SELL 실패: {ticker} reason={fail_reason}")
+            notify_order(
+                event_type="ORDER_SELL_FAILED",
+                strategy_tag=strategy_tag,
+                ticker=ticker,
+                price=cur_price,
+                qty=qty,
+                reason=reason_code,
+            )
             return False, f"{fail_reason}:{e}"
         ok = False
 
     if _is_real_order() and not ok:
         print(f"⚠️ SELL 실패: {ticker} reason={fail_reason}")
+        notify_order(
+            event_type="ORDER_SELL_FAILED",
+            strategy_tag=strategy_tag,
+            ticker=ticker,
+            price=cur_price,
+            qty=qty,
+            reason=reason_code,
+        )
         return False, f"{fail_reason}:returned_false"
     return True, ""
 
@@ -159,7 +198,7 @@ def _resolve_trail_drawdown_pct(regime_trail_back: float) -> float:
     return 0.6
 
 
-def apply_risk_rules(upbit, ticker: str, state: dict, cur: float, market_sell, now=None):
+def apply_risk_rules(upbit, ticker: str, state: dict, cur: float, market_sell, now=None, strategy_tag: str = "MAIN"):
     now_ts = _now_ts(now)
     entry = float(state.get("entry", 0.0))
     if entry <= 0:
@@ -195,7 +234,15 @@ def apply_risk_rules(upbit, ticker: str, state: dict, cur: float, market_sell, n
         if bool(getattr(config, "DEBUG_TRADE_FLOW", False)):
             print(f"[손절] {ticker} pnl={pnl:.4f}")
         if vol > 0 and _can_order(float(cur), vol):
-            ok, err = _execute_sell(upbit, ticker, vol, market_sell, "stop_loss_sell_failed")
+            ok, err = _execute_sell(
+                upbit,
+                ticker,
+                vol,
+                market_sell,
+                "stop_loss_sell_failed",
+                strategy_tag=strategy_tag,
+                cur_price=float(cur),
+            )
             if not ok:
                 return {"closed": False, "reason": err}
             _record_realized(state, vol, float(cur))
@@ -213,13 +260,39 @@ def apply_risk_rules(upbit, ticker: str, state: dict, cur: float, market_sell, n
             if sell_qty > 0 and _can_order(float(cur), sell_qty):
                 if bool(getattr(config, "DEBUG_TRADE_FLOW", False)):
                     print(f"[TP1_익절] {ticker} pnl={pnl:.4f}")
-                ok, err = _execute_sell(upbit, ticker, sell_qty, market_sell, "tp1_sell_failed")
+                ok, err = _execute_sell(
+                    upbit,
+                    ticker,
+                    sell_qty,
+                    market_sell,
+                    "tp1_sell_failed",
+                    strategy_tag=strategy_tag,
+                    cur_price=float(cur),
+                )
                 if not ok:
                     return {"closed": False, "reason": err}
                 _record_realized(state, sell_qty, float(cur))
                 if not _is_real_order():
                     _mock_reduce_volume(state, sell_qty)
                 state["tp1"] = True
+                notify_order(
+                    event_type="ORDER_SELL_FILLED",
+                    strategy_tag=strategy_tag,
+                    ticker=ticker,
+                    price=float(cur),
+                    qty=float(sell_qty),
+                    reason="TP1",
+                )
+                notify_event(
+                    event_type="TP1_HIT",
+                    lines=[
+                        f"전략: {strategy_tag}",
+                        f"종목: {ticker}",
+                        f"가격: {float(cur):,.0f}",
+                        f"수량: {float(sell_qty):.8f}".rstrip("0").rstrip("."),
+                        "사유: TP1",
+                    ],
+                )
 
     # 3) TP2 partial
     if (not bool(state.get("tp2", False))) and tp2 > 0 and pnl >= tp2:
@@ -229,13 +302,39 @@ def apply_risk_rules(upbit, ticker: str, state: dict, cur: float, market_sell, n
             if sell_qty > 0 and _can_order(float(cur), sell_qty):
                 if bool(getattr(config, "DEBUG_TRADE_FLOW", False)):
                     print(f"[TP2_익절] {ticker} pnl={pnl:.4f}")
-                ok, err = _execute_sell(upbit, ticker, sell_qty, market_sell, "tp2_sell_failed")
+                ok, err = _execute_sell(
+                    upbit,
+                    ticker,
+                    sell_qty,
+                    market_sell,
+                    "tp2_sell_failed",
+                    strategy_tag=strategy_tag,
+                    cur_price=float(cur),
+                )
                 if not ok:
                     return {"closed": False, "reason": err}
                 _record_realized(state, sell_qty, float(cur))
                 if not _is_real_order():
                     _mock_reduce_volume(state, sell_qty)
                 state["tp2"] = True
+                notify_order(
+                    event_type="ORDER_SELL_FILLED",
+                    strategy_tag=strategy_tag,
+                    ticker=ticker,
+                    price=float(cur),
+                    qty=float(sell_qty),
+                    reason="TP2",
+                )
+                notify_event(
+                    event_type="TP2_HIT",
+                    lines=[
+                        f"전략: {strategy_tag}",
+                        f"종목: {ticker}",
+                        f"가격: {float(cur):,.0f}",
+                        f"수량: {float(sell_qty):.8f}".rstrip("0").rstrip("."),
+                        "사유: TP2",
+                    ],
+                )
 
     # 4) Trailing arm/close: arm only after elapsed time + minimum profit threshold.
     if (not bool(state.get("trail_armed", False))) and elapsed_sec >= trail_arm_sec and pnl_pct >= trail_arm_pct:
@@ -257,7 +356,15 @@ def apply_risk_rules(upbit, ticker: str, state: dict, cur: float, market_sell, n
                 if vol > 0 and _can_order(float(cur), vol):
                     if bool(getattr(config, "DEBUG_TRADE_FLOW", False)):
                         print(f"[트레일청산] {ticker} drawdown={drawdown_pct:.3f}% hwm={trail_hwm:.6f}")
-                    ok, err = _execute_sell(upbit, ticker, vol, market_sell, "trail_sell_failed")
+                    ok, err = _execute_sell(
+                        upbit,
+                        ticker,
+                        vol,
+                        market_sell,
+                        "trail_sell_failed",
+                        strategy_tag=strategy_tag,
+                        cur_price=float(cur),
+                    )
                     if not ok:
                         return {"closed": False, "reason": err}
                     _record_realized(state, vol, float(cur))

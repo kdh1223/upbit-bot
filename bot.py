@@ -35,6 +35,7 @@ from market import (
 from order_utils import wait_for_filled_snapshot
 from state_store import STRATEGIES, load_state, save_state, verify_state_with_balance
 from strategy import build_k_map
+from utils.telegram_notify import notify_event, notify_order
 
 
 BASE_TP_TABLE = copy.deepcopy(getattr(config, "TP_TABLE", {}))
@@ -67,6 +68,13 @@ def _notify_loop_error_once(exc: Exception):
         return
 
     print(f"[ALERT] ERROR: {type(exc).__name__}: {exc}")
+    notify_event(
+        event_type="EXCEPTION_RAISED",
+        lines=[
+            f"예외: {type(exc).__name__}",
+            f"메시지: {exc}",
+        ],
+    )
     _TG_LAST_ERR_AT = float(now_ts)
     _TG_LAST_ERR_KEY = err_key
 
@@ -199,6 +207,18 @@ def _notify_risk_cut_once(info: dict, equity: float):
     daily = float(info.get("daily_loss_pct", 0.0))
     mdd = float(info.get("mdd_pct", 0.0))
     print(f"[ALERT] RISK CUT {reason} | equity={float(equity):,.0f} daily={daily:+.2f}% mdd={mdd:+.2f}%")
+    event_type = "GLOBAL_MDD_REACHED"
+    if reason == "DAILY_LOSS_LIMIT":
+        event_type = "DAILY_MAX_LOSS_REACHED"
+    notify_event(
+        event_type=event_type,
+        lines=[
+            f"사유: {reason}",
+            f"현재자산: {float(equity):,.0f}",
+            f"일손익: {daily:+.2f}%",
+            f"MDD: {mdd:+.2f}%",
+        ],
+    )
     _TG_LAST_RISKCUT_AT = float(now_ts)
 
 
@@ -260,6 +280,36 @@ def _calc_monthly_stats(now: dt.datetime, trade_log_path: str):
     }
 
 
+def _normalize_order_reason(raw_reason: str) -> str:
+    s = str(raw_reason or "").lower()
+    if "tp1" in s:
+        return "TP1"
+    if "tp2" in s or "take_profit" in s:
+        return "TP2"
+    if "trail" in s:
+        return "TRAILING"
+    if "stop" in s:
+        return "SL"
+    if "switch" in s or "timeout" in s or "force" in s:
+        return "FORCE"
+    return "ENTRY"
+
+
+def _close_event_type(raw_reason: str) -> str:
+    s = str(raw_reason or "").lower()
+    if "tp1" in s:
+        return "TP1_HIT"
+    if "tp2" in s or "take_profit" in s:
+        return "TP2_HIT"
+    if "trail" in s:
+        return "TRAILING_EXIT"
+    if "stop" in s:
+        return "STOPLOSS_HIT"
+    if "switch" in s or "timeout" in s or "force" in s:
+        return "FORCE_CLOSE"
+    return ""
+
+
 def _notify_trade_result(ticker: str, qty: float, entry_price: float, exit_price: float, pnl_pct: float):
     symbol = _coin_symbol(ticker)
     qty_txt = _fmt_qty(qty)
@@ -294,9 +344,34 @@ def _notify_closed_trade_events(events):
         entry_price = _safe_float(e.get("entry_price", 0.0), 0.0)
         exit_price = _safe_float(e.get("exit_price", 0.0), 0.0)
         pnl_pct = _safe_float(e.get("pnl_pct", 0.0), 0.0)
+        strategy_tag = str(e.get("strategy", "MAIN") or "MAIN").upper().strip()
+        raw_reason = str(e.get("reason", "") or "")
+        reason_code = _normalize_order_reason(raw_reason)
+        event_type = _close_event_type(raw_reason)
         close_time = e.get("time")
         if not isinstance(close_time, dt.datetime):
             close_time = now_kst()
+
+        if not raw_reason.startswith("dust"):
+            notify_order(
+                event_type="ORDER_SELL_FILLED",
+                strategy_tag=strategy_tag,
+                ticker=ticker,
+                price=float(exit_price),
+                qty=float(qty),
+                reason=reason_code,
+            )
+        if event_type:
+            notify_event(
+                event_type=event_type,
+                lines=[
+                    f"\uC804\uB7B5: {strategy_tag}",
+                    f"\uC885\uBAA9: {ticker}",
+                    f"\uAC00\uACA9: {float(exit_price):,.0f}",
+                    f"\uC218\uB7C9: {_fmt_qty(float(qty))}",
+                    f"\uC0AC\uC720: {reason_code}",
+                ],
+            )
 
         _notify_trade_result(
             ticker=ticker,
@@ -720,6 +795,14 @@ def _get_scalp_btc_buy_krw(equity: float, krw: float):
     required = float(getattr(config, "MIN_ORDER_KRW", 5_000)) * float(getattr(config, "SCALP_BTC_MIN_ORDER_BUFFER", 1.02))
     if buy_krw < required:
         print(f"[SCALP_BTC] skip: size {buy_krw:,.0f} < required_min {required:,.0f} (fee buffer)")
+        notify_event(
+            event_type="INSUFFICIENT_BALANCE",
+            lines=[
+                "\uC804\uB7B5: SCALP_BTC",
+                f"\uD544\uC694\uAE08\uC561: {required:,.0f}",
+                f"\uAC00\uC6A9\uAE08: {float(krw):,.0f}",
+            ],
+        )
         return 0.0
     return float(buy_krw)
 
@@ -793,6 +876,14 @@ def _scalp_btc_close_position(
 
     if not ok:
         print(f"[WARN] ORDER failed: SELL {ticker}")
+        notify_order(
+            event_type="ORDER_SELL_FAILED",
+            strategy_tag="SCALP_BTC",
+            ticker=ticker,
+            price=float(cur),
+            qty=float(qty),
+            reason=_normalize_order_reason(reason),
+        )
         return False, f"sell_failed:{err_msg}"
 
     pnl = (cur / entry - 1.0) if entry > 0 else 0.0
@@ -826,6 +917,27 @@ def _scalp_btc_close_position(
             "SCALP_BTC",
         ],
     )
+    reason_code = _normalize_order_reason(reason)
+    notify_order(
+        event_type="ORDER_SELL_FILLED",
+        strategy_tag="SCALP_BTC",
+        ticker=ticker,
+        price=float(cur),
+        qty=float(qty),
+        reason=reason_code,
+    )
+    event_type = _close_event_type(reason)
+    if event_type:
+        notify_event(
+            event_type=event_type,
+            lines=[
+                "\uC804\uB7B5: SCALP_BTC",
+                f"\uC885\uBAA9: {ticker}",
+                f"\uAC00\uACA9: {float(cur):,.0f}",
+                f"\uC218\uB7C9: {_fmt_qty(float(qty))}",
+                f"\uC0AC\uC720: {reason_code}",
+            ],
+        )
     _notify_trade_result(ticker=ticker, qty=float(qty), entry_price=float(entry), exit_price=float(cur), pnl_pct=float(pnl * 100.0))
     _notify_monthly_stats(now)
     print(f"[CLOSE][SCALP_BTC] {ticker} pnl={(pnl * 100.0):+.2f}% reason={reason}")
@@ -956,12 +1068,28 @@ def _try_scalp_btc_entry(
         state["entry_time"] = now
         state["peak_price"] = float(entry)
         print(f"[SCALP_BTC ENTRY] BUY {ticker} | KRW={buy_krw:,.0f}")
+        notify_order(
+            event_type="ORDER_BUY_FILLED",
+            strategy_tag="SCALP_BTC",
+            ticker=ticker,
+            price=float(entry),
+            qty=float(qty),
+            reason="ENTRY",
+        )
         persist_state_fn()
         return True
     except Exception as e:
         log_order("BUY", ticker, 0.0, False, f"scalp_btc_err={e}")
         print(f"[WARN] buy failed(SCALP_BTC): {ticker} err={e}")
         print(f"[WARN] ORDER failed: BUY {ticker}")
+        notify_order(
+            event_type="ORDER_BUY_FAILED",
+            strategy_tag="SCALP_BTC",
+            ticker=ticker,
+            price=float(cur) if "cur" in locals() else 0.0,
+            qty=0.0,
+            reason="ENTRY",
+        )
         return False
     finally:
         ticker_lock.release(ticker)
@@ -1077,6 +1205,15 @@ def run():
         f"SCALP_BTC={'ON' if enable_scalp_btc else 'OFF'} "
         f"LEGACY_SCALP={'ON' if enable_scalp_legacy else 'OFF'}"
     )
+    notify_event(
+        event_type="BOT_START",
+        lines=[
+            f"\uBAA8\uB4DC: {bot_mode}",
+            f"REAL_ORDER: {bool(getattr(config, 'REAL_ORDER', False))}",
+            f"\uC804\uB7B5: MAIN={'ON' if enable_main else 'OFF'}, SCALP_BTC={'ON' if enable_scalp_btc else 'OFF'}",
+        ],
+    )
+
 
     while True:
         try:
@@ -1436,6 +1573,7 @@ def run():
 
         except KeyboardInterrupt:
             print("\nUser interrupted (Ctrl+C)")
+            notify_event(event_type="BOT_STOP", lines=["\uC0AC\uC720: \uC0AC\uC6A9\uC790 \uC911\uC9C0"])
             persist_state()
             break
         except Exception as e:

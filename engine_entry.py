@@ -6,6 +6,7 @@ import config
 import position_manager
 from indicators import check_filters, intraday_trend_ok, minute_entry_ok, scalp_entry_signal
 from strategy import calc_target
+from utils.telegram_notify import notify_event, notify_order
 
 
 def _safe_caches(prices):
@@ -201,6 +202,14 @@ def try_main_entries(
         except Exception as e:
             print(f"[WARN] buy failed(MAIN): {ticker} err={e}")
             print(f"[WARN] ORDER failed: BUY {ticker}")
+            notify_order(
+                event_type="ORDER_BUY_FAILED",
+                strategy_tag="MAIN",
+                ticker=ticker,
+                price=float(cur),
+                qty=0.0,
+                reason="ENTRY",
+            )
             continue
 
         if holding:
@@ -222,6 +231,25 @@ def try_main_entries(
             state[ticker]["entry_bucket"] = "CORE"
 
         save_state_fn()
+        notify_order(
+            event_type="ORDER_BUY_FILLED",
+            strategy_tag="MAIN",
+            ticker=ticker,
+            price=float(entry_price),
+            qty=float(initial_vol),
+            reason="ENTRY",
+        )
+        if holding:
+            notify_event(
+                event_type="AVG_DOWN_BUY",
+                lines=[
+                    "\uC804\uB7B5: MAIN",
+                    f"\uC885\uBAA9: {ticker}",
+                    f"\uAC00\uACA9: {float(entry_price):,.0f}",
+                    f"\uC218\uB7C9: {float(initial_vol):.8f}".rstrip("0").rstrip("."),
+                    "\uC0AC\uC720: ENTRY",
+                ],
+            )
         time.sleep(0.15)
         return True
 
@@ -306,6 +334,14 @@ def try_scalp_entries(
         except Exception as e:
             print(f"[WARN] buy failed(SCALP): {ticker} err={e}")
             print(f"[WARN] ORDER failed: BUY {ticker}")
+            notify_order(
+                event_type="ORDER_BUY_FAILED",
+                strategy_tag="SCALP",
+                ticker=ticker,
+                price=float(cur),
+                qty=0.0,
+                reason="ENTRY",
+            )
             continue
 
         state[ticker] = position_manager.init_position_state(
@@ -317,6 +353,14 @@ def try_scalp_entries(
         )
         state[ticker]["entry_bucket"] = "SURGE"
         save_state_fn()
+        notify_order(
+            event_type="ORDER_BUY_FILLED",
+            strategy_tag="SCALP",
+            ticker=ticker,
+            price=float(entry_price),
+            qty=float(initial_vol),
+            reason="ENTRY",
+        )
         time.sleep(0.10)
         return True
 

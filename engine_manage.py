@@ -141,7 +141,15 @@ def manage_positions(
                 inactive_positions=inactive_positions,
             )
 
-        result = apply_risk_rules(upbit, ticker, s, float(cur), sell_fn, now=now)
+        result = apply_risk_rules(
+            upbit,
+            ticker,
+            s,
+            float(cur),
+            sell_fn,
+            now=now,
+            strategy_tag=strategy,
+        )
 
         if result.get("closed"):
             if bool(getattr(config, "REAL_ORDER", False)):

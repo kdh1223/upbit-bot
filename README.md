@@ -38,6 +38,8 @@ pip install pyupbit python-dotenv requests
 ```bash
 UPBIT_ACCESS=your_access_key
 UPBIT_SECRET=your_secret_key
+TELEGRAM_TOKEN=your_telegram_bot_token
+TELEGRAM_CHAT_ID=your_telegram_chat_id
 ```
 
 ## systemd override 적용
