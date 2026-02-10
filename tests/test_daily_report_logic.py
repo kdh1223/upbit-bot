@@ -2,7 +2,7 @@ import datetime as dt
 import unittest
 from zoneinfo import ZoneInfo
 
-from run_daily_report import _calc_window_pnl_krw_pct, _mdd_pct, build_heartbeat_text, build_metrics, build_report_text, report_window_21_to_21
+from run_daily_report import _calc_mdd_from_equity_points, build_heartbeat_text, build_metrics, build_report_text, report_window_21_to_21
 
 
 KST = ZoneInfo("Asia/Seoul")
@@ -26,15 +26,6 @@ class DailyReportLogicTests(unittest.TestCase):
         self.assertGreater(m["wr"], 60.0)
         self.assertAlmostEqual(m["sl_ratio"], 33.3333333333, places=2)
 
-    def test_mdd_is_negative(self):
-        rows = [
-            {"pnl_pct": "2.0"},
-            {"pnl_pct": "-10.0"},
-            {"pnl_pct": "1.0"},
-        ]
-        mdd = _mdd_pct(rows, 1_000_000.0)
-        self.assertLess(mdd, 0.0)
-
     def test_build_metrics_ignores_partial_reasons(self):
         rows = [
             {"pnl_pct": "3.0", "reason": "TP1"},
@@ -45,18 +36,18 @@ class DailyReportLogicTests(unittest.TestCase):
         self.assertEqual(m["n"], 1)
         self.assertAlmostEqual(m["avg"], -1.0, places=6)
 
-    def test_window_pnl_krw_pct(self):
-        rows = [
-            {"time_dt": dt.datetime(2026, 2, 8, 22, 0, 0, tzinfo=KST), "pnl_pct": "10.0"},
-            {"time_dt": dt.datetime(2026, 2, 9, 22, 0, 0, tzinfo=KST), "pnl_pct": "10.0"},
+    def test_snapshot_mdd_is_negative(self):
+        points = [
+            (dt.datetime(2026, 2, 1, 21, 0, 0, tzinfo=KST), 1_000_000.0),
+            (dt.datetime(2026, 2, 2, 21, 0, 0, tzinfo=KST), 1_100_000.0),
+            (dt.datetime(2026, 2, 3, 21, 0, 0, tzinfo=KST), 1_000_000.0),
         ]
-        start = dt.datetime(2026, 2, 9, 21, 0, 0, tzinfo=KST)
-        end = dt.datetime(2026, 2, 10, 21, 0, 0, tzinfo=KST)
-        pnl_krw, pnl_pct, start_eq, end_eq = _calc_window_pnl_krw_pct(rows, start, end, 1000.0)
-        self.assertAlmostEqual(start_eq, 1100.0, places=6)
-        self.assertAlmostEqual(end_eq, 1210.0, places=6)
-        self.assertAlmostEqual(pnl_krw, 110.0, places=6)
-        self.assertAlmostEqual(pnl_pct, 10.0, places=6)
+        mdd = _calc_mdd_from_equity_points(points)
+        self.assertLess(mdd, 0.0)
+
+    def test_snapshot_mdd_none_when_insufficient_points(self):
+        points = [(dt.datetime(2026, 2, 1, 21, 0, 0, tzinfo=KST), 1_000_000.0)]
+        self.assertIsNone(_calc_mdd_from_equity_points(points))
 
     def test_build_report_text_without_overall_sections(self):
         report_end = dt.datetime(2026, 2, 10, 21, 0, 0, tzinfo=KST)

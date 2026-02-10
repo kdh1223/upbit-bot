@@ -16,13 +16,12 @@ import config
 from market import get_balance, load_keys
 from state_store import load_state
 from utils.log_paths import list_trade_log_paths, report_log_path_for, trade_log_path_for
-from utils.telegram_notify import has_telegram_credentials, load_telegram_env_file, tg_notify, tg_notify_photo
+from utils.telegram_notify import has_telegram_credentials, load_telegram_env_file, tg_notify
 
 
 KST = ZoneInfo("Asia/Seoul")
 SUMMARY_CSV = "trading_summary.csv"
 SUMMARY_XLSX = "trading_summary.xlsx"
-MONTH_PNG = "equity_month.png"
 DEFAULT_SERVICE_NAME = "upbit-bot"
 EQUITY_HISTORY_JSONL = "equity_snapshot_history.jsonl"
 EQUITY_ANCHOR_MAX_AFTER_SEC = 3600
@@ -37,13 +36,6 @@ def _to_float(value, default: float = 0.0) -> float:
         return float(value)
     except Exception:
         return float(default)
-
-
-def _safe_initial_capital() -> float:
-    try:
-        return float(getattr(config, "INITIAL_CAPITAL", 1_000_000))
-    except Exception:
-        return 1_000_000.0
 
 
 def _parse_trade_time(raw: str):
@@ -174,23 +166,6 @@ def _compound_return_pct(rows: List[Dict[str, str]]) -> float:
     return (mult - 1.0) * 100.0
 
 
-def _mdd_pct(rows: List[Dict[str, str]], initial_capital: float) -> float:
-    rows = [r for r in rows if not _is_partial_reason(r.get("reason", ""))]
-    equity = float(initial_capital)
-    peak = float(initial_capital)
-    mdd = 0.0
-    for row in rows:
-        pnl = _to_float(row.get("pnl_pct", 0.0), 0.0)
-        equity *= (1.0 + pnl / 100.0)
-        if equity > peak:
-            peak = equity
-        if peak > 0:
-            dd = (equity / peak - 1.0) * 100.0
-            if dd < mdd:
-                mdd = dd
-    return float(mdd)
-
-
 def build_metrics(rows: List[Dict[str, str]]):
     rows = [r for r in rows if not _is_partial_reason(r.get("reason", ""))]
     n = len(rows)
@@ -219,24 +194,6 @@ def build_metrics(rows: List[Dict[str, str]]):
 
 def _rows_without_partials(rows: List[Dict[str, str]]):
     return [r for r in list(rows or []) if not _is_partial_reason(r.get("reason", ""))]
-
-
-def _equity_after_rows(rows: List[Dict[str, str]], start_equity: float) -> float:
-    equity = float(start_equity)
-    for row in list(rows or []):
-        pnl = _to_float(row.get("pnl_pct", 0.0), 0.0)
-        equity *= (1.0 + pnl / 100.0)
-    return float(equity)
-
-
-def _calc_window_pnl_krw_pct(rows_all: List[Dict[str, str]], start: dt.datetime, end: dt.datetime, initial_capital: float):
-    start_rows = filter_rows(rows_all, start=None, end=start)
-    end_rows = filter_rows(rows_all, start=None, end=end)
-    start_eq = _equity_after_rows(start_rows, initial_capital)
-    end_eq = _equity_after_rows(end_rows, initial_capital)
-    pnl_krw = float(end_eq) - float(start_eq)
-    pnl_pct = ((float(end_eq) / float(start_eq)) - 1.0) * 100.0 if float(start_eq) > 0 else 0.0
-    return float(pnl_krw), float(pnl_pct), float(start_eq), float(end_eq)
 
 
 def _safe_account_snapshot(log_line):
@@ -498,44 +455,6 @@ def write_xlsx_if_requested(path: str, daily: dict, month: dict, by_strategy: di
     return True, ""
 
 
-def save_month_equity_png(path: str, rows_month: List[Dict[str, str]], start: dt.datetime, end: dt.datetime):
-    import matplotlib
-
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-
-    initial = _safe_initial_capital()
-    xs = [start]
-    ys = [initial]
-    equity = initial
-    for row in rows_month:
-        pnl = _to_float(row.get("pnl_pct", 0.0), 0.0)
-        equity *= (1.0 + pnl / 100.0)
-        xs.append(row["time_dt"])
-        ys.append(equity)
-    if len(xs) == 1:
-        xs.append(end)
-        ys.append(initial)
-
-    fig = plt.figure(figsize=(10, 4.8))
-    ax = fig.add_subplot(111)
-    ax.plot(xs, ys, linewidth=1.8)
-    ax.set_title(f"Monthly Equity Curve ({start.strftime('%Y-%m')}, KST 21->21)")
-    ax.set_xlabel("Time")
-    ax.set_ylabel("Equity (KRW)")
-    ax.grid(alpha=0.3)
-    fig.tight_layout()
-    fig.savefig(path, dpi=130)
-    plt.close(fig)
-
-
-def fmt_pct(value: float, signed: bool = True) -> str:
-    v = _to_float(value, 0.0)
-    if signed:
-        return f"{v:+.2f}%"
-    return f"{v:.2f}%"
-
-
 def build_report_text(
     report_end: dt.datetime,
     day_start: dt.datetime,
@@ -773,17 +692,7 @@ def main():
     }
 
     write_summary_csv(SUMMARY_CSV, day_metrics, month_metrics, by_strategy, month_mdd_pct=month_mdd_pct)
-    month_png_ready = False
-    try:
-        save_month_equity_png(MONTH_PNG, rows_month, month_start, report_end)
-        month_png_ready = bool(os.path.exists(MONTH_PNG))
-    except Exception as e:
-        month_png_ready = False
-        log_line(f"[WARN] month equity image skipped: {type(e).__name__}: {e}")
-    if month_png_ready:
-        log_line(f"[OK] wrote {SUMMARY_CSV} and {MONTH_PNG}")
-    else:
-        log_line(f"[OK] wrote {SUMMARY_CSV}")
+    log_line(f"[OK] wrote {SUMMARY_CSV}")
 
     if args.xlsx:
         ok, err = write_xlsx_if_requested(
@@ -818,18 +727,6 @@ def main():
         log_line("[OK] telegram text sent")
     else:
         log_line("[WARN] telegram text send failed or queued to spool")
-
-    send_month_image = bool(getattr(config, "DAILY_REPORT_SEND_MONTH_IMAGE", False))
-    if month_png_ready and send_month_image:
-        photo_ok = bool(tg_notify_photo(event_type="DAILY_REPORT", photo_path=MONTH_PNG))
-        if photo_ok:
-            log_line("[OK] telegram photo sent")
-        else:
-            log_line("[WARN] telegram photo send failed or queued to spool")
-    elif month_png_ready and (not send_month_image):
-        log_line("[INFO] telegram photo disabled by DAILY_REPORT_SEND_MONTH_IMAGE=False")
-    else:
-        log_line("[WARN] telegram photo skipped: equity image unavailable")
 
 
 if __name__ == "__main__":
