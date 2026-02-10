@@ -707,13 +707,30 @@ def estimate_equity(krw: float, strategy_state: dict, prices: dict, upbit, inact
         if not s.get("holding"):
             continue
         coin = ticker.split("-")[1]
-        vol = float(get_balance(upbit, coin))
+        # Prefer live balance but fall back to state qty on transient API errors.
+        vol = 0.0
+        try:
+            vol = float(get_balance(upbit, coin))
+        except Exception:
+            vol = 0.0
+        if vol <= 0:
+            try:
+                vol = float(s.get("qty", 0.0))
+            except Exception:
+                vol = 0.0
         if vol <= 0:
             continue
         p = prices.get(ticker)
-        if p is None:
+        try:
+            p = float(p) if p is not None else 0.0
+        except Exception:
+            p = 0.0
+        if p <= 0:
+            # Fallback to entry price so missing quotes do not collapse equity to zero.
+            p = _safe_float(s.get("entry", s.get("entry_price", 0.0)), 0.0)
+        if p <= 0:
             continue
-        equity += vol * float(p)
+        equity += float(vol) * float(p)
     return float(equity)
 
 
