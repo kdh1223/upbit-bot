@@ -794,12 +794,15 @@ def main():
     else:
         log_line("[WARN] telegram text send failed or queued to spool")
 
-    if month_png_ready:
+    send_month_image = bool(getattr(config, "DAILY_REPORT_SEND_MONTH_IMAGE", False))
+    if month_png_ready and send_month_image:
         photo_ok = bool(tg_notify_photo(event_type="DAILY_REPORT", photo_path=MONTH_PNG))
         if photo_ok:
             log_line("[OK] telegram photo sent")
         else:
             log_line("[WARN] telegram photo send failed or queued to spool")
+    elif month_png_ready and (not send_month_image):
+        log_line("[INFO] telegram photo disabled by DAILY_REPORT_SEND_MONTH_IMAGE=False")
     else:
         log_line("[WARN] telegram photo skipped: equity image unavailable")
 
