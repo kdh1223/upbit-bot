@@ -7,7 +7,7 @@ import json
 import os
 import subprocess
 import traceback
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 from zoneinfo import ZoneInfo
 
 import pyupbit
@@ -196,6 +196,73 @@ def _rows_without_partials(rows: List[Dict[str, str]]):
     return [r for r in list(rows or []) if not _is_partial_reason(r.get("reason", ""))]
 
 
+def _load_krw_market_set(log_line=None) -> Optional[Set[str]]:
+    try:
+        markets = pyupbit.get_tickers(fiat="KRW")
+    except Exception as e:
+        if callable(log_line):
+            log_line(f"[WARN] snapshot market list failed: {type(e).__name__}: {e}")
+        return None
+    if not isinstance(markets, list):
+        return None
+    out: Set[str] = set()
+    for raw in markets:
+        t = str(raw or "").strip().upper()
+        if t.startswith("KRW-"):
+            out.add(t)
+    return out
+
+
+def _fetch_price_map_with_fallback(tickers: List[str], log_line=None) -> Dict[str, float]:
+    ordered: List[str] = []
+    seen = set()
+    for raw in list(tickers or []):
+        t = str(raw or "").strip().upper()
+        if (not t) or t in seen:
+            continue
+        seen.add(t)
+        ordered.append(t)
+    if not ordered:
+        return {}
+
+    prices: Dict[str, float] = {}
+    remaining: List[str] = list(ordered)
+    try:
+        raw = pyupbit.get_current_price(ordered)
+        if isinstance(raw, dict):
+            next_remaining: List[str] = []
+            for t in ordered:
+                p = _to_float(raw.get(t, 0.0), 0.0)
+                if p > 0:
+                    prices[t] = float(p)
+                else:
+                    next_remaining.append(t)
+            remaining = next_remaining
+        elif len(ordered) == 1:
+            p = _to_float(raw, 0.0)
+            if p > 0:
+                prices[ordered[0]] = float(p)
+                remaining = []
+        else:
+            remaining = list(ordered)
+    except Exception as e:
+        if callable(log_line):
+            log_line(f"[WARN] snapshot batch price failed: {type(e).__name__}: {e}")
+        remaining = list(ordered)
+
+    for t in remaining:
+        try:
+            raw_one = pyupbit.get_current_price(t)
+        except Exception as e:
+            if callable(log_line):
+                log_line(f"[WARN] snapshot price failed: {t} {type(e).__name__}: {e}")
+            continue
+        p = _to_float(raw_one, 0.0)
+        if p > 0:
+            prices[t] = float(p)
+    return prices
+
+
 def _safe_account_snapshot(log_line):
     snapshot = {
         "krw_balance": 0.0,
@@ -231,26 +298,29 @@ def _safe_account_snapshot(log_line):
                 coin_qty[ticker] = float(coin_qty.get(ticker, 0.0)) + float(qty)
 
         has_coin = bool(coin_qty)
+        snapshot["has_coin"] = bool(has_coin)
         coin_value = 0.0
         if has_coin:
-            tickers = list(coin_qty.keys())
-            prices_raw = pyupbit.get_current_price(tickers)
-            price_map = {}
-            if isinstance(prices_raw, dict):
-                for t in tickers:
-                    p = prices_raw.get(t)
-                    if p is not None:
-                        price_map[t] = _to_float(p, 0.0)
-            elif len(tickers) == 1 and prices_raw is not None:
-                price_map[tickers[0]] = _to_float(prices_raw, 0.0)
-
+            krw_markets = _load_krw_market_set(log_line=log_line)
+            priceable_qty = {}
+            skipped_tickers = []
             for t, q in coin_qty.items():
+                if (krw_markets is not None) and (t not in krw_markets):
+                    skipped_tickers.append(t)
+                    continue
+                priceable_qty[t] = float(q)
+            if skipped_tickers and callable(log_line):
+                head = ", ".join(skipped_tickers[:5])
+                tail = " ..." if len(skipped_tickers) > 5 else ""
+                log_line(f"[WARN] snapshot skip non-KRW market holdings: {head}{tail}")
+
+            price_map = _fetch_price_map_with_fallback(list(priceable_qty.keys()), log_line=log_line)
+            for t, q in priceable_qty.items():
                 p = _to_float(price_map.get(t, 0.0), 0.0)
                 if p > 0 and q > 0:
                     coin_value += float(q) * float(p)
 
         snapshot["coin_value"] = float(max(0.0, coin_value))
-        snapshot["has_coin"] = bool(has_coin)
         snapshot["total_equity"] = float(snapshot["krw_balance"] + snapshot["coin_value"])
     except Exception as e:
         log_line(f"[WARN] account snapshot failed: {type(e).__name__}: {e}")
