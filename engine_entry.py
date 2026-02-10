@@ -374,14 +374,18 @@ def try_main_entries(
                 state[ticker]["trail_giveback_pct"] = max(0.0, float(entry_params.get("trail_giveback", 0.0)))
 
         save_state_fn()
-        notify_order(
+        buy_notify_ok = bool(
+            notify_order(
             event_type="ORDER_BUY_FILLED",
             strategy_tag="MAIN",
             ticker=ticker,
             price=float(entry_price),
             qty=float(initial_vol),
             reason="ENTRY",
+            )
         )
+        if not buy_notify_ok:
+            print(f"[WARN][TELEGRAM] ORDER_BUY_FILLED queued/failed: MAIN {ticker}")
         if holding:
             notify_event(
                 event_type="AVG_DOWN_BUY",
@@ -512,14 +516,18 @@ def try_scalp_entries(
         )
         state[ticker]["entry_bucket"] = "SURGE"
         save_state_fn()
-        notify_order(
+        buy_notify_ok = bool(
+            notify_order(
             event_type="ORDER_BUY_FILLED",
             strategy_tag=strategy_tag,
             ticker=ticker,
             price=float(entry_price),
             qty=float(initial_vol),
             reason="ENTRY",
+            )
         )
+        if not buy_notify_ok:
+            print(f"[WARN][TELEGRAM] ORDER_BUY_FILLED queued/failed: {strategy_tag} {ticker}")
         time.sleep(0.10)
         return True
 

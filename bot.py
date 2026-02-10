@@ -38,7 +38,13 @@ from order_utils import wait_for_filled_snapshot
 from state_store import STRATEGIES, load_state, save_state, verify_state_with_balance
 from strategy import build_k_map
 from utils.log_paths import trade_log_path_for
-from utils.telegram_notify import has_telegram_credentials, load_telegram_env_file, notify_event, notify_order
+from utils.telegram_notify import (
+    flush_telegram_spool,
+    has_telegram_credentials,
+    load_telegram_env_file,
+    notify_event,
+    notify_order,
+)
 
 
 BASE_TP_TABLE = copy.deepcopy(getattr(config, "TP_TABLE", {}))
@@ -1460,14 +1466,18 @@ def _try_scalp_btc_entry(
             state["trail_giveback_pct"] = max(0.0, float(entry_params.get("trail_giveback", 0.0)))
             state["timeout_profit_min"] = max(0.0, float(entry_params.get("timeout_profit_min", 0.0)))
         print(f"[SCALP_BTC ENTRY] BUY {ticker} | KRW={buy_krw:,.0f}")
-        notify_order(
+        buy_notify_ok = bool(
+            notify_order(
             event_type="ORDER_BUY_FILLED",
             strategy_tag="SCALP_BTC",
             ticker=ticker,
             price=float(entry),
             qty=float(qty),
             reason="ENTRY",
+            )
         )
+        if not buy_notify_ok:
+            print(f"[WARN][TELEGRAM] ORDER_BUY_FILLED queued/failed: SCALP_BTC {ticker}")
         persist_state_fn()
         return True
     except Exception as e:
@@ -1584,6 +1594,9 @@ def run():
     last_refresh = now
     last_status = now
     last_state_save = now
+    last_tg_spool_flush = now - dt.timedelta(seconds=3600)
+    tg_spool_flush_sec = max(5.0, float(getattr(config, "TELEGRAM_SPOOL_FLUSH_SEC", 30)))
+    tg_spool_flush_limit = max(1, int(getattr(config, "TELEGRAM_SPOOL_FLUSH_LIMIT", 50)))
     trading_day = now.date()
 
     day_tp1_count_main = 0
@@ -1621,6 +1634,15 @@ def run():
         try:
             now = now_kst()
             main_entry_intent = None
+
+            if (now - last_tg_spool_flush).total_seconds() >= tg_spool_flush_sec:
+                try:
+                    sent = int(flush_telegram_spool(limit=tg_spool_flush_limit))
+                    if sent > 0:
+                        print(f"[TG_SPOOL] flushed queued notifications: {sent}")
+                except Exception as e:
+                    print(f"[WARN][TG_SPOOL] flush failed: {type(e).__name__}: {e}")
+                last_tg_spool_flush = now
 
             if (now - last_refresh).total_seconds() >= float(config.REFRESH_MIN) * 60.0:
                 print("\n[REFRESH] universe")
