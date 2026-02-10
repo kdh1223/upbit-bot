@@ -157,7 +157,13 @@ def _is_stop_reason(reason: str) -> bool:
     return False
 
 
+def _is_partial_reason(reason: str) -> bool:
+    code = str(reason or "").strip().upper()
+    return code in {"TP1", "TP2_PARTIAL"}
+
+
 def _compound_return_pct(rows: List[Dict[str, str]]) -> float:
+    rows = [r for r in rows if not _is_partial_reason(r.get("reason", ""))]
     mult = 1.0
     for row in rows:
         pnl = _to_float(row.get("pnl_pct", 0.0), 0.0)
@@ -166,6 +172,7 @@ def _compound_return_pct(rows: List[Dict[str, str]]) -> float:
 
 
 def _mdd_pct(rows: List[Dict[str, str]], initial_capital: float) -> float:
+    rows = [r for r in rows if not _is_partial_reason(r.get("reason", ""))]
     equity = float(initial_capital)
     peak = float(initial_capital)
     mdd = 0.0
@@ -182,6 +189,7 @@ def _mdd_pct(rows: List[Dict[str, str]], initial_capital: float) -> float:
 
 
 def build_metrics(rows: List[Dict[str, str]]):
+    rows = [r for r in rows if not _is_partial_reason(r.get("reason", ""))]
     n = len(rows)
     pnls = [_to_float(row.get("pnl_pct", 0.0), 0.0) for row in rows]
     wins = sum(1 for x in pnls if x > 0)
@@ -204,6 +212,91 @@ def build_metrics(rows: List[Dict[str, str]]):
         "sl_ratio": float(sl_ratio),
         "avg10": float(avg10),
     }
+
+
+def _rows_without_partials(rows: List[Dict[str, str]]):
+    return [r for r in list(rows or []) if not _is_partial_reason(r.get("reason", ""))]
+
+
+def _equity_after_rows(rows: List[Dict[str, str]], start_equity: float) -> float:
+    equity = float(start_equity)
+    for row in list(rows or []):
+        pnl = _to_float(row.get("pnl_pct", 0.0), 0.0)
+        equity *= (1.0 + pnl / 100.0)
+    return float(equity)
+
+
+def _calc_window_pnl_krw_pct(rows_all: List[Dict[str, str]], start: dt.datetime, end: dt.datetime, initial_capital: float):
+    start_rows = filter_rows(rows_all, start=None, end=start)
+    end_rows = filter_rows(rows_all, start=None, end=end)
+    start_eq = _equity_after_rows(start_rows, initial_capital)
+    end_eq = _equity_after_rows(end_rows, initial_capital)
+    pnl_krw = float(end_eq) - float(start_eq)
+    pnl_pct = ((float(end_eq) / float(start_eq)) - 1.0) * 100.0 if float(start_eq) > 0 else 0.0
+    return float(pnl_krw), float(pnl_pct), float(start_eq), float(end_eq)
+
+
+def _safe_account_snapshot(log_line):
+    snapshot = {
+        "krw_balance": 0.0,
+        "coin_value": 0.0,
+        "total_equity": 0.0,
+        "has_coin": False,
+    }
+    try:
+        access, secret = load_keys()
+        upbit = pyupbit.Upbit(access, secret)
+        krw_balance = float(get_balance(upbit, "KRW"))
+        snapshot["krw_balance"] = float(max(0.0, krw_balance))
+
+        coin_qty = {}
+        try:
+            accounts = upbit.get_balances()
+        except Exception:
+            accounts = []
+
+        if isinstance(accounts, list):
+            for row in accounts:
+                if not isinstance(row, dict):
+                    continue
+                currency = str(row.get("currency") or "").upper().strip()
+                if (not currency) or currency == "KRW":
+                    continue
+                bal = max(0.0, _to_float(row.get("balance", 0.0), 0.0))
+                locked = max(0.0, _to_float(row.get("locked", 0.0), 0.0))
+                qty = bal + locked
+                if qty <= 0:
+                    continue
+                ticker = f"KRW-{currency}"
+                coin_qty[ticker] = float(coin_qty.get(ticker, 0.0)) + float(qty)
+
+        has_coin = bool(coin_qty)
+        coin_value = 0.0
+        if has_coin:
+            tickers = list(coin_qty.keys())
+            prices_raw = pyupbit.get_current_price(tickers)
+            price_map = {}
+            if isinstance(prices_raw, dict):
+                for t in tickers:
+                    p = prices_raw.get(t)
+                    if p is not None:
+                        price_map[t] = _to_float(p, 0.0)
+            elif len(tickers) == 1 and prices_raw is not None:
+                price_map[tickers[0]] = _to_float(prices_raw, 0.0)
+
+            for t, q in coin_qty.items():
+                p = _to_float(price_map.get(t, 0.0), 0.0)
+                if p > 0 and q > 0:
+                    coin_value += float(q) * float(p)
+
+        snapshot["coin_value"] = float(max(0.0, coin_value))
+        snapshot["has_coin"] = bool(has_coin)
+        snapshot["total_equity"] = float(snapshot["krw_balance"] + snapshot["coin_value"])
+    except Exception as e:
+        log_line(f"[WARN] account snapshot failed: {type(e).__name__}: {e}")
+        log_line(traceback.format_exc().strip())
+        snapshot["total_equity"] = float(snapshot["krw_balance"] + snapshot["coin_value"])
+    return snapshot
 
 
 def build_strategy_metrics_month(rows_month: List[Dict[str, str]]):
@@ -305,56 +398,58 @@ def fmt_pct(value: float, signed: bool = True) -> str:
     return f"{v:.2f}%"
 
 
-def build_report_text(report_end: dt.datetime, day_start: dt.datetime, day: dict, month: dict, overall: dict, by_strategy: dict):
-    mdd_warn = abs(_to_float(getattr(config, "DAILY_REPORT_MDD_WARN_PCT", 10.0), 10.0))
-    status = "\U0001F7E2"
-    status_reason = ""
-    if overall["mdd"] <= -mdd_warn:
-        status = "\U0001F6A8"
-        status_reason = f"\uC804\uCCB4 MDD {fmt_pct(overall['mdd'])} <= -{mdd_warn:.2f}%"
-    elif day["avg10"] < 0:
-        status = "\u26A0\uFE0F"
-        status_reason = f"\uCD5C\uADFC10\uD3C9\uADE0 {fmt_pct(day['avg10'])} < 0%"
+def build_report_text(
+    report_end: dt.datetime,
+    day_start: dt.datetime,
+    day: dict,
+    month: dict,
+    overall: dict,
+    by_strategy: dict,
+    snapshot: dict,
+    pnl_amounts: dict,
+):
+    krw_balance = max(0.0, _to_float((snapshot or {}).get("krw_balance", 0.0), 0.0))
+    coin_value = max(0.0, _to_float((snapshot or {}).get("coin_value", 0.0), 0.0))
+    total_equity = max(0.0, _to_float((snapshot or {}).get("total_equity", 0.0), 0.0))
+    has_coin = bool((snapshot or {}).get("has_coin", False))
+
+    coin_value_text = f"{coin_value:,.0f}원"
+    if not has_coin:
+        coin_value_text = "0원 (보유 없음)"
+
+    main_stats = by_strategy.get("MAIN", {"n": 0, "wr": 0.0, "avg": 0.0})
+    scalp_stats = by_strategy.get("SCALP_BTC", {"n": 0, "wr": 0.0, "avg": 0.0})
 
     lines = [
-        f"\U0001F4CA \uC77C\uC77C \uC131\uC801 \uB9AC\uD3EC\uD2B8 (KST) | {report_end.strftime('%Y-%m-%d 21:00')}",
-        f"\uAE30\uAC04: {day_start.strftime('%m/%d %H:%M')} ~ {report_end.strftime('%m/%d %H:%M')}",
+        f"📊 일일 성적 리포트 (KST) | {report_end.strftime('%Y-%m-%d 21:00')}",
+        f"기간: {day_start.strftime('%m/%d 21:00')} ~ {report_end.strftime('%m/%d 21:00')}",
         "",
+        "🏦 계좌 스냅샷",
+        f"- KRW 잔고: {krw_balance:,.0f}원",
+        f"- 코인 평가금: {coin_value_text}",
+        f"- 총자산: {total_equity:,.0f}원",
+        "",
+        "일일",
+        f"거래 {int(day.get('n', 0))} | 승률 {_to_float(day.get('wr', 0.0), 0.0):.2f}% | 평균 {_to_float(day.get('avg', 0.0), 0.0):+.2f}%",
+        f"손익 {_to_float(pnl_amounts.get('daily_krw', 0.0), 0.0):+,.0f}원 ({_to_float(pnl_amounts.get('daily_pct', 0.0), 0.0):+.2f}%)",
+        f"최대익절 {_to_float(day.get('max', 0.0), 0.0):+.2f}% | 최대손절 {_to_float(day.get('min', 0.0), 0.0):+.2f}%",
+        f"손절비중 {_to_float(day.get('sl_ratio', 0.0), 0.0):.2f}% | 최근10평균 {_to_float(day.get('avg10', 0.0), 0.0):+.2f}%",
+        "",
+        f"이번달 ({report_end.strftime('%Y-%m')})",
+        f"거래 {int(month.get('n', 0))} | 승률 {_to_float(month.get('wr', 0.0), 0.0):.2f}% | 평균 {_to_float(month.get('avg', 0.0), 0.0):+.2f}%",
+        f"손익 {_to_float(pnl_amounts.get('month_krw', 0.0), 0.0):+,.0f}원 ({_to_float(pnl_amounts.get('month_pct', 0.0), 0.0):+.2f}%)",
+        f"누적(복리) {_to_float(month.get('cum', 0.0), 0.0):+.2f}%",
+        "",
+        "전체",
+        f"누적 손익 {_to_float(pnl_amounts.get('total_krw', 0.0), 0.0):+,.0f}원 ({_to_float(overall.get('cum', 0.0), 0.0):+.2f}%)",
+        f"MDD {_to_float(overall.get('mdd', 0.0), 0.0):.2f}%",
+        "",
+        "전략별 (이번달)",
+        f"- MAIN: 거래 {int(main_stats.get('n', 0))} | 승률 {_to_float(main_stats.get('wr', 0.0), 0.0):.2f}% | 평균 {_to_float(main_stats.get('avg', 0.0), 0.0):+.2f}%",
+        f"- SCALP_BTC: 거래 {int(scalp_stats.get('n', 0))}",
+        "",
+        "상태: 🟢",
     ]
-    if day["n"] > 0:
-        lines.extend(
-            [
-                f"\uC77C\uC77C: \uAC70\uB798 {day['n']} | \uC2B9\uB960 {fmt_pct(day['wr'], signed=False)} | \uD3C9\uADE0 {fmt_pct(day['avg'])} | \uB204\uC801(\uBCF5\uB9AC) {fmt_pct(day['cum'])}",
-                f"      \uCD5C\uB300\uC775\uC808 {fmt_pct(day['max'])} | \uCD5C\uB300\uC190\uC808 {fmt_pct(day['min'])}",
-                f"      \uC190\uC808\uBE44\uC911 {fmt_pct(day['sl_ratio'], signed=False)} | \uCD5C\uADFC10\uD3C9\uADE0 {fmt_pct(day['avg10'])}",
-                "",
-            ]
-        )
-    else:
-        lines.extend(
-            [
-                "\uC77C\uC77C: \uC624\uB298 \uAC70\uB798 \uC5C6\uC74C",
-                "",
-            ]
-        )
-
-    lines.extend(
-        [
-            f"\uC774\uBC88\uB2EC({report_end.strftime('%Y-%m')})",
-            f"\uAC70\uB798 {month['n']} | \uC2B9\uB960 {fmt_pct(month['wr'], signed=False)} | \uD3C9\uADE0 {fmt_pct(month['avg'])} | \uB204\uC801(\uBCF5\uB9AC) {fmt_pct(month['cum'])}",
-            "",
-            "\uC804\uCCB4",
-            f"\uB204\uC801(\uBCF5\uB9AC) {fmt_pct(overall['cum'])} | MDD {fmt_pct(overall['mdd'])}",
-            "",
-            "\uC804\uB7B5\uBCC4(\uC774\uBC88\uB2EC)",
-            f"- MAIN: \uAC70\uB798 {by_strategy['MAIN']['n']} | \uC2B9\uB960 {fmt_pct(by_strategy['MAIN']['wr'], signed=False)} | \uD3C9\uADE0 {fmt_pct(by_strategy['MAIN']['avg'])}",
-            f"- SCALP_BTC: \uAC70\uB798 {by_strategy['SCALP_BTC']['n']} | \uC2B9\uB960 {fmt_pct(by_strategy['SCALP_BTC']['wr'], signed=False)} | \uD3C9\uADE0 {fmt_pct(by_strategy['SCALP_BTC']['avg'])}",
-            "",
-            f"\uC0C1\uD0DC: {status}",
-        ]
-    )
-    if status_reason:
-        lines.append(f"\uC0AC\uC720: {status_reason}")
     return "\n".join(lines)
 
 
@@ -473,9 +568,10 @@ def main():
     if not files:
         log_line("[INFO] no trade_log_YYYY-MM.csv files found")
 
-    rows_daily = filter_rows(rows_all, start=day_start, end=report_end)
-    rows_month = filter_rows(rows_all, start=month_start, end=report_end)
-    rows_total = list(rows_all)
+    rows_all_no_partial = _rows_without_partials(rows_all)
+    rows_daily = filter_rows(rows_all_no_partial, start=day_start, end=report_end)
+    rows_month = filter_rows(rows_all_no_partial, start=month_start, end=report_end)
+    rows_total = list(rows_all_no_partial)
 
     day_metrics = build_metrics(rows_daily)
     month_metrics = build_metrics(rows_month)
@@ -483,9 +579,42 @@ def main():
     total_metrics["mdd"] = _mdd_pct(rows_total, _safe_initial_capital()) if rows_total else 0.0
     by_strategy = build_strategy_metrics_month(rows_month)
 
+    initial_capital = _safe_initial_capital()
+    daily_pnl_krw, daily_pnl_pct, _, _ = _calc_window_pnl_krw_pct(
+        rows_all_no_partial,
+        day_start,
+        report_end,
+        initial_capital,
+    )
+    month_pnl_krw, month_pnl_pct, _, _ = _calc_window_pnl_krw_pct(
+        rows_all_no_partial,
+        month_start,
+        report_end,
+        initial_capital,
+    )
+    total_equity = _equity_after_rows(rows_all_no_partial, initial_capital)
+    pnl_amounts = {
+        "daily_krw": float(daily_pnl_krw),
+        "daily_pct": float(daily_pnl_pct),
+        "month_krw": float(month_pnl_krw),
+        "month_pct": float(month_pnl_pct),
+        "total_krw": float(total_equity - initial_capital),
+    }
+
+    snapshot = _safe_account_snapshot(log_line)
+
     write_summary_csv(SUMMARY_CSV, day_metrics, month_metrics, total_metrics, by_strategy)
-    save_month_equity_png(MONTH_PNG, rows_month, month_start, report_end)
-    log_line(f"[OK] wrote {SUMMARY_CSV} and {MONTH_PNG}")
+    month_png_ready = False
+    try:
+        save_month_equity_png(MONTH_PNG, rows_month, month_start, report_end)
+        month_png_ready = bool(os.path.exists(MONTH_PNG))
+    except Exception as e:
+        month_png_ready = False
+        log_line(f"[WARN] month equity image skipped: {type(e).__name__}: {e}")
+    if month_png_ready:
+        log_line(f"[OK] wrote {SUMMARY_CSV} and {MONTH_PNG}")
+    else:
+        log_line(f"[OK] wrote {SUMMARY_CSV}")
 
     if args.xlsx:
         ok, err = write_xlsx_if_requested(SUMMARY_XLSX, day_metrics, month_metrics, total_metrics, by_strategy)
@@ -494,7 +623,16 @@ def main():
         else:
             log_line(f"[WARN] xlsx skipped: {err}")
 
-    text = build_report_text(report_end, day_start, day_metrics, month_metrics, total_metrics, by_strategy)
+    text = build_report_text(
+        report_end=report_end,
+        day_start=day_start,
+        day=day_metrics,
+        month=month_metrics,
+        overall=total_metrics,
+        by_strategy=by_strategy,
+        snapshot=snapshot,
+        pnl_amounts=pnl_amounts,
+    )
 
     if not has_telegram_credentials():
         log_line("[WARN] TELEGRAM_TOKEN/TELEGRAM_CHAT_ID missing; report notifications will be queued to spool")
@@ -505,11 +643,14 @@ def main():
     else:
         log_line("[WARN] telegram text send failed or queued to spool")
 
-    photo_ok = bool(tg_notify_photo(event_type="DAILY_REPORT", photo_path=MONTH_PNG))
-    if photo_ok:
-        log_line("[OK] telegram photo sent")
+    if month_png_ready:
+        photo_ok = bool(tg_notify_photo(event_type="DAILY_REPORT", photo_path=MONTH_PNG))
+        if photo_ok:
+            log_line("[OK] telegram photo sent")
+        else:
+            log_line("[WARN] telegram photo send failed or queued to spool")
     else:
-        log_line("[WARN] telegram photo send failed or queued to spool")
+        log_line("[WARN] telegram photo skipped: equity image unavailable")
 
 
 if __name__ == "__main__":

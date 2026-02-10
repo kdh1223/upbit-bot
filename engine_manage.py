@@ -187,6 +187,10 @@ def _safe_nonneg_float(value, default: float = 0.0) -> float:
 
 def _normalize_exit_reason(raw_reason: str) -> str:
     s = str(raw_reason or "").lower().strip()
+    if "runner_trail" in s:
+        return "RUNNER_TRAIL"
+    if "runner_timeout" in s:
+        return "RUNNER_TIMEOUT"
     if ("stop" in s) or ("sl" in s):
         return "STOPLOSS"
     if "trail" in s:
@@ -194,6 +198,11 @@ def _normalize_exit_reason(raw_reason: str) -> str:
     if ("tp2" in s) or ("take_profit" in s):
         return "TP2"
     return "FORCE_CLOSE"
+
+
+def _is_partial_trade_reason(raw_reason: str) -> bool:
+    code = str(raw_reason or "").strip().upper()
+    return code in {"TP1", "TP2_PARTIAL"}
 
 
 def manage_positions(
@@ -244,6 +253,37 @@ def manage_positions(
             now=now,
             strategy_tag=strategy,
         )
+
+        partial_rows = result.get("partials", []) if isinstance(result, dict) else []
+        if partial_rows:
+            entry_for_partial = float(s.get("entry", 0.0))
+            trade_log_path = trade_log_path_for(now)
+            for p in partial_rows:
+                reason = str((p or {}).get("reason", "")).strip().upper()
+                if not _is_partial_trade_reason(reason):
+                    continue
+                part_price = _safe_nonneg_float((p or {}).get("price", float(cur)), float(cur))
+                part_qty = _safe_nonneg_float((p or {}).get("qty", 0.0), 0.0)
+                part_pnl = (float(part_price) / entry_for_partial - 1.0) * 100.0 if entry_for_partial > 0 else 0.0
+                append_trade_log(
+                    trade_log_path,
+                    [
+                        now.strftime("%Y-%m-%d %H:%M:%S"),
+                        ticker,
+                        f"{entry_for_partial:.6f}",
+                        f"{float(part_price):.6f}",
+                        f"{float(part_pnl):.2f}",
+                        reason,
+                        s.get("regime", ""),
+                        strategy,
+                    ],
+                )
+                if bool(getattr(config, "DEBUG_TRADE_FLOW", False)):
+                    print(
+                        f"[PARTIAL_LOG] {ticker} reason={reason} qty={float(part_qty):.8f} "
+                        f"price={float(part_price):.6f} pnl={float(part_pnl):+.2f}%"
+                    )
+            save_state_fn(state, cooldown_until)
 
         if result.get("closed"):
             if bool(getattr(config, "REAL_ORDER", False)):
@@ -334,6 +374,15 @@ def manage_positions(
             s["initial_volume"] = 0.0
             s["tp1"] = False
             s["tp2"] = False
+            s["tp1_done"] = False
+            s["tp2_done"] = False
+            s["runner_active"] = False
+            s["runner_hwm"] = 0.0
+            s["runner_start_ts"] = 0.0
+            s["tp1_ratio"] = 0.0
+            s["tp2_ratio"] = 0.0
+            s["runner_ratio"] = 0.0
+            s["entry_mode"] = ""
             s["realized_krw"] = 0.0
             s["realized_cost_krw"] = 0.0
             s["total_buy_krw"] = 0.0

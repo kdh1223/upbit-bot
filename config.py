@@ -167,6 +167,18 @@ TRAIL_DRAWDOWN_PCT = None
 # MAIN one-shot take profit (ratio). 0 disables.
 MAIN_TP_ONE_PCT = 0.0
 
+# MAIN staged take-profit profile by AUTO_STRATEGY_MODE.
+# The ratios are normalized at runtime and persisted per-position on entry.
+MAIN_TP_RATIOS = {
+    "CONSERVATIVE": {"TP1": 0.60, "TP2": 0.30, "RUNNER": 0.10},
+    "AGGRESSIVE": {"TP1": 0.40, "TP2": 0.40, "RUNNER": 0.20},
+}
+
+# MAIN runner (remaining size after TP2 partial) controls
+MAIN_RUNNER_TRAIL_GIVEBACK_PCT = 0.007
+MAIN_RUNNER_MAX_HOLD_MIN = 120
+MAIN_RUNNER_TIMEOUT_CLOSE_IF_PNL_GE = 0.0
+
 TP_SL_BY_HOLDINGS = {
     2: {
         "tp1": 0.008,
@@ -285,6 +297,15 @@ ENTRY_VOL_MULT = 1.2
 ENTRY_USE_BREAKOUT = True
 ENTRY_BREAKOUT_LOOKBACK = 20
 ENTRY_REQUIRE_RSI_UPTURN = False
+
+# MAIN additional 1m confirmation (applied only in CONSERVATIVE mode)
+USE_1M_CONFIRM_FOR_MAIN = True
+MAIN_CONFIRM_1M_INTERVAL = "minute1"
+MAIN_CONFIRM_1M_RSI_PERIOD = 14
+MAIN_CONFIRM_1M_RSI_DELTA_MIN = 0.3
+MAIN_CONFIRM_1M_REQUIRE_REBOUND = True
+MAIN_CONFIRM_1M_CACHE_SEC = 5
+
 MAIN_FILTER_REJECT_SUMMARY_MIN = 10
 MAIN_FILTER_REJECT_SUMMARY_TOPN = 6
 

@@ -61,7 +61,7 @@ AUTO_PARAM_SETS = {
         },
         "MAIN": {
             "sl_one": -0.009,
-            "tp_one": 0.012,
+            "tp_one": 0.0,
             "trail_from": 0.006,
             "trail_giveback": 0.006,
         },
@@ -76,7 +76,7 @@ AUTO_PARAM_SETS = {
         },
         "MAIN": {
             "sl_one": -0.012,
-            "tp_one": 0.020,
+            "tp_one": 0.0,
             "trail_from": 0.008,
             "trail_giveback": 0.008,
         },
@@ -410,6 +410,11 @@ def _fmt_qty(qty: float) -> str:
     return txt or "0"
 
 
+def _is_partial_trade_reason(raw_reason: str) -> bool:
+    code = str(raw_reason or "").strip().upper()
+    return code in {"TP1", "TP2_PARTIAL"}
+
+
 def _calc_monthly_stats(now: dt.datetime, trade_log_path: str):
     month_prefix = now.strftime("%Y-%m")
     total = 0
@@ -428,6 +433,9 @@ def _calc_monthly_stats(now: dt.datetime, trade_log_path: str):
 
                 ts = str(row[0]).strip()
                 if not ts.startswith(month_prefix):
+                    continue
+                reason = str(row[5]).strip() if len(row) > 5 else ""
+                if _is_partial_trade_reason(reason):
                     continue
 
                 try:
@@ -457,8 +465,14 @@ def _normalize_order_reason(raw_reason: str) -> str:
     s_raw = str(raw_reason or "").strip()
     s = s_raw.lower()
     s_up = s_raw.upper()
-    if s_up in {"ENTRY", "TP1", "TP2", "TRAILING", "SL", "FORCE_CLOSE"}:
+    if s_up in {"ENTRY", "TP1", "TP2", "TP2_PARTIAL", "RUNNER_TRAIL", "RUNNER_TIMEOUT", "TRAILING", "SL", "FORCE_CLOSE"}:
         return s_up
+    if "tp2_partial" in s:
+        return "TP2_PARTIAL"
+    if "runner_trail" in s:
+        return "RUNNER_TRAIL"
+    if "runner_timeout" in s:
+        return "RUNNER_TIMEOUT"
     if "tp1" in s:
         return "TP1"
     if "tp2" in s or "take_profit" in s:
@@ -476,8 +490,12 @@ def _normalize_exit_reason(raw_reason: str) -> str:
     s_raw = str(raw_reason or "").strip()
     s = s_raw.lower()
     s_up = s_raw.upper()
-    if s_up in {"TP2", "TRAILING", "STOPLOSS", "FORCE_CLOSE"}:
+    if s_up in {"TP2", "RUNNER_TRAIL", "RUNNER_TIMEOUT", "TRAILING", "STOPLOSS", "FORCE_CLOSE"}:
         return s_up
+    if "runner_trail" in s:
+        return "RUNNER_TRAIL"
+    if "runner_timeout" in s:
+        return "RUNNER_TIMEOUT"
     if "tp2" in s or "take_profit" in s:
         return "TP2"
     if "trail" in s:
@@ -493,6 +511,10 @@ def _close_event_type(raw_reason: str) -> str:
     exit_reason = _normalize_exit_reason(raw_reason)
     if exit_reason == "TP2":
         return "TP2_HIT"
+    if exit_reason == "RUNNER_TRAIL":
+        return "TRAILING_EXIT"
+    if exit_reason == "RUNNER_TIMEOUT":
+        return "FORCE_CLOSE"
     if exit_reason == "TRAILING":
         return "TRAILING_EXIT"
     if exit_reason == "STOPLOSS":
@@ -757,6 +779,17 @@ def _repair_cross_strategy_duplicate_holdings(strategy_state: dict):
         s["initial_volume"] = 0.0
         s["realized_krw"] = 0.0
         s["realized_cost_krw"] = 0.0
+        s["tp1"] = False
+        s["tp2"] = False
+        s["tp1_done"] = False
+        s["tp2_done"] = False
+        s["runner_active"] = False
+        s["runner_hwm"] = 0.0
+        s["runner_start_ts"] = 0.0
+        s["tp1_ratio"] = 0.0
+        s["tp2_ratio"] = 0.0
+        s["runner_ratio"] = 0.0
+        s["entry_mode"] = ""
         s["entry_ts"] = 0.0
         s["trail_armed"] = False
         s["trail_hwm"] = 0.0
@@ -1869,6 +1902,7 @@ def run():
                         global_holding_tickers=_all_holding_tickers_with_scalp_btc(strategy_state, scalp_btc_state),
                         before_buy_fn=before_main_buy,
                         entry_params=entry_params.get("MAIN") if isinstance(entry_params, dict) else None,
+                        main_mode=entry_param_mode,
                         runtime_risk_state=runtime_risk_state,
                         equity=equity,
                     )

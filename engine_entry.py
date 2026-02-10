@@ -3,8 +3,9 @@
 import time
 
 import config
+import pyupbit
 import position_manager
-from indicators import check_filters, intraday_trend_ok, minute_entry_ok, scalp_entry_signal
+from indicators import check_filters, get_rsi, intraday_trend_ok, minute_entry_ok, safe_last, scalp_entry_signal
 from strategy import calc_target
 from utils.telegram_notify import notify_event, notify_order
 
@@ -41,7 +42,102 @@ def _is_cooldown_active(now, until) -> bool:
             return False
 
 
-def entry_passes_filters(ticker: str, now, day_cache, intraday_cache, minute_cache) -> bool:
+def _normalize_main_mode(mode: str) -> str:
+    m = str(mode or "CONSERVATIVE").upper().strip()
+    if m not in {"AGGRESSIVE", "CONSERVATIVE"}:
+        m = "CONSERVATIVE"
+    return m
+
+
+def _normalize_main_tp_ratios(tp1, tp2, runner):
+    try:
+        a = max(0.0, float(tp1))
+    except Exception:
+        a = 0.0
+    try:
+        b = max(0.0, float(tp2))
+    except Exception:
+        b = 0.0
+    try:
+        c = max(0.0, float(runner))
+    except Exception:
+        c = 0.0
+
+    total = a + b + c
+    if total <= 0:
+        a, b, c = 0.60, 0.30, 0.10
+        total = 1.0
+    return a / total, b / total, c / total
+
+
+def _resolve_main_tp_ratios(mode: str):
+    normalized_mode = _normalize_main_mode(mode)
+    table = getattr(config, "MAIN_TP_RATIOS", {}) or {}
+    row = table.get(normalized_mode)
+    if not isinstance(row, dict):
+        row = table.get("CONSERVATIVE", {})
+    if not isinstance(row, dict):
+        row = {"TP1": 0.60, "TP2": 0.30, "RUNNER": 0.10}
+
+    return _normalize_main_tp_ratios(
+        row.get("TP1", 0.60),
+        row.get("TP2", 0.30),
+        row.get("RUNNER", 0.10),
+    )
+
+
+def _apply_main_tp_profile_on_entry(state_row: dict, mode: str):
+    tp1_ratio, tp2_ratio, runner_ratio = _resolve_main_tp_ratios(mode)
+    state_row["entry_mode"] = _normalize_main_mode(mode)
+    state_row["tp1_ratio"] = float(tp1_ratio)
+    state_row["tp2_ratio"] = float(tp2_ratio)
+    state_row["runner_ratio"] = float(runner_ratio)
+    state_row["tp1_done"] = False
+    state_row["tp2_done"] = False
+    state_row["runner_active"] = False
+    state_row["runner_hwm"] = 0.0
+    state_row["runner_start_ts"] = 0.0
+    # Keep legacy flags in sync for compatibility.
+    state_row["tp1"] = False
+    state_row["tp2"] = False
+
+
+def _main_1m_confirm_ok(ticker: str) -> tuple[bool, str]:
+    interval = str(getattr(config, "MAIN_CONFIRM_1M_INTERVAL", "minute1"))
+    rsi_period = max(2, int(getattr(config, "MAIN_CONFIRM_1M_RSI_PERIOD", 14)))
+    min_needed = max(30, rsi_period + 3)
+    try:
+        df = pyupbit.get_ohlcv(ticker, interval=interval, count=min_needed + 10)
+    except Exception:
+        return True, "FETCH_ERROR"
+    if df is None or len(df) < min_needed:
+        return True, "DATA_SHORT"
+
+    try:
+        rsi = get_rsi(df, rsi_period)
+        rsi_now = safe_last(rsi)
+        rsi_prev = float(rsi.iloc[-2])
+        close_now = safe_last(df["close"])
+        close_prev = safe_last(df["close"].iloc[:-1])
+        if None in (rsi_now, close_now, close_prev):
+            return True, "DATA_NAN"
+        if rsi_prev != rsi_prev:
+            return True, "RSI_PREV_NAN"
+    except Exception:
+        return True, "CALC_ERROR"
+
+    delta_min = float(getattr(config, "MAIN_CONFIRM_1M_RSI_DELTA_MIN", 0.3))
+    if (float(rsi_now) - float(rsi_prev)) < delta_min:
+        return False, "RSI_DELTA_LOW"
+
+    if bool(getattr(config, "MAIN_CONFIRM_1M_REQUIRE_REBOUND", True)):
+        if not (float(close_now) > float(close_prev)):
+            return False, "REBOUND_NOT_CONFIRMED"
+
+    return True, "OK"
+
+
+def entry_passes_filters(ticker: str, now, day_cache, intraday_cache, minute_cache, main_mode: str = "CONSERVATIVE") -> bool:
     # Daily filter cache
     cached = day_cache.get(ticker)
     if cached and (now - cached[1]).total_seconds() < float(getattr(config, "DAY_FILTER_CACHE_SEC", 60)):
@@ -78,6 +174,22 @@ def entry_passes_filters(ticker: str, now, day_cache, intraday_cache, minute_cac
         minute_cache[ticker] = (ok_m, now)
     if not ok_m:
         return False
+
+    mode = _normalize_main_mode(main_mode)
+    use_1m_confirm = bool(getattr(config, "USE_1M_CONFIRM_FOR_MAIN", True))
+    if use_1m_confirm and mode == "CONSERVATIVE":
+        key = f"main_1m::{ticker}"
+        cached4 = minute_cache.get(key)
+        cache_sec = max(0.0, float(getattr(config, "MAIN_CONFIRM_1M_CACHE_SEC", 5)))
+        if cached4 and (now - cached4[1]).total_seconds() < cache_sec:
+            ok_1m, reason_1m = cached4[0], cached4[2]
+        else:
+            ok_1m, reason_1m = _main_1m_confirm_ok(ticker)
+            minute_cache[key] = (ok_1m, now, str(reason_1m))
+        if not ok_1m:
+            if bool(getattr(config, "DEBUG_ENTRY_REJECT", False)):
+                print(f"[MAIN_1M_CONFIRM_REJECT] {ticker} {reason_1m}")
+            return False
 
     return True
 
@@ -123,6 +235,7 @@ def try_main_entries(
     global_holding_tickers=None,
     before_buy_fn=None,
     entry_params=None,
+    main_mode: str = "CONSERVATIVE",
     runtime_risk_state=None,
     equity=None,
 ):
@@ -178,7 +291,14 @@ def try_main_entries(
             if not can_new:
                 continue
 
-        if not entry_passes_filters(ticker, now, day_cache, intraday_cache, minute_cache):
+        if not entry_passes_filters(
+            ticker,
+            now,
+            day_cache,
+            intraday_cache,
+            minute_cache,
+            main_mode=main_mode,
+        ):
             continue
 
         cur = prices.get(ticker)
@@ -245,9 +365,11 @@ def try_main_entries(
                 entry_ts=float(now.timestamp()),
             )
             state[ticker]["entry_bucket"] = "CORE"
+            _apply_main_tp_profile_on_entry(state[ticker], mode=main_mode)
             if isinstance(entry_params, dict):
                 state[ticker]["sl_one_pct"] = abs(float(entry_params.get("sl_one", 0.0)))
-                state[ticker]["tp_one_pct"] = max(0.0, float(entry_params.get("tp_one", 0.0)))
+                # MAIN always uses TP1/TP2/RUNNER staged exits.
+                state[ticker]["tp_one_pct"] = None
                 state[ticker]["trail_from_pct"] = max(0.0, float(entry_params.get("trail_from", 0.0)))
                 state[ticker]["trail_giveback_pct"] = max(0.0, float(entry_params.get("trail_giveback", 0.0)))
 

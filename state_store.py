@@ -199,6 +199,67 @@ def _normalize_position_state(raw: dict):
     s["trail_from_pct"] = _as_optional_pct("trail_from_pct")
     s["trail_giveback_pct"] = _as_optional_pct("trail_giveback_pct")
 
+    def _as_nonneg_ratio(key):
+        if key not in s:
+            return None
+        try:
+            value = float(s.get(key))
+        except Exception:
+            return None
+        if value < 0:
+            return None
+        return float(value)
+
+    stage_tag = str(s.get("strategy_tag") or "MAIN").upper().strip()
+    s["tp1_done"] = bool(s.get("tp1_done", s.get("tp1", False)))
+    s["tp2_done"] = bool(s.get("tp2_done", s.get("tp2", False)))
+    s["tp1"] = bool(s["tp1_done"])
+    s["tp2"] = bool(s["tp2_done"])
+
+    if stage_tag == "MAIN":
+        tp1_ratio = _as_nonneg_ratio("tp1_ratio")
+        tp2_ratio = _as_nonneg_ratio("tp2_ratio")
+        runner_ratio = _as_nonneg_ratio("runner_ratio")
+        if None in (tp1_ratio, tp2_ratio, runner_ratio):
+            table = getattr(config, "MAIN_TP_RATIOS", {}) or {}
+            mode = str(s.get("entry_mode") or "CONSERVATIVE").upper().strip()
+            row = table.get(mode) if isinstance(table.get(mode), dict) else table.get("CONSERVATIVE", {})
+            if not isinstance(row, dict):
+                row = {"TP1": 0.60, "TP2": 0.30, "RUNNER": 0.10}
+            tp1_ratio = max(0.0, float(row.get("TP1", 0.60)))
+            tp2_ratio = max(0.0, float(row.get("TP2", 0.30)))
+            runner_ratio = max(0.0, float(row.get("RUNNER", 0.10)))
+        total_ratio = float(tp1_ratio) + float(tp2_ratio) + float(runner_ratio)
+        if total_ratio <= 0:
+            tp1_ratio, tp2_ratio, runner_ratio = 0.60, 0.30, 0.10
+            total_ratio = 1.0
+        s["tp1_ratio"] = float(tp1_ratio / total_ratio)
+        s["tp2_ratio"] = float(tp2_ratio / total_ratio)
+        s["runner_ratio"] = float(runner_ratio / total_ratio)
+        s["runner_active"] = bool(s.get("runner_active", False))
+        try:
+            runner_hwm = float(s.get("runner_hwm", 0.0))
+        except Exception:
+            runner_hwm = 0.0
+        s["runner_hwm"] = max(0.0, float(runner_hwm))
+        runner_start_ts = _parse_ts(s.get("runner_start_ts"))
+        s["runner_start_ts"] = float(runner_start_ts) if runner_start_ts is not None else 0.0
+        mode = str(s.get("entry_mode") or "CONSERVATIVE").upper().strip()
+        s["entry_mode"] = mode if mode in {"AGGRESSIVE", "CONSERVATIVE"} else "CONSERVATIVE"
+
+        if not bool(s.get("holding", False)):
+            s["runner_active"] = False
+            s["runner_hwm"] = 0.0
+            s["runner_start_ts"] = 0.0
+    else:
+        s["runner_active"] = bool(s.get("runner_active", False))
+        try:
+            s["runner_hwm"] = max(0.0, float(s.get("runner_hwm", 0.0)))
+        except Exception:
+            s["runner_hwm"] = 0.0
+        runner_start_ts = _parse_ts(s.get("runner_start_ts"))
+        s["runner_start_ts"] = float(runner_start_ts) if runner_start_ts is not None else 0.0
+
     try:
         buy_krw = float(s.get("total_buy_krw", s.get("invested_krw", 0.0)))
     except Exception:
@@ -454,6 +515,17 @@ def _repair_strategy_state_with_balance(upbit, state: dict, strategy_tag: str = 
             s["invested_krw"] = 0.0
             s["target_krw"] = 0.0
             s["initial_volume"] = 0.0
+            s["tp1"] = False
+            s["tp2"] = False
+            s["tp1_done"] = False
+            s["tp2_done"] = False
+            s["runner_active"] = False
+            s["runner_hwm"] = 0.0
+            s["runner_start_ts"] = 0.0
+            s["tp1_ratio"] = 0.0
+            s["tp2_ratio"] = 0.0
+            s["runner_ratio"] = 0.0
+            s["entry_mode"] = ""
             s["realized_krw"] = 0.0
             s["realized_cost_krw"] = 0.0
             s["total_buy_krw"] = 0.0

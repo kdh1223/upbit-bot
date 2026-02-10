@@ -85,6 +85,12 @@ def _record_sell_krw(state: dict, qty: float, price: float):
 
 def _reason_code_from_fail_reason(fail_reason: str) -> str:
     raw = str(fail_reason or "").lower()
+    if "tp2_partial" in raw:
+        return "TP2_PARTIAL"
+    if "runner_trail" in raw:
+        return "RUNNER_TRAIL"
+    if "runner_timeout" in raw:
+        return "RUNNER_TIMEOUT"
     if "tp1" in raw:
         return "TP1"
     if "tp2" in raw:
@@ -233,12 +239,98 @@ def _resolve_trail_drawdown_pct(regime_trail_back: float) -> float:
     return 0.6
 
 
+def _is_main_strategy(strategy_tag: str) -> bool:
+    return str(strategy_tag or "").upper().strip() == "MAIN"
+
+
+def _normalize_main_mode(mode: str) -> str:
+    m = str(mode or "CONSERVATIVE").upper().strip()
+    if m not in {"AGGRESSIVE", "CONSERVATIVE"}:
+        m = "CONSERVATIVE"
+    return m
+
+
+def _normalize_main_ratios(tp1, tp2, runner):
+    a = _as_nonneg_float(tp1, 0.0)
+    b = _as_nonneg_float(tp2, 0.0)
+    c = _as_nonneg_float(runner, 0.0)
+    total = a + b + c
+    if total <= 0:
+        return 0.60, 0.30, 0.10
+    return float(a / total), float(b / total), float(c / total)
+
+
+def _main_ratios_from_mode(mode: str):
+    normalized_mode = _normalize_main_mode(mode)
+    table = getattr(config, "MAIN_TP_RATIOS", {}) or {}
+    row = table.get(normalized_mode)
+    if not isinstance(row, dict):
+        row = table.get("CONSERVATIVE", {})
+    if not isinstance(row, dict):
+        row = {"TP1": 0.60, "TP2": 0.30, "RUNNER": 0.10}
+    return _normalize_main_ratios(
+        row.get("TP1", 0.60),
+        row.get("TP2", 0.30),
+        row.get("RUNNER", 0.10),
+    )
+
+
+def _ensure_main_stage_state(state: dict, now_ts: float, cur: float):
+    mode = _normalize_main_mode(state.get("entry_mode"))
+    state["entry_mode"] = mode
+
+    fallback_tp1, fallback_tp2, fallback_runner = _main_ratios_from_mode(mode)
+    state_tp1, state_tp2, state_runner = _normalize_main_ratios(
+        state.get("tp1_ratio", fallback_tp1),
+        state.get("tp2_ratio", fallback_tp2),
+        state.get("runner_ratio", fallback_runner),
+    )
+    state["tp1_ratio"] = float(state_tp1)
+    state["tp2_ratio"] = float(state_tp2)
+    state["runner_ratio"] = float(state_runner)
+
+    tp1_done = bool(state.get("tp1_done", state.get("tp1", False)))
+    tp2_done = bool(state.get("tp2_done", state.get("tp2", False)))
+    state["tp1_done"] = bool(tp1_done)
+    state["tp2_done"] = bool(tp2_done)
+    state["tp1"] = bool(tp1_done)
+    state["tp2"] = bool(tp2_done)
+
+    state["runner_active"] = bool(state.get("runner_active", False))
+    state["runner_hwm"] = _as_nonneg_float(state.get("runner_hwm", 0.0), 0.0)
+    runner_start_ts = _parse_timestamp(state.get("runner_start_ts"))
+    state["runner_start_ts"] = float(runner_start_ts) if runner_start_ts is not None else 0.0
+
+    if not bool(state.get("holding", False)):
+        state["runner_active"] = False
+        state["runner_hwm"] = 0.0
+        state["runner_start_ts"] = 0.0
+        return
+
+    # Recovery path: if TP2 already done but runner fields were missing, re-arm safely.
+    if state["tp2_done"] and (not state["runner_active"]):
+        state["runner_active"] = True
+        state["runner_hwm"] = max(float(cur), _as_nonneg_float(state.get("runner_hwm", 0.0), 0.0))
+        if float(state.get("runner_start_ts", 0.0)) <= 0:
+            state["runner_start_ts"] = float(now_ts)
+
+
+def _estimate_entry_qty(state: dict, entry: float) -> float:
+    if entry > 0:
+        total_buy_krw = _as_nonneg_float(state.get("total_buy_krw", state.get("invested_krw", 0.0)), 0.0)
+        if total_buy_krw > 0:
+            return float(total_buy_krw / entry)
+    return _as_nonneg_float(state.get("initial_volume", 0.0), 0.0)
+
+
 def apply_risk_rules(upbit, ticker: str, state: dict, cur: float, market_sell, now=None, strategy_tag: str = "MAIN"):
     now_ts = _now_ts(now)
     entry = float(state.get("entry", 0.0))
     if entry <= 0:
         return {"closed": False}
     _ensure_position_accounting(state, strategy_tag=strategy_tag)
+    tag = str(state.get("strategy_tag") or strategy_tag or "MAIN").upper().strip() or "MAIN"
+    is_main = _is_main_strategy(tag)
 
     _ensure_trail_state(state, now_ts)
     state["peak"] = max(float(state.get("peak", entry)), float(cur))
@@ -255,6 +347,11 @@ def apply_risk_rules(upbit, ticker: str, state: dict, cur: float, market_sell, n
     trail_giveback = _get_state_pct(state, "trail_giveback_pct", None)
     trail_arm_sec = max(0.0, float(getattr(config, "TRAIL_ARM_SEC", 120)))
     trail_arm_pct = float(getattr(config, "TRAIL_ARM_PCT", 0.5))
+    partials = []
+
+    if is_main:
+        _ensure_main_stage_state(state, now_ts=now_ts, cur=float(cur))
+        tp_one = None
 
     vol = _get_volume(upbit, ticker, state)
 
@@ -262,13 +359,15 @@ def apply_risk_rules(upbit, ticker: str, state: dict, cur: float, market_sell, n
         if bool(getattr(config, "DUST_CLOSE_AS_CLOSED", True)):
             state["holding"] = False
             state["last_exit_reason"] = "FORCE_CLOSE"
+            state["runner_active"] = False
             return {
                 "closed": True,
                 "reason": "dust(<min_order)",
                 "exit_price": float(cur),
                 "close_qty": float(vol),
+                "partials": partials,
             }
-        return {"closed": False}
+        return {"closed": False, "partials": partials}
 
     # 1) stop loss full close
     # In the early post-entry window, force fixed SL only (no ATR stop widening/tightening).
@@ -286,24 +385,235 @@ def apply_risk_rules(upbit, ticker: str, state: dict, cur: float, market_sell, n
                 vol,
                 market_sell,
                 "stop_loss_sell_failed",
-                strategy_tag=strategy_tag,
+                strategy_tag=tag,
                 cur_price=float(cur),
             )
             if not ok:
-                return {"closed": False, "reason": err}
+                return {"closed": False, "reason": err, "partials": partials}
             _record_realized(state, vol, float(cur))
             _record_sell_krw(state, vol, float(cur))
             if not _is_real_order():
                 _mock_reduce_volume(state, vol)
 
         state["holding"] = False
+        state["runner_active"] = False
         state["last_exit_reason"] = "STOPLOSS"
         return {
             "closed": True,
             "reason": "stoploss",
             "exit_price": float(cur),
             "close_qty": float(max(0.0, vol)),
+            "partials": partials,
         }
+
+    if is_main:
+        def _close_main_dust_after_partial():
+            vol_now = _get_volume(upbit, ticker, state)
+            if vol_now <= 0:
+                state["holding"] = False
+                state["runner_active"] = False
+                state["last_exit_reason"] = "FORCE_CLOSE"
+                return {
+                    "closed": True,
+                    "reason": "dust(<min_order)",
+                    "exit_price": float(cur),
+                    "close_qty": 0.0,
+                    "partials": partials,
+                }
+            if _can_order(float(cur), vol_now):
+                return None
+            if not bool(getattr(config, "DUST_CLOSE_AS_CLOSED", True)):
+                return None
+            state["holding"] = False
+            state["runner_active"] = False
+            state["last_exit_reason"] = "FORCE_CLOSE"
+            return {
+                "closed": True,
+                "reason": "dust(<min_order)",
+                "exit_price": float(cur),
+                "close_qty": float(vol_now),
+                "partials": partials,
+            }
+
+        # MAIN staged TP1 partial
+        if (not bool(state.get("tp1_done", False))) and tp1 > 0 and pnl >= tp1:
+            vol = _get_volume(upbit, ticker, state)
+            if vol > 0:
+                base_qty = _estimate_entry_qty(state, entry)
+                target_qty = max(0.0, float(base_qty) * float(state.get("tp1_ratio", 0.0)))
+                sell_qty = min(float(target_qty), float(vol))
+                if sell_qty > 0 and _can_order(float(cur), sell_qty):
+                    if bool(getattr(config, "DEBUG_TRADE_FLOW", False)):
+                        print(f"[TP1_익절][MAIN] {ticker} pnl={pnl:.4f}")
+                    ok, err = _execute_sell(
+                        upbit,
+                        ticker,
+                        sell_qty,
+                        market_sell,
+                        "tp1_sell_failed",
+                        strategy_tag=tag,
+                        cur_price=float(cur),
+                    )
+                    if not ok:
+                        return {"closed": False, "reason": err, "partials": partials}
+                    _record_realized(state, sell_qty, float(cur))
+                    _record_sell_krw(state, sell_qty, float(cur))
+                    if not _is_real_order():
+                        _mock_reduce_volume(state, sell_qty)
+                    state["tp1_done"] = True
+                    state["tp1"] = True
+                    notify_order(
+                        event_type="ORDER_PARTIAL_FILL",
+                        strategy_tag=tag,
+                        ticker=ticker,
+                        price=float(cur),
+                        qty=float(sell_qty),
+                        reason="TP1",
+                    )
+                    partials.append(
+                        {
+                            "reason": "TP1",
+                            "qty": float(sell_qty),
+                            "price": float(cur),
+                            "pnl_pct": float(pnl * 100.0),
+                        }
+                    )
+                    dust_closed = _close_main_dust_after_partial()
+                    if dust_closed:
+                        return dust_closed
+
+        # MAIN staged TP2 partial -> activate runner
+        if (not bool(state.get("tp2_done", False))) and tp2 > 0 and pnl >= tp2:
+            vol = _get_volume(upbit, ticker, state)
+            if vol > 0:
+                base_qty = _estimate_entry_qty(state, entry)
+                target_qty = max(0.0, float(base_qty) * float(state.get("tp2_ratio", 0.0)))
+                # Never allow TP2 step to close the position fully.
+                max_sell = max(0.0, float(vol) * (1.0 - 1e-9))
+                sell_qty = min(float(target_qty), float(max_sell))
+                if sell_qty > 0 and _can_order(float(cur), sell_qty):
+                    if bool(getattr(config, "DEBUG_TRADE_FLOW", False)):
+                        print(f"[TP2_익절][MAIN] {ticker} pnl={pnl:.4f}")
+                    ok, err = _execute_sell(
+                        upbit,
+                        ticker,
+                        sell_qty,
+                        market_sell,
+                        "tp2_partial_sell_failed",
+                        strategy_tag=tag,
+                        cur_price=float(cur),
+                    )
+                    if not ok:
+                        return {"closed": False, "reason": err, "partials": partials}
+                    _record_realized(state, sell_qty, float(cur))
+                    _record_sell_krw(state, sell_qty, float(cur))
+                    if not _is_real_order():
+                        _mock_reduce_volume(state, sell_qty)
+                    state["tp2_done"] = True
+                    state["tp2"] = True
+                    state["runner_active"] = True
+                    state["runner_hwm"] = float(cur)
+                    state["runner_start_ts"] = float(now_ts)
+                    notify_order(
+                        event_type="ORDER_PARTIAL_FILL",
+                        strategy_tag=tag,
+                        ticker=ticker,
+                        price=float(cur),
+                        qty=float(sell_qty),
+                        reason="TP2_PARTIAL",
+                    )
+                    partials.append(
+                        {
+                            "reason": "TP2_PARTIAL",
+                            "qty": float(sell_qty),
+                            "price": float(cur),
+                            "pnl_pct": float(pnl * 100.0),
+                        }
+                    )
+                    dust_closed = _close_main_dust_after_partial()
+                    if dust_closed:
+                        return dust_closed
+
+        # MAIN runner management: trailing giveback and timeout exit.
+        if bool(state.get("runner_active", False)):
+            state["runner_hwm"] = max(
+                _as_nonneg_float(state.get("runner_hwm", 0.0), 0.0),
+                float(cur),
+            )
+            runner_hwm = _as_nonneg_float(state.get("runner_hwm", 0.0), 0.0)
+            trail_giveback = max(0.0, float(getattr(config, "MAIN_RUNNER_TRAIL_GIVEBACK_PCT", 0.007)))
+            trail_hit = False
+            if runner_hwm > 0 and trail_giveback > 0:
+                cut_price = float(runner_hwm) * (1.0 - float(trail_giveback))
+                trail_hit = float(cur) <= float(cut_price)
+
+            if trail_hit:
+                vol = _get_volume(upbit, ticker, state)
+                if vol > 0 and _can_order(float(cur), vol):
+                    ok, err = _execute_sell(
+                        upbit,
+                        ticker,
+                        vol,
+                        market_sell,
+                        "runner_trail_sell_failed",
+                        strategy_tag=tag,
+                        cur_price=float(cur),
+                    )
+                    if not ok:
+                        return {"closed": False, "reason": err, "partials": partials}
+                    _record_realized(state, vol, float(cur))
+                    _record_sell_krw(state, vol, float(cur))
+                    if not _is_real_order():
+                        _mock_reduce_volume(state, vol)
+                state["holding"] = False
+                state["runner_active"] = False
+                state["last_exit_reason"] = "RUNNER_TRAIL"
+                return {
+                    "closed": True,
+                    "reason": "RUNNER_TRAIL",
+                    "exit_price": float(cur),
+                    "close_qty": float(max(0.0, vol)),
+                    "partials": partials,
+                }
+
+            runner_start_ts = _as_nonneg_float(state.get("runner_start_ts", 0.0), 0.0)
+            max_hold_min = max(0.0, float(getattr(config, "MAIN_RUNNER_MAX_HOLD_MIN", 120)))
+            timeout_sec = max_hold_min * 60.0
+            timeout_pnl_min = float(getattr(config, "MAIN_RUNNER_TIMEOUT_CLOSE_IF_PNL_GE", 0.0))
+            timeout_hit = False
+            if runner_start_ts > 0 and timeout_sec > 0:
+                timeout_hit = (now_ts - runner_start_ts) >= timeout_sec and pnl >= timeout_pnl_min
+
+            if timeout_hit:
+                vol = _get_volume(upbit, ticker, state)
+                if vol > 0 and _can_order(float(cur), vol):
+                    ok, err = _execute_sell(
+                        upbit,
+                        ticker,
+                        vol,
+                        market_sell,
+                        "runner_timeout_sell_failed",
+                        strategy_tag=tag,
+                        cur_price=float(cur),
+                    )
+                    if not ok:
+                        return {"closed": False, "reason": err, "partials": partials}
+                    _record_realized(state, vol, float(cur))
+                    _record_sell_krw(state, vol, float(cur))
+                    if not _is_real_order():
+                        _mock_reduce_volume(state, vol)
+                state["holding"] = False
+                state["runner_active"] = False
+                state["last_exit_reason"] = "RUNNER_TIMEOUT"
+                return {
+                    "closed": True,
+                    "reason": "RUNNER_TIMEOUT",
+                    "exit_price": float(cur),
+                    "close_qty": float(max(0.0, vol)),
+                    "partials": partials,
+                }
+
+        return {"closed": False, "partials": partials}
 
     # 1b) One-shot take profit full close
     if tp_one is not None and pnl >= float(tp_one):
