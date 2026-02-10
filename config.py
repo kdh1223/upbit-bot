@@ -309,6 +309,14 @@ MAIN_CONFIRM_1M_CACHE_SEC = 5
 MAIN_FILTER_REJECT_SUMMARY_MIN = 10
 MAIN_FILTER_REJECT_SUMMARY_TOPN = 6
 
+# 09:00 KST opening volatility guard (new entries only)
+ENABLE_0900_ENTRY_GUARD = True
+ENTRY_GUARD_START_HOUR = 9
+ENTRY_GUARD_START_MIN = 0
+ENTRY_GUARD_END_HOUR = 9
+ENTRY_GUARD_END_MIN = 15
+ENTRY_GUARD_NOTIFY_TELEGRAM = False
+
 # ===============================
 # SCALP strategy
 # ===============================

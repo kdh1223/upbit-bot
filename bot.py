@@ -988,6 +988,36 @@ def _is_dawn_hour(now: dt.datetime) -> bool:
     return h >= start or h < end
 
 
+def _entry_guard_window(now: dt.datetime):
+    if not bool(getattr(config, "ENABLE_0900_ENTRY_GUARD", True)):
+        return False, None, None, ""
+    if not isinstance(now, dt.datetime):
+        now = now_kst()
+    if now.tzinfo is None:
+        kst_now = now.replace(tzinfo=KST)
+    else:
+        kst_now = now.astimezone(KST)
+
+    sh = min(23, max(0, int(getattr(config, "ENTRY_GUARD_START_HOUR", 9))))
+    sm = min(59, max(0, int(getattr(config, "ENTRY_GUARD_START_MIN", 0))))
+    eh = min(23, max(0, int(getattr(config, "ENTRY_GUARD_END_HOUR", 9))))
+    em = min(59, max(0, int(getattr(config, "ENTRY_GUARD_END_MIN", 15))))
+
+    start = kst_now.replace(hour=sh, minute=sm, second=0, microsecond=0)
+    end = kst_now.replace(hour=eh, minute=em, second=0, microsecond=0)
+
+    if end <= start:
+        # Support across-midnight ranges (e.g. 23:50~00:10).
+        if kst_now < end:
+            start -= dt.timedelta(days=1)
+        else:
+            end += dt.timedelta(days=1)
+
+    active = bool(start <= kst_now < end)
+    key = f"{start.strftime('%Y%m%d%H%M')}-{end.strftime('%Y%m%d%H%M')}"
+    return active, start, end, key
+
+
 def _resolve_mode() -> str:
     mode = str(getattr(config, "MODE", getattr(config, "BOT_MODE", "MAIN"))).upper().strip()
     if mode not in {"MAIN", "SAFE", "TEST"}:
@@ -1564,6 +1594,8 @@ def run():
         if bool(st.get("holding", False)) and bool(st.get("tp1", False))
     }
     main_entry_blocked_prev = False
+    guard_last_log_minute = None
+    guard_notified_window_key = ""
 
     day_cache = {}
     intraday_cache = {}
@@ -1830,12 +1862,34 @@ def run():
                 time.sleep(float(config.POLL_SEC))
                 continue
 
+            guard_active, guard_start, guard_end, guard_key = _entry_guard_window(now)
+            if guard_active:
+                minute_bucket = now.replace(second=0, microsecond=0)
+                if guard_last_log_minute != minute_bucket:
+                    start_txt = guard_start.strftime("%H:%M") if isinstance(guard_start, dt.datetime) else "09:00"
+                    end_txt = guard_end.strftime("%H:%M") if isinstance(guard_end, dt.datetime) else "09:15"
+                    print(
+                        f"[GUARD] entry blocked ({start_txt}~{end_txt} KST window)"
+                    )
+                    guard_last_log_minute = minute_bucket
+                if bool(getattr(config, "ENTRY_GUARD_NOTIFY_TELEGRAM", False)) and guard_notified_window_key != guard_key:
+                    start_txt = guard_start.strftime("%H:%M") if isinstance(guard_start, dt.datetime) else "09:00"
+                    end_txt = guard_end.strftime("%H:%M") if isinstance(guard_end, dt.datetime) else "09:15"
+                    notify_event(
+                        event_type="ENTRY_GUARD_ACTIVE",
+                        lines=[
+                            f"신규진입 차단: {start_txt}~{end_txt} KST",
+                            f"사유: 장시작 변동성 보호",
+                        ],
+                    )
+                    guard_notified_window_key = str(guard_key)
+
             total_holding = _count_total_holdings_with_scalp_btc(
                 strategy_state, scalp_btc_state, include_legacy_scalp=enable_scalp_legacy
             )
 
             # 3) MAIN entry scan (intent at order-finalization)
-            if enable_main and main_entry_allowed and total_holding < max_holdings and float(per_trade_main) > 0:
+            if (not guard_active) and enable_main and main_entry_allowed and total_holding < max_holdings and float(per_trade_main) > 0:
                 def before_main_buy(ticker: str, buy_krw: float, cur: float):
                     nonlocal main_entry_intent
                     if ticker != btc_ticker:
@@ -1915,7 +1969,7 @@ def run():
                     )
 
             # 4) Legacy SCALP entry (optional)
-            if enable_scalp_legacy and (not risk_halted) and total_holding < max_holdings:
+            if (not guard_active) and enable_scalp_legacy and (not risk_halted) and total_holding < max_holdings:
                 scalp_universe = []
                 for ticker in surge_candidates:
                     until = surge_stoploss_until.get(ticker)
@@ -1950,7 +2004,7 @@ def run():
                     )
 
             # 5) SCALP_BTC entry (always last)
-            if enable_scalp_btc and (not risk_halted) and total_holding < max_holdings:
+            if (not guard_active) and enable_scalp_btc and (not risk_halted) and total_holding < max_holdings:
                 did_scalp_btc = _try_scalp_btc_entry(
                     upbit=upbit,
                     now=now,

@@ -611,6 +611,29 @@ def _safe_service_status(service_name: str = DEFAULT_SERVICE_NAME) -> str:
         return "\uC2E4\uD589\uC911 (systemd \uD655\uC778\uC2E4\uD328)"
 
 
+def _entry_guard_status_text(now: dt.datetime) -> str:
+    if not bool(getattr(config, "ENABLE_0900_ENTRY_GUARD", True)):
+        return "OFF"
+    ts = now if isinstance(now, dt.datetime) else now_kst()
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=KST)
+    ts = ts.astimezone(KST)
+    sh = min(23, max(0, int(getattr(config, "ENTRY_GUARD_START_HOUR", 9))))
+    sm = min(59, max(0, int(getattr(config, "ENTRY_GUARD_START_MIN", 0))))
+    eh = min(23, max(0, int(getattr(config, "ENTRY_GUARD_END_HOUR", 9))))
+    em = min(59, max(0, int(getattr(config, "ENTRY_GUARD_END_MIN", 15))))
+    start = ts.replace(hour=sh, minute=sm, second=0, microsecond=0)
+    end = ts.replace(hour=eh, minute=em, second=0, microsecond=0)
+    if end <= start:
+        if ts < end:
+            start -= dt.timedelta(days=1)
+        else:
+            end += dt.timedelta(days=1)
+    active = bool(start <= ts < end)
+    window_txt = f"{start.strftime('%H:%M')}~{end.strftime('%H:%M')}"
+    return f"{'ACTIVE' if active else 'OFF'} ({window_txt})"
+
+
 def _safe_krw_balance(log_line) -> str:
     try:
         access, secret = load_keys()
@@ -634,6 +657,7 @@ def build_heartbeat_text(
     halted = bool((risk_state or {}).get("halted_flag", False))
     reason = str((risk_state or {}).get("halt_reason") or "").strip()
     risk_txt = f"\uC815\uC9C0({reason})" if halted and reason else ("\uC815\uC9C0" if halted else "\uC5C6\uC74C")
+    guard_txt = _entry_guard_status_text(now)
     return "\n".join(
         [
             "\U0001F7E2 [\uC624\uC804 9\uC2DC \uC810\uAC80] \uBD07 \uC815\uC0C1 \uB3D9\uC791",
@@ -642,6 +666,7 @@ def build_heartbeat_text(
             f"- \uC790\uC0B0: {asset_text}",
             f"- \uBCF4\uC720: MAIN {int(main_holding_cnt)} / SCALP {int(scalp_holding_cnt)}",
             f"- \uB9AC\uC2A4\uD06C\uC815\uC9C0: {risk_txt}",
+            f"- \uC2E0\uADDC\uC9C4\uC785\uAC00\uB4DC: {guard_txt}",
         ]
     )
 

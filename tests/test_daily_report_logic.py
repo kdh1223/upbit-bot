@@ -2,7 +2,7 @@ import datetime as dt
 import unittest
 from zoneinfo import ZoneInfo
 
-from run_daily_report import _calc_window_pnl_krw_pct, _mdd_pct, build_metrics, build_report_text, report_window_21_to_21
+from run_daily_report import _calc_window_pnl_krw_pct, _mdd_pct, build_heartbeat_text, build_metrics, build_report_text, report_window_21_to_21
 
 
 KST = ZoneInfo("Asia/Seoul")
@@ -99,6 +99,18 @@ class DailyReportLogicTests(unittest.TestCase):
             status_emoji="🟢",
         )
         self.assertIn("- 월간 MDD: N/A", text)
+
+    def test_heartbeat_includes_entry_guard_line(self):
+        now = dt.datetime(2026, 2, 10, 9, 5, 0, tzinfo=KST)
+        text = build_heartbeat_text(
+            now=now,
+            service_status="실행중",
+            asset_text="100,000 KRW",
+            main_holding_cnt=0,
+            scalp_holding_cnt=0,
+            risk_state={"halted_flag": False, "halt_reason": ""},
+        )
+        self.assertIn("신규진입가드: ACTIVE", text)
 
 
 if __name__ == "__main__":
