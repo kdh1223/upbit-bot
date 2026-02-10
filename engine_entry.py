@@ -123,7 +123,21 @@ def try_main_entries(
     global_holding_tickers=None,
     before_buy_fn=None,
     entry_params=None,
+    runtime_risk_state=None,
+    equity=None,
 ):
+    runtime_risk_state = runtime_risk_state or {}
+    if bool(runtime_risk_state.get("halted_flag", False)):
+        reason = str(runtime_risk_state.get("halt_reason") or "RISK_CUT")
+        eq_txt = "-"
+        try:
+            eq_txt = f"{float(equity):,.0f}"
+        except Exception:
+            pass
+        print(f"[ENTRY_BLOCKED] risk halted: {reason}")
+        print(f"[RISK_GUARD] ENTRY BLOCKED | reason={reason} | equity={eq_txt}")
+        return False
+
     day_cache, intraday_cache, minute_cache = _safe_caches(prices)
     krw = _safe_krw(prices)
     inactive_tickers = set(inactive_tickers or [])
@@ -280,7 +294,21 @@ def try_scalp_entries(
     inactive_positions=None,
     global_holding_tickers=None,
     conservative=False,
+    runtime_risk_state=None,
+    equity=None,
 ):
+    runtime_risk_state = runtime_risk_state or {}
+    if bool(runtime_risk_state.get("halted_flag", False)):
+        reason = str(runtime_risk_state.get("halt_reason") or "RISK_CUT")
+        eq_txt = "-"
+        try:
+            eq_txt = f"{float(equity):,.0f}"
+        except Exception:
+            pass
+        print(f"[ENTRY_BLOCKED] risk halted: {reason}")
+        print(f"[RISK_GUARD] ENTRY BLOCKED | reason={reason} | equity={eq_txt}")
+        return False
+
     if not bool(getattr(config, "USE_MINUTE_TEST_STRATEGY", False)):
         return False
 

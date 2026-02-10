@@ -4,14 +4,12 @@ import argparse
 import csv
 import datetime as dt
 import os
-import traceback
 from typing import Dict, List
 from zoneinfo import ZoneInfo
 
-import requests
-
 import config
 from utils.log_paths import list_trade_log_paths, report_log_path_for, trade_log_path_for
+from utils.telegram_notify import has_telegram_credentials, load_telegram_env_file, tg_notify, tg_notify_photo
 
 
 KST = ZoneInfo("Asia/Seoul")
@@ -36,39 +34,6 @@ def _safe_initial_capital() -> float:
         return float(getattr(config, "INITIAL_CAPITAL", 1_000_000))
     except Exception:
         return 1_000_000.0
-
-
-def _strip_quotes(value: str) -> str:
-    s = str(value or "").strip()
-    if len(s) >= 2 and ((s[0] == s[-1] == '"') or (s[0] == s[-1] == "'")):
-        return s[1:-1].strip()
-    return s
-
-
-def load_env_file(path: str = "/etc/default/telegram-bot"):
-    if not os.path.exists(path):
-        return
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            lines = f.readlines()
-    except Exception:
-        return
-
-    for raw in lines:
-        line = str(raw or "").strip()
-        if (not line) or line.startswith("#"):
-            continue
-        if line.startswith("export "):
-            line = line[7:].strip()
-        if "=" not in line:
-            continue
-        key, value = line.split("=", 1)
-        key = str(key or "").strip()
-        if not key:
-            continue
-        if key in os.environ:
-            continue
-        os.environ[key] = _strip_quotes(value)
 
 
 def _parse_trade_time(raw: str):
@@ -386,17 +351,6 @@ def build_report_text(report_end: dt.datetime, day_start: dt.datetime, day: dict
     return "\n".join(lines)
 
 
-def tg_send_message(token: str, chat_id: str, text: str):
-    url = f"https://api.telegram.org/bot{token}/sendMessage"
-    requests.post(url, data={"chat_id": chat_id, "text": text, "disable_web_page_preview": True}, timeout=10)
-
-
-def tg_send_photo(token: str, chat_id: str, path: str):
-    url = f"https://api.telegram.org/bot{token}/sendPhoto"
-    with open(path, "rb") as f:
-        requests.post(url, data={"chat_id": chat_id}, files={"photo": f}, timeout=20)
-
-
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--xlsx", action="store_true")
@@ -414,9 +368,7 @@ def main():
         except Exception:
             pass
 
-    load_env_file("/etc/default/telegram-bot")
-    token = str(os.getenv("TELEGRAM_TOKEN") or "").strip()
-    chat_id = str(os.getenv("TELEGRAM_CHAT_ID") or "").strip()
+    load_telegram_env_file("/etc/default/telegram-bot")
 
     rows_all, files = load_all_trades(".")
     day_start, report_end = report_window_21_to_21(now)
@@ -451,21 +403,20 @@ def main():
 
     text = build_report_text(report_end, day_start, day_metrics, month_metrics, total_metrics, by_strategy)
 
-    if (not token) or (not chat_id):
-        log_line("[WARN] TELEGRAM_TOKEN/TELEGRAM_CHAT_ID missing; skip telegram send")
-        return
+    if not has_telegram_credentials():
+        log_line("[WARN] TELEGRAM_TOKEN/TELEGRAM_CHAT_ID missing; report notifications will be queued to spool")
 
-    try:
-        tg_send_message(token, chat_id, text)
+    text_ok = bool(tg_notify(event_type="DAILY_REPORT", message=text))
+    if text_ok:
         log_line("[OK] telegram text sent")
-    except Exception:
-        log_line(f"[ERR] telegram text send failed\n{traceback.format_exc().strip()}")
+    else:
+        log_line("[WARN] telegram text send failed or queued to spool")
 
-    try:
-        tg_send_photo(token, chat_id, MONTH_PNG)
+    photo_ok = bool(tg_notify_photo(event_type="DAILY_REPORT", photo_path=MONTH_PNG))
+    if photo_ok:
         log_line("[OK] telegram photo sent")
-    except Exception:
-        log_line(f"[ERR] telegram photo send failed\n{traceback.format_exc().strip()}")
+    else:
+        log_line("[WARN] telegram photo send failed or queued to spool")
 
 
 if __name__ == "__main__":

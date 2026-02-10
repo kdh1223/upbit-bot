@@ -1,7 +1,10 @@
+import json
 import os
+import tempfile
 import unittest
+from unittest import mock
 
-from utils.telegram_notify import build_event_message, build_order_message, tg_notify
+from utils.telegram_notify import build_event_message, build_order_message, flush_telegram_spool, tg_notify
 
 
 class TelegramNotifyTests(unittest.TestCase):
@@ -25,16 +28,125 @@ class TelegramNotifyTests(unittest.TestCase):
         self.assertIn("\uC0AC\uC720: ENTRY", msg)
 
     def test_tg_notify_returns_false_without_env(self):
+        old_env_file = os.environ.get("TELEGRAM_ENV_FILE")
+        old_spool = os.environ.get("TELEGRAM_SPOOL_PATH")
         old_token = os.environ.pop("TELEGRAM_TOKEN", None)
         old_chat = os.environ.pop("TELEGRAM_CHAT_ID", None)
-        try:
-            ok = tg_notify("HEARTBEAT", "test")
-            self.assertFalse(ok)
-        finally:
-            if old_token is not None:
-                os.environ["TELEGRAM_TOKEN"] = old_token
-            if old_chat is not None:
-                os.environ["TELEGRAM_CHAT_ID"] = old_chat
+        with tempfile.TemporaryDirectory() as td:
+            os.environ["TELEGRAM_ENV_FILE"] = "__missing__.env"
+            os.environ["TELEGRAM_SPOOL_PATH"] = os.path.join(td, "telegram_spool.jsonl")
+            try:
+                ok = tg_notify("HEARTBEAT", "test")
+                self.assertFalse(ok)
+            finally:
+                if old_env_file is None:
+                    os.environ.pop("TELEGRAM_ENV_FILE", None)
+                else:
+                    os.environ["TELEGRAM_ENV_FILE"] = old_env_file
+                if old_spool is None:
+                    os.environ.pop("TELEGRAM_SPOOL_PATH", None)
+                else:
+                    os.environ["TELEGRAM_SPOOL_PATH"] = old_spool
+                if old_token is not None:
+                    os.environ["TELEGRAM_TOKEN"] = old_token
+                if old_chat is not None:
+                    os.environ["TELEGRAM_CHAT_ID"] = old_chat
+
+    def test_tg_notify_failed_send_is_spooled(self):
+        old_token = os.environ.get("TELEGRAM_TOKEN")
+        old_chat = os.environ.get("TELEGRAM_CHAT_ID")
+        old_spool = os.environ.get("TELEGRAM_SPOOL_PATH")
+        old_env_file = os.environ.get("TELEGRAM_ENV_FILE")
+        with tempfile.TemporaryDirectory() as td:
+            spool_path = os.path.join(td, "telegram_spool.jsonl")
+            os.environ["TELEGRAM_TOKEN"] = "test_token"
+            os.environ["TELEGRAM_CHAT_ID"] = "test_chat"
+            os.environ["TELEGRAM_SPOOL_PATH"] = spool_path
+            os.environ["TELEGRAM_ENV_FILE"] = "__missing__.env"
+            try:
+                with mock.patch("requests.post", side_effect=RuntimeError("network down")), mock.patch(
+                    "time.sleep", return_value=None
+                ):
+                    ok = tg_notify("ORDER_BUY_FILLED", "filled")
+                self.assertFalse(ok)
+                self.assertTrue(os.path.exists(spool_path))
+                with open(spool_path, "r", encoding="utf-8") as f:
+                    rows = [json.loads(line) for line in f if line.strip()]
+                self.assertGreaterEqual(len(rows), 1)
+                self.assertEqual(rows[0].get("event_type"), "ORDER_BUY_FILLED")
+            finally:
+                if old_token is None:
+                    os.environ.pop("TELEGRAM_TOKEN", None)
+                else:
+                    os.environ["TELEGRAM_TOKEN"] = old_token
+                if old_chat is None:
+                    os.environ.pop("TELEGRAM_CHAT_ID", None)
+                else:
+                    os.environ["TELEGRAM_CHAT_ID"] = old_chat
+                if old_spool is None:
+                    os.environ.pop("TELEGRAM_SPOOL_PATH", None)
+                else:
+                    os.environ["TELEGRAM_SPOOL_PATH"] = old_spool
+                if old_env_file is None:
+                    os.environ.pop("TELEGRAM_ENV_FILE", None)
+                else:
+                    os.environ["TELEGRAM_ENV_FILE"] = old_env_file
+
+    def test_flush_spool_resends_oldest_first_with_limit(self):
+        old_token = os.environ.get("TELEGRAM_TOKEN")
+        old_chat = os.environ.get("TELEGRAM_CHAT_ID")
+        old_spool = os.environ.get("TELEGRAM_SPOOL_PATH")
+        old_env_file = os.environ.get("TELEGRAM_ENV_FILE")
+        with tempfile.TemporaryDirectory() as td:
+            spool_path = os.path.join(td, "telegram_spool.jsonl")
+            os.environ["TELEGRAM_TOKEN"] = "test_token"
+            os.environ["TELEGRAM_CHAT_ID"] = "test_chat"
+            os.environ["TELEGRAM_SPOOL_PATH"] = spool_path
+            os.environ["TELEGRAM_ENV_FILE"] = "__missing__.env"
+            first = {
+                "ts": 1.0,
+                "event_type": "ORDER_BUY_FILLED",
+                "kind": "sendMessage",
+                "payload": {"text": "first"},
+            }
+            second = {
+                "ts": 2.0,
+                "event_type": "ORDER_SELL_FILLED",
+                "kind": "sendMessage",
+                "payload": {"text": "second"},
+            }
+            with open(spool_path, "w", encoding="utf-8") as f:
+                f.write(json.dumps(first) + "\n")
+                f.write(json.dumps(second) + "\n")
+
+            mock_resp = mock.Mock()
+            mock_resp.raise_for_status.return_value = None
+            mock_resp.json.return_value = {"ok": True}
+            try:
+                with mock.patch("requests.post", return_value=mock_resp):
+                    sent = flush_telegram_spool(limit=1)
+                self.assertEqual(sent, 1)
+                with open(spool_path, "r", encoding="utf-8") as f:
+                    rows = [json.loads(line) for line in f if line.strip()]
+                self.assertEqual(len(rows), 1)
+                self.assertEqual(rows[0].get("payload", {}).get("text"), "second")
+            finally:
+                if old_token is None:
+                    os.environ.pop("TELEGRAM_TOKEN", None)
+                else:
+                    os.environ["TELEGRAM_TOKEN"] = old_token
+                if old_chat is None:
+                    os.environ.pop("TELEGRAM_CHAT_ID", None)
+                else:
+                    os.environ["TELEGRAM_CHAT_ID"] = old_chat
+                if old_spool is None:
+                    os.environ.pop("TELEGRAM_SPOOL_PATH", None)
+                else:
+                    os.environ["TELEGRAM_SPOOL_PATH"] = old_spool
+                if old_env_file is None:
+                    os.environ.pop("TELEGRAM_ENV_FILE", None)
+                else:
+                    os.environ["TELEGRAM_ENV_FILE"] = old_env_file
 
 
 if __name__ == "__main__":

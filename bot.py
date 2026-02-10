@@ -38,7 +38,7 @@ from order_utils import wait_for_filled_snapshot
 from state_store import STRATEGIES, load_state, save_state, verify_state_with_balance
 from strategy import build_k_map
 from utils.log_paths import trade_log_path_for
-from utils.telegram_notify import notify_event, notify_order
+from utils.telegram_notify import has_telegram_credentials, load_telegram_env_file, notify_event, notify_order
 
 
 BASE_TP_TABLE = copy.deepcopy(getattr(config, "TP_TABLE", {}))
@@ -46,6 +46,7 @@ BASE_STOP_LOSS_PCT = float(getattr(config, "STOP_LOSS_PCT", 0.01))
 _TG_LAST_ERR_AT = 0.0
 _TG_LAST_ERR_KEY = ""
 _TG_LAST_RISKCUT_AT = 0.0
+_TG_ENV_WARNED = False
 _INSTANCE_LOCK_FH = None
 KST = ZoneInfo("Asia/Seoul")
 
@@ -214,6 +215,16 @@ def _warn_missing_requests_dependency():
         print("[WARN] requests not installed: pip install requests")
 
 
+def _warn_missing_telegram_env_once():
+    global _TG_ENV_WARNED
+    if _TG_ENV_WARNED:
+        return
+    _TG_ENV_WARNED = True
+    load_telegram_env_file("/etc/default/telegram-bot")
+    if not has_telegram_credentials():
+        print("[WARN] TELEGRAM_TOKEN/TELEGRAM_CHAT_ID missing at startup; realtime telegram alerts may be queued")
+
+
 def _notify_loop_error_once(exc: Exception):
     global _TG_LAST_ERR_AT, _TG_LAST_ERR_KEY
 
@@ -280,7 +291,7 @@ def _pct_change(cur: float, base: float) -> float:
     return (float(cur) / float(base) - 1.0) * 100.0
 
 
-def _update_global_risk_cut_state(now: dt.datetime, equity: float, risk_state: dict):
+def _update_global_risk_cut_state(now: dt.datetime, equity: float, risk_state: dict, persist_state_fn=None):
     changed = False
     triggered = False
     s = risk_state
@@ -330,6 +341,11 @@ def _update_global_risk_cut_state(now: dt.datetime, equity: float, risk_state: d
             s["halted_at_ts"] = float(now.timestamp())
             triggered = True
             changed = True
+            if callable(persist_state_fn):
+                try:
+                    persist_state_fn()
+                except Exception as e:
+                    print(f"[WARN] risk state immediate save failed: {e}")
         elif prev_reason != halt_reason:
             changed = True
     else:
@@ -1294,8 +1310,21 @@ def _try_scalp_btc_entry(
     main_state: dict,
     persist_state_fn,
     ticker_lock: _TickerLock,
+    runtime_risk_state: dict = None,
     entry_params: dict = None,
 ):
+    runtime_risk_state = runtime_risk_state or {}
+    if bool(runtime_risk_state.get("halted_flag", False)):
+        reason = str(runtime_risk_state.get("halt_reason") or "RISK_CUT")
+        eq_txt = "-"
+        try:
+            eq_txt = f"{float(equity):,.0f}"
+        except Exception:
+            pass
+        print(f"[ENTRY_BLOCKED] risk halted: {reason}")
+        print(f"[RISK_GUARD] ENTRY BLOCKED | reason={reason} | equity={eq_txt}")
+        return False
+
     ticker = str(getattr(config, "SCALP_BTC_TICKER", "KRW-BTC"))
 
     if bool(state.get("holding", False)):
@@ -1402,6 +1431,7 @@ def run():
         return
     atexit.register(_release_instance_lock)
     _warn_missing_requests_dependency()
+    _warn_missing_telegram_env_once()
 
     if force_mock_order and bool(getattr(config, "REAL_ORDER", False)):
         print("[MODE] TEST mode detected: force REAL_ORDER=False")
@@ -1630,7 +1660,12 @@ def run():
 
             prev_day_key = str(runtime_risk_state.get("day_key", ""))
             prev_halted = bool(runtime_risk_state.get("halted_flag", False))
-            risk_info, _, risk_triggered = _update_global_risk_cut_state(now, equity, runtime_risk_state)
+            risk_info, _, risk_triggered = _update_global_risk_cut_state(
+                now,
+                equity,
+                runtime_risk_state,
+                persist_state_fn=persist_state,
+            )
             risk_halted = bool(risk_info.get("halted", False))
             halt_reason = str(risk_info.get("reason", ""))
 
@@ -1754,6 +1789,14 @@ def run():
                                 surge_stoploss_until[t] = now + dt.timedelta(minutes=block_min)
                                 print(f"[SURGE_BLOCK] {t} blocked {block_min}m ({reason})")
 
+            if risk_triggered:
+                print(
+                    f"[RISK_GUARD] same-loop entry scan skipped after risk cut | "
+                    f"reason={halt_reason} | equity={equity:,.0f}"
+                )
+                time.sleep(float(config.POLL_SEC))
+                continue
+
             total_holding = _count_total_holdings_with_scalp_btc(
                 strategy_state, scalp_btc_state, include_legacy_scalp=enable_scalp_legacy
             )
@@ -1826,6 +1869,8 @@ def run():
                         global_holding_tickers=_all_holding_tickers_with_scalp_btc(strategy_state, scalp_btc_state),
                         before_buy_fn=before_main_buy,
                         entry_params=entry_params.get("MAIN") if isinstance(entry_params, dict) else None,
+                        runtime_risk_state=runtime_risk_state,
+                        equity=equity,
                     )
                 finally:
                     main_entry_intent = None
@@ -1862,6 +1907,8 @@ def run():
                     inactive_positions=inactive_positions,
                     global_holding_tickers=_all_holding_tickers_with_scalp_btc(strategy_state, scalp_btc_state),
                     conservative=False,
+                    runtime_risk_state=runtime_risk_state,
+                    equity=equity,
                 )
                 if did_legacy:
                     total_holding = _count_total_holdings_with_scalp_btc(
@@ -1882,6 +1929,7 @@ def run():
                     main_state=strategy_state["MAIN"],
                     persist_state_fn=persist_state,
                     ticker_lock=ticker_lock,
+                    runtime_risk_state=runtime_risk_state,
                     entry_params=entry_params.get("SCALP_BTC") if isinstance(entry_params, dict) else None,
                 )
                 if did_scalp_btc:
