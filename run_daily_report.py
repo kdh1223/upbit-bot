@@ -1,13 +1,19 @@
-"""Send daily 21:00(KST) report text + monthly equity PNG to Telegram."""
+"""Send daily report (21:00 KST) and optional 09:00 heartbeat to Telegram."""
 
 import argparse
 import csv
 import datetime as dt
 import os
+import subprocess
+import traceback
 from typing import Dict, List
 from zoneinfo import ZoneInfo
 
+import pyupbit
+
 import config
+from market import get_balance, load_keys
+from state_store import load_state
 from utils.log_paths import list_trade_log_paths, report_log_path_for, trade_log_path_for
 from utils.telegram_notify import has_telegram_credentials, load_telegram_env_file, tg_notify, tg_notify_photo
 
@@ -16,6 +22,7 @@ KST = ZoneInfo("Asia/Seoul")
 SUMMARY_CSV = "trading_summary.csv"
 SUMMARY_XLSX = "trading_summary.xlsx"
 MONTH_PNG = "equity_month.png"
+DEFAULT_SERVICE_NAME = "upbit-bot"
 
 
 def now_kst() -> dt.datetime:
@@ -351,9 +358,89 @@ def build_report_text(report_end: dt.datetime, day_start: dt.datetime, day: dict
     return "\n".join(lines)
 
 
+def _count_holdings(strategy_state: dict, strategy: str) -> int:
+    out = 0
+    for _ticker, pos in ((strategy_state or {}).get(strategy, {}) or {}).items():
+        if bool((pos or {}).get("holding", False)):
+            out += 1
+    return int(out)
+
+
+def _safe_service_status(service_name: str = DEFAULT_SERVICE_NAME) -> str:
+    cmd = ["systemctl", "is-active", str(service_name or DEFAULT_SERVICE_NAME)]
+    try:
+        cp = subprocess.run(cmd, capture_output=True, text=True, timeout=2.0, check=False)
+        raw = str(cp.stdout or cp.stderr or "").strip().lower()
+        if raw == "active":
+            return "\uC2E4\uD589\uC911 (systemd)"
+        if raw:
+            return f"\uC911\uB2E8 (systemd:{raw})"
+        return "\uC911\uB2E8 (systemd:unknown)"
+    except Exception:
+        return "\uC2E4\uD589\uC911 (systemd \uD655\uC778\uC2E4\uD328)"
+
+
+def _safe_krw_balance(log_line) -> str:
+    try:
+        access, secret = load_keys()
+        upbit = pyupbit.Upbit(access, secret)
+        krw = float(get_balance(upbit, "KRW"))
+        return f"{krw:,.0f} KRW"
+    except Exception as e:
+        log_line(f"[ERR] heartbeat balance calc failed: {type(e).__name__}: {e}")
+        log_line(traceback.format_exc().strip())
+        return "\uACC4\uC0B0 \uC2E4\uD328(\uB85C\uADF8 \uD655\uC778)"
+
+
+def build_heartbeat_text(
+    now: dt.datetime,
+    service_status: str,
+    asset_text: str,
+    main_holding_cnt: int,
+    scalp_holding_cnt: int,
+    risk_state: dict,
+):
+    halted = bool((risk_state or {}).get("halted_flag", False))
+    reason = str((risk_state or {}).get("halt_reason") or "").strip()
+    risk_txt = f"\uC815\uC9C0({reason})" if halted and reason else ("\uC815\uC9C0" if halted else "\uC5C6\uC74C")
+    return "\n".join(
+        [
+            "\U0001F7E2 [\uC624\uC804 9\uC2DC \uC810\uAC80] \uBD07 \uC815\uC0C1 \uB3D9\uC791",
+            f"- \uC2DC\uAC01: {now.strftime('%Y-%m-%d %H:%M')} KST",
+            f"- \uC0C1\uD0DC: {service_status}",
+            f"- \uC790\uC0B0: {asset_text}",
+            f"- \uBCF4\uC720: MAIN {int(main_holding_cnt)} / SCALP {int(scalp_holding_cnt)}",
+            f"- \uB9AC\uC2A4\uD06C\uC815\uC9C0: {risk_txt}",
+        ]
+    )
+
+
+def send_heartbeat(now: dt.datetime, log_line):
+    strategy_state, _, _, _, risk_state = load_state()
+    main_holding_cnt = _count_holdings(strategy_state, "MAIN")
+    scalp_holding_cnt = _count_holdings(strategy_state, "SCALP")
+    service_status = _safe_service_status(DEFAULT_SERVICE_NAME)
+    asset_text = _safe_krw_balance(log_line)
+    msg = build_heartbeat_text(
+        now=now,
+        service_status=service_status,
+        asset_text=asset_text,
+        main_holding_cnt=main_holding_cnt,
+        scalp_holding_cnt=scalp_holding_cnt,
+        risk_state=risk_state,
+    )
+    ok = bool(tg_notify(event_type="HEARTBEAT", message=msg))
+    if ok:
+        log_line("[OK] heartbeat telegram sent")
+    else:
+        log_line("[WARN] heartbeat telegram send failed or queued to spool")
+    return ok
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--xlsx", action="store_true")
+    parser.add_argument("--heartbeat-only", action="store_true")
     args = parser.parse_args()
 
     now = now_kst()
@@ -369,6 +456,12 @@ def main():
             pass
 
     load_telegram_env_file("/etc/default/telegram-bot")
+
+    if args.heartbeat_only:
+        if not has_telegram_credentials():
+            log_line("[WARN] TELEGRAM_TOKEN/TELEGRAM_CHAT_ID missing; heartbeat will be queued to spool")
+        send_heartbeat(now, log_line)
+        return
 
     rows_all, files = load_all_trades(".")
     day_start, report_end = report_window_21_to_21(now)
