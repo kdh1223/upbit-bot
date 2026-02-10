@@ -299,6 +299,48 @@ def _safe_account_snapshot(log_line):
     return snapshot
 
 
+def _base_max_holdings_by_equity(equity: float) -> int:
+    fixed_until = float(getattr(config, "HOLDINGS_FIXED_UNTIL_EQUITY", 1_500_000))
+    if float(equity) <= fixed_until:
+        return 2
+    tiers = sorted((getattr(config, "ACCOUNT_TIERS", []) or []), key=lambda x: float(x.get("min_equity", 0)))
+    out = 2
+    for row in tiers:
+        min_eq = float(row.get("min_equity", 0))
+        if float(equity) >= min_eq:
+            out = int(row.get("max_holdings", out))
+    return max(1, int(out))
+
+
+def _estimate_trade_notional_krw(row: Dict[str, str], total_equity: float) -> float:
+    eq = max(0.0, float(total_equity))
+    if eq <= 0:
+        return 0.0
+    strategy = str((row or {}).get("strategy", "")).upper().strip()
+    if strategy == "SCALP_BTC":
+        share = max(0.0, float(getattr(config, "SCALP_BTC_PER_TRADE_SHARE", 0.10)))
+        return max(float(getattr(config, "MIN_ORDER_KRW", 5_000)), eq * share)
+
+    regime = str((row or {}).get("regime", "MID") or "MID").upper().strip()
+    invest_frac = float((getattr(config, "REGIME_INVEST_FRAC", {}) or {}).get(regime, 0.6))
+    holdings_mult = float((getattr(config, "REGIME_HOLDINGS_MULT", {}) or {}).get(regime, 1.0))
+    base_holdings = _base_max_holdings_by_equity(eq)
+    eff_holdings = max(1, int(base_holdings * holdings_mult))
+    if invest_frac <= 0:
+        return 0.0
+    est = (eq * invest_frac) / float(eff_holdings)
+    return max(float(getattr(config, "MIN_ORDER_KRW", 5_000)), float(est))
+
+
+def _calc_pnl_krw_from_rows(rows: List[Dict[str, str]], total_equity: float) -> float:
+    pnl_krw = 0.0
+    for row in list(rows or []):
+        pct = _to_float((row or {}).get("pnl_pct", 0.0), 0.0)
+        notional = _estimate_trade_notional_krw(row, total_equity)
+        pnl_krw += float(notional) * (float(pct) / 100.0)
+    return float(pnl_krw)
+
+
 def build_strategy_metrics_month(rows_month: List[Dict[str, str]]):
     out = {}
     for strategy in ("MAIN", "SCALP_BTC"):
@@ -579,29 +621,18 @@ def main():
     total_metrics["mdd"] = _mdd_pct(rows_total, _safe_initial_capital()) if rows_total else 0.0
     by_strategy = build_strategy_metrics_month(rows_month)
 
-    initial_capital = _safe_initial_capital()
-    daily_pnl_krw, daily_pnl_pct, _, _ = _calc_window_pnl_krw_pct(
-        rows_all_no_partial,
-        day_start,
-        report_end,
-        initial_capital,
-    )
-    month_pnl_krw, month_pnl_pct, _, _ = _calc_window_pnl_krw_pct(
-        rows_all_no_partial,
-        month_start,
-        report_end,
-        initial_capital,
-    )
-    total_equity = _equity_after_rows(rows_all_no_partial, initial_capital)
+    snapshot = _safe_account_snapshot(log_line)
+    total_eq_for_est = max(0.0, float(snapshot.get("total_equity", 0.0)))
+    daily_pnl_krw = _calc_pnl_krw_from_rows(rows_daily, total_eq_for_est)
+    month_pnl_krw = _calc_pnl_krw_from_rows(rows_month, total_eq_for_est)
+    total_pnl_krw = _calc_pnl_krw_from_rows(rows_total, total_eq_for_est)
     pnl_amounts = {
         "daily_krw": float(daily_pnl_krw),
-        "daily_pct": float(daily_pnl_pct),
+        "daily_pct": float(day_metrics.get("cum", 0.0)),
         "month_krw": float(month_pnl_krw),
-        "month_pct": float(month_pnl_pct),
-        "total_krw": float(total_equity - initial_capital),
+        "month_pct": float(month_metrics.get("cum", 0.0)),
+        "total_krw": float(total_pnl_krw),
     }
-
-    snapshot = _safe_account_snapshot(log_line)
 
     write_summary_csv(SUMMARY_CSV, day_metrics, month_metrics, total_metrics, by_strategy)
     month_png_ready = False

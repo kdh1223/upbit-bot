@@ -1,8 +1,16 @@
 import datetime as dt
 import unittest
+from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
-from run_daily_report import _calc_window_pnl_krw_pct, _mdd_pct, build_metrics, build_report_text, report_window_21_to_21
+from run_daily_report import (
+    _calc_pnl_krw_from_rows,
+    _calc_window_pnl_krw_pct,
+    _mdd_pct,
+    build_metrics,
+    build_report_text,
+    report_window_21_to_21,
+)
 
 
 KST = ZoneInfo("Asia/Seoul")
@@ -57,6 +65,22 @@ class DailyReportLogicTests(unittest.TestCase):
         self.assertAlmostEqual(end_eq, 1210.0, places=6)
         self.assertAlmostEqual(pnl_krw, 110.0, places=6)
         self.assertAlmostEqual(pnl_pct, 10.0, places=6)
+
+    def test_calc_pnl_krw_from_rows_notional_based(self):
+        rows = [
+            {"pnl_pct": "1.0", "strategy": "MAIN", "regime": "MID"},
+            {"pnl_pct": "-0.5", "strategy": "SCALP_BTC", "regime": "MID"},
+        ]
+        with (
+            patch("run_daily_report.config.REGIME_INVEST_FRAC", {"MID": 0.5}),
+            patch("run_daily_report.config.REGIME_HOLDINGS_MULT", {"MID": 1.0}),
+            patch("run_daily_report.config.HOLDINGS_FIXED_UNTIL_EQUITY", 1_500_000),
+            patch("run_daily_report.config.ACCOUNT_TIERS", []),
+            patch("run_daily_report.config.MIN_ORDER_KRW", 5_000),
+            patch("run_daily_report.config.SCALP_BTC_PER_TRADE_SHARE", 0.10),
+        ):
+            pnl = _calc_pnl_krw_from_rows(rows, total_equity=100_000.0)
+        self.assertAlmostEqual(pnl, 200.0, places=6)
 
     def test_build_report_text_final_format_sections(self):
         report_end = dt.datetime(2026, 2, 10, 21, 0, 0, tzinfo=KST)
