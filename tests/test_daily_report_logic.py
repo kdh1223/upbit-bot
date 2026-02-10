@@ -1,16 +1,8 @@
 import datetime as dt
 import unittest
-from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
-from run_daily_report import (
-    _calc_pnl_krw_from_rows,
-    _calc_window_pnl_krw_pct,
-    _mdd_pct,
-    build_metrics,
-    build_report_text,
-    report_window_21_to_21,
-)
+from run_daily_report import _calc_window_pnl_krw_pct, _mdd_pct, build_metrics, build_report_text, report_window_21_to_21
 
 
 KST = ZoneInfo("Asia/Seoul")
@@ -66,23 +58,7 @@ class DailyReportLogicTests(unittest.TestCase):
         self.assertAlmostEqual(pnl_krw, 110.0, places=6)
         self.assertAlmostEqual(pnl_pct, 10.0, places=6)
 
-    def test_calc_pnl_krw_from_rows_notional_based(self):
-        rows = [
-            {"pnl_pct": "1.0", "strategy": "MAIN", "regime": "MID"},
-            {"pnl_pct": "-0.5", "strategy": "SCALP_BTC", "regime": "MID"},
-        ]
-        with (
-            patch("run_daily_report.config.REGIME_INVEST_FRAC", {"MID": 0.5}),
-            patch("run_daily_report.config.REGIME_HOLDINGS_MULT", {"MID": 1.0}),
-            patch("run_daily_report.config.HOLDINGS_FIXED_UNTIL_EQUITY", 1_500_000),
-            patch("run_daily_report.config.ACCOUNT_TIERS", []),
-            patch("run_daily_report.config.MIN_ORDER_KRW", 5_000),
-            patch("run_daily_report.config.SCALP_BTC_PER_TRADE_SHARE", 0.10),
-        ):
-            pnl = _calc_pnl_krw_from_rows(rows, total_equity=100_000.0)
-        self.assertAlmostEqual(pnl, 200.0, places=6)
-
-    def test_build_report_text_final_format_sections(self):
+    def test_build_report_text_without_overall_sections(self):
         report_end = dt.datetime(2026, 2, 10, 21, 0, 0, tzinfo=KST)
         day_start = dt.datetime(2026, 2, 9, 21, 0, 0, tzinfo=KST)
         text = build_report_text(
@@ -90,21 +66,39 @@ class DailyReportLogicTests(unittest.TestCase):
             day_start=day_start,
             day={"n": 2, "wr": 50.0, "avg": 1.23, "max": 3.0, "min": -1.0, "sl_ratio": 50.0, "avg10": 0.5},
             month={"n": 10, "wr": 60.0, "avg": 0.8, "cum": 8.3},
-            overall={"cum": 12.5, "mdd": -4.2},
             by_strategy={"MAIN": {"n": 7, "wr": 57.14, "avg": 0.9}, "SCALP_BTC": {"n": 3, "wr": 66.6, "avg": 0.5}},
             snapshot={"krw_balance": 12345.0, "coin_value": 0.0, "total_equity": 12345.0, "has_coin": False},
-            pnl_amounts={"daily_krw": 1000.0, "daily_pct": 1.0, "month_krw": 5000.0, "month_pct": 5.0, "total_krw": 12000.0},
+            pnl_amounts={"daily_krw": 1000.0, "daily_pct": 1.0, "month_krw": 5000.0, "month_pct": 5.0},
+            month_mdd_pct=-1.23,
+            status_emoji="🟡",
         )
         self.assertIn("📊 일일 성적 리포트 (KST) | 2026-02-10 21:00", text)
         self.assertIn("기간: 02/09 21:00 ~ 02/10 21:00", text)
-        self.assertIn("🏦 계좌 스냅샷", text)
-        self.assertIn("- 코인 평가금: 0원 (보유 없음)", text)
-        self.assertIn("일일", text)
-        self.assertIn("이번달 (2026-02)", text)
-        self.assertIn("전체", text)
-        self.assertIn("전략별 (이번달)", text)
-        self.assertIn("- SCALP_BTC: 거래 3", text)
-        self.assertIn("상태: 🟢", text)
+        self.assertIn("📅 오늘", text)
+        self.assertIn("- 일일 손익: +1,000원 (+1.00%)", text)
+        self.assertIn("📆 이번 달 (2026-02)", text)
+        self.assertIn("- 월간 MDD: -1.23%", text)
+        self.assertIn("📌 전략별 (이번 달)", text)
+        self.assertIn("상태: 🟡", text)
+        self.assertNotIn("전체", text)
+        self.assertNotIn("누적(복리)", text)
+        self.assertNotIn("누적 손익", text)
+
+    def test_build_report_text_month_mdd_na(self):
+        report_end = dt.datetime(2026, 2, 10, 21, 0, 0, tzinfo=KST)
+        day_start = dt.datetime(2026, 2, 9, 21, 0, 0, tzinfo=KST)
+        text = build_report_text(
+            report_end=report_end,
+            day_start=day_start,
+            day={},
+            month={},
+            by_strategy={},
+            snapshot={"krw_balance": 0.0, "coin_value": 0.0, "total_equity": 0.0, "has_coin": False},
+            pnl_amounts={},
+            month_mdd_pct=None,
+            status_emoji="🟢",
+        )
+        self.assertIn("- 월간 MDD: N/A", text)
 
 
 if __name__ == "__main__":
