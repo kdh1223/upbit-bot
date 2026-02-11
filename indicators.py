@@ -501,6 +501,13 @@ def scalp_btc_entry_signal(ticker):
     if close_pos < close_pos_min:
         return False
 
+    # V3-Lite: block entries too close to recent 20-bar high (avoid buying right below resistance).
+    recent_high20 = safe_last(high.rolling(20).max())
+    if recent_high20 is None:
+        return False
+    if float(close_now) >= float(recent_high20) * 0.997:
+        return False
+
     # V2 (change-1): RSI upturn mandatory + (breakout OR EMA reclaim).
     trig_rsi_up = float(rsi_now) > float(rsi_prev)
     trig_price_reclaim = (float(close_now) > float(prev_high)) or (float(close_now) > float(ema_now))
