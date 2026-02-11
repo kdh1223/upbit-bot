@@ -14,6 +14,8 @@ class GlobalRiskCutStateTests(unittest.TestCase):
         self._set("DAILY_MAX_LOSS_PCT", -5.0)
         self._set("GLOBAL_MDD_LIMIT_PCT", -15.0)
         self._set("RISK_CUT_CONFIRM_TICKS", 3)
+        self._set("RISK_EQUITY_DROP_GUARD_PCT", 0.20)
+        self._set("RISK_EQUITY_DROP_GUARD_TICKS", 30)
 
     def tearDown(self):
         for name, original in self._backup.items():
@@ -38,7 +40,12 @@ class GlobalRiskCutStateTests(unittest.TestCase):
 
         for i, eq in enumerate(seq):
             now = base + dt.timedelta(minutes=i)
-            info, _, triggered = bot._update_global_risk_cut_state(now=now, equity=eq, risk_state=state)
+            info, _, triggered = bot._update_global_risk_cut_state(
+                now=now,
+                equity=eq,
+                risk_state=state,
+                holdings_count=1,
+            )
             snapshots.append((info, triggered))
 
         self.assertFalse(snapshots[1][0]["halted"])
@@ -56,6 +63,46 @@ class GlobalRiskCutStateTests(unittest.TestCase):
         self.assertTrue(info.get("used_last_good_equity", False))
         self.assertAlmostEqual(float(info.get("last_good_equity", 0.0)), 100_000.0, places=6)
         self.assertFalse(info.get("halted", False))
+
+    def test_sudden_drop_without_holdings_is_guarded_temporarily(self):
+        self._set("RISK_CUT_CONFIRM_TICKS", 1)
+        self._set("RISK_EQUITY_DROP_GUARD_TICKS", 3)
+        state = bot._normalize_runtime_risk_state({})
+        base = dt.datetime(2026, 2, 11, 10, 0, 0)
+
+        bot._update_global_risk_cut_state(now=base, equity=100_000.0, risk_state=state, holdings_count=0)
+        snap = []
+        for i in range(1, 4):
+            info, _, triggered = bot._update_global_risk_cut_state(
+                now=base + dt.timedelta(seconds=i),
+                equity=69_000.0,
+                risk_state=state,
+                holdings_count=0,
+            )
+            snap.append((info, triggered))
+
+        self.assertFalse(snap[0][0]["halted"])
+        self.assertFalse(snap[1][0]["halted"])
+        self.assertTrue(snap[2][0]["halted"])
+        self.assertEqual(snap[2][0]["reason"], "TOTAL_MDD_LIMIT")
+
+    def test_sudden_drop_with_holdings_is_not_guarded(self):
+        self._set("RISK_CUT_CONFIRM_TICKS", 1)
+        self._set("RISK_EQUITY_DROP_GUARD_TICKS", 30)
+        state = bot._normalize_runtime_risk_state({})
+        base = dt.datetime(2026, 2, 11, 10, 0, 0)
+
+        bot._update_global_risk_cut_state(now=base, equity=100_000.0, risk_state=state, holdings_count=1)
+        info, _, triggered = bot._update_global_risk_cut_state(
+            now=base + dt.timedelta(seconds=1),
+            equity=69_000.0,
+            risk_state=state,
+            holdings_count=1,
+        )
+
+        self.assertTrue(info["halted"])
+        self.assertEqual(info["reason"], "TOTAL_MDD_LIMIT")
+        self.assertTrue(triggered)
 
 
 if __name__ == "__main__":

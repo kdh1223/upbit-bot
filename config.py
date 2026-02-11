@@ -246,6 +246,10 @@ GLOBAL_MDD_LIMIT_PCT = -15.0
 RISK_CUT_FORCE_CLOSE = False
 # Require consecutive breaches before risk-cut fires (spike guard).
 RISK_CUT_CONFIRM_TICKS = 3
+# If equity drops sharply while no position is held, treat it as transient API noise
+# until this many consecutive ticks confirm the drop.
+RISK_EQUITY_DROP_GUARD_PCT = 0.20
+RISK_EQUITY_DROP_GUARD_TICKS = 30
 
 # ===============================
 # MAIN strategy

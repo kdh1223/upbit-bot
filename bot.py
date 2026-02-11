@@ -278,6 +278,7 @@ def _default_runtime_risk_state():
         "last_good_equity": 0.0,
         "daily_breach_streak": 0,
         "mdd_breach_streak": 0,
+        "eq_drop_guard_streak": 0,
         "halted_flag": False,
         "halt_reason": "",
         "halted_at_ts": 0.0,
@@ -300,6 +301,10 @@ def _normalize_runtime_risk_state(raw: dict):
         s["mdd_breach_streak"] = max(0, int(s.get("mdd_breach_streak", 0)))
     except Exception:
         s["mdd_breach_streak"] = 0
+    try:
+        s["eq_drop_guard_streak"] = max(0, int(s.get("eq_drop_guard_streak", 0)))
+    except Exception:
+        s["eq_drop_guard_streak"] = 0
     s["halted_flag"] = bool(s.get("halted_flag", False))
     s["halt_reason"] = str(s.get("halt_reason") or "")
     s["halted_at_ts"] = max(0.0, _safe_float(s.get("halted_at_ts", 0.0), 0.0))
@@ -312,7 +317,13 @@ def _pct_change(cur: float, base: float) -> float:
     return (float(cur) / float(base) - 1.0) * 100.0
 
 
-def _update_global_risk_cut_state(now: dt.datetime, equity: float, risk_state: dict, persist_state_fn=None):
+def _update_global_risk_cut_state(
+    now: dt.datetime,
+    equity: float,
+    risk_state: dict,
+    persist_state_fn=None,
+    holdings_count: int = 0,
+):
     changed = False
     triggered = False
     s = risk_state
@@ -320,11 +331,49 @@ def _update_global_risk_cut_state(now: dt.datetime, equity: float, risk_state: d
     raw_eq = max(0.0, float(equity))
     last_good_eq = max(0.0, _safe_float(s.get("last_good_equity", 0.0), 0.0))
     used_last_good = False
-    if raw_eq <= 0 and last_good_eq > 0:
+    try:
+        holdings_cnt = max(0, int(holdings_count))
+    except Exception:
+        holdings_cnt = 0
+
+    drop_guard_pct = max(0.0, _safe_float(getattr(config, "RISK_EQUITY_DROP_GUARD_PCT", 0.20), 0.20))
+    drop_guard_ticks = max(1, int(getattr(config, "RISK_EQUITY_DROP_GUARD_TICKS", 30)))
+    prev_drop_guard_streak = max(0, int(s.get("eq_drop_guard_streak", 0)))
+    suspicious_drop = (
+        holdings_cnt <= 0
+        and raw_eq > 0
+        and last_good_eq > 0
+        and raw_eq < (float(last_good_eq) * (1.0 - float(drop_guard_pct)))
+    )
+
+    if suspicious_drop:
+        s["eq_drop_guard_streak"] = prev_drop_guard_streak + 1
+        if int(s["eq_drop_guard_streak"]) < drop_guard_ticks:
+            cur_eq = float(last_good_eq)
+            used_last_good = True
+        else:
+            cur_eq = float(raw_eq)
+    else:
+        if prev_drop_guard_streak != 0:
+            s["eq_drop_guard_streak"] = 0
+        if raw_eq <= 0 and last_good_eq > 0:
+            cur_eq = float(last_good_eq)
+            used_last_good = True
+        else:
+            cur_eq = float(raw_eq)
+
+    if int(s.get("eq_drop_guard_streak", 0)) != prev_drop_guard_streak:
+        changed = True
+    if suspicious_drop and int(s.get("eq_drop_guard_streak", 0)) == 1:
+        print(
+            f"[RISK_GUARD] suspicious equity drop ignored (no holdings) "
+            f"raw={raw_eq:,.0f} last_good={last_good_eq:,.0f} "
+            f"guard={int(s.get('eq_drop_guard_streak', 0))}/{drop_guard_ticks}"
+        )
+
+    if raw_eq <= 0 and last_good_eq > 0 and not suspicious_drop:
         cur_eq = float(last_good_eq)
         used_last_good = True
-    else:
-        cur_eq = float(raw_eq)
     if cur_eq > 0 and abs(float(last_good_eq) - float(cur_eq)) > 1e-9:
         s["last_good_equity"] = float(cur_eq)
         changed = True
@@ -409,6 +458,7 @@ def _update_global_risk_cut_state(now: dt.datetime, equity: float, risk_state: d
         "confirm_ticks": int(confirm_ticks),
         "daily_breach_streak": int(s.get("daily_breach_streak", 0)),
         "mdd_breach_streak": int(s.get("mdd_breach_streak", 0)),
+        "eq_drop_guard_streak": int(s.get("eq_drop_guard_streak", 0)),
         "day_key": str(day_key),
         "day_start_equity": float(day_start),
         "peak_equity": float(peak_equity),
@@ -2109,6 +2159,7 @@ def run():
                 equity,
                 runtime_risk_state,
                 persist_state_fn=persist_state,
+                holdings_count=total_holding,
             )
             risk_halted = bool(risk_info.get("halted", False))
             halt_reason = str(risk_info.get("reason", ""))
