@@ -806,7 +806,8 @@ def build_0900_mini_report_text(
         else:
             lines.append("\uC0C1\uD0DC: \u26D4 HALTED")
     else:
-        lines.append(f"09:00~09:15 \uC2E0\uADDC\uC9C4\uC785\uAC00\uB4DC: {'\uD65C\uC131' if bool(guard_active) else '\uBE44\uD65C\uC131'}")
+        guard_label = "\uD65C\uC131" if bool(guard_active) else "\uBE44\uD65C\uC131"
+        lines.append(f"09:00~09:15 \uC2E0\uADDC\uC9C4\uC785\uAC00\uB4DC: {guard_label}")
     return "\n".join(lines)
 
 
