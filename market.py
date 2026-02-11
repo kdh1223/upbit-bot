@@ -173,6 +173,25 @@ def _normalize_market_warning(raw_warning: str) -> str:
     return sup
 
 
+def _market_event_is_caution(market_event) -> bool:
+    if not isinstance(market_event, dict):
+        return False
+    try:
+        if bool(market_event.get("warning", False)):
+            return True
+    except Exception:
+        pass
+    caution = market_event.get("caution")
+    if isinstance(caution, dict):
+        for v in caution.values():
+            try:
+                if bool(v):
+                    return True
+            except Exception:
+                continue
+    return False
+
+
 def get_upbit_krw_markets(timeout_sec: float = 5.0) -> Dict[str, Dict[str, str]]:
     global _MARKET_META_DEBUG_PRINTED
     try:
@@ -202,10 +221,17 @@ def get_upbit_krw_markets(timeout_sec: float = 5.0) -> Dict[str, Dict[str, str]]
                 raw_warning = row.get(key)
                 break
 
-        if warning_key is None:
-            raw_warning = "NONE"
-
-        market_warning = _normalize_market_warning(raw_warning)
+        market_warning = "NONE"
+        market_event = row.get("market_event")
+        if _market_event_is_caution(market_event):
+            market_warning = "CAUTION"
+            if warning_key is None:
+                warning_key = "market_event"
+                raw_warning = "CAUTION"
+        else:
+            if warning_key is None:
+                raw_warning = "NONE"
+            market_warning = _normalize_market_warning(raw_warning)
 
         markets[market] = {
             "korean_name": str(row.get("korean_name") or "").strip(),
@@ -230,7 +256,11 @@ def get_upbit_krw_markets(timeout_sec: float = 5.0) -> Dict[str, Dict[str, str]]
     return markets
 
 
-def filter_tradeable_tickers(tickers, market_info) -> Tuple[List[str], List[str], Dict[str, str]]:
+def filter_tradeable_tickers(
+    tickers,
+    market_info,
+    strict_registry: bool = False,
+) -> Tuple[List[str], List[str], Dict[str, str]]:
     active: List[str] = []
     inactive: List[str] = []
     reasons: Dict[str, str] = {}
@@ -255,6 +285,8 @@ def filter_tradeable_tickers(tickers, market_info) -> Tuple[List[str], List[str]
             reason = "STABLECOIN"
         elif symbol in USER_EXCLUDED_SYMBOLS:
             reason = "USER_EXCLUDED"
+        elif strict_registry and exclude_caution and (not use_market_registry):
+            reason = "MARKET_INFO_UNAVAILABLE"
         elif use_market_registry:
             info = market_info.get(t)
             if info is None:

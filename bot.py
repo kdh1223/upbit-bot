@@ -1908,6 +1908,8 @@ def run():
         persist_state()
 
     now = now_kst()
+    market_info_refresh_sec = max(60.0, float(getattr(config, "MARKET_INFO_REFRESH_MIN", 1)) * 60.0)
+    market_info_last_refresh = now
     momentum_seen_at = {}
     surge_stoploss_until = {}
     ticker_lock = _TickerLock()
@@ -1977,6 +1979,15 @@ def run():
         try:
             now = now_kst()
             main_entry_intent = None
+
+            if (now - market_info_last_refresh).total_seconds() >= market_info_refresh_sec:
+                latest_market_info = get_upbit_krw_markets()
+                if latest_market_info:
+                    market_info = latest_market_info
+                    print(f"[FILTER] refreshed KRW market info: {len(market_info)}")
+                else:
+                    print("[FILTER] market info refresh failed; keep previous cache")
+                market_info_last_refresh = now
 
             if (now - last_tg_spool_flush).total_seconds() >= tg_spool_flush_sec:
                 try:
@@ -2260,6 +2271,17 @@ def run():
             if (not guard_active) and enable_main and main_entry_allowed and total_holding < max_holdings and float(per_trade_main) > 0:
                 def before_main_buy(ticker: str, buy_krw: float, cur: float):
                     nonlocal main_entry_intent
+                    strict_market_registry = bool(getattr(config, "BLOCK_ENTRY_WHEN_MARKET_INFO_UNAVAILABLE", True))
+                    _, blocked_tickers, blocked_reasons = filter_tradeable_tickers(
+                        [ticker],
+                        market_info,
+                        strict_registry=strict_market_registry,
+                    )
+                    if blocked_tickers:
+                        reason = str(blocked_reasons.get(ticker) or "UNIVERSE_FILTER")
+                        print(f"[ENTRY_BLOCK][MAIN] reason={reason} ticker={ticker}")
+                        return False
+
                     if ticker != btc_ticker:
                         return True
 
