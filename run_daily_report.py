@@ -397,7 +397,53 @@ def _load_equity_history(path: str, log_line=None) -> List[Tuple[dt.datetime, fl
         if callable(log_line):
             log_line(f"[WARN] equity history load failed: {type(e).__name__}: {e}")
     out.sort(key=lambda x: x[0])
-    return out
+    filtered, dropped = _filter_equity_spikes(out)
+    if dropped > 0 and callable(log_line):
+        log_line(f"[WARN] equity history spike filtered: {dropped}")
+    return filtered
+
+
+def _filter_equity_spikes(
+    points: List[Tuple[dt.datetime, float]],
+    drop_pct: float = -20.0,
+    recover_floor_pct: float = -5.0,
+    spike_up_pct: float = 20.0,
+    rollback_ceiling_pct: float = 5.0,
+    max_gap_min: float = 30.0,
+) -> Tuple[List[Tuple[dt.datetime, float]], int]:
+    """
+    Remove single-point spikes that revert quickly:
+    - sudden drop then quick recovery
+    - sudden jump then quick rollback
+    """
+    src = list(points or [])
+    if len(src) < 3:
+        return src, 0
+
+    keep = [True] * len(src)
+    for i in range(1, len(src) - 1):
+        ts_prev, eq_prev = src[i - 1]
+        ts_cur, eq_cur = src[i]
+        ts_next, eq_next = src[i + 1]
+        prev = _to_float(eq_prev, 0.0)
+        cur = _to_float(eq_cur, 0.0)
+        nxt = _to_float(eq_next, 0.0)
+        if prev <= 0 or cur <= 0 or nxt <= 0:
+            continue
+        gap_min = (ts_next - ts_cur).total_seconds() / 60.0
+        if gap_min < 0 or gap_min > float(max_gap_min):
+            continue
+        cur_vs_prev = (cur / prev - 1.0) * 100.0
+        next_vs_prev = (nxt / prev - 1.0) * 100.0
+
+        drop_spike = (cur_vs_prev <= float(drop_pct)) and (next_vs_prev >= float(recover_floor_pct))
+        up_spike = (cur_vs_prev >= float(spike_up_pct)) and (next_vs_prev <= float(rollback_ceiling_pct))
+        if drop_spike or up_spike:
+            keep[i] = False
+
+    filtered = [p for k, p in zip(keep, src) if k]
+    dropped = len(src) - len(filtered)
+    return filtered, dropped
 
 
 def _append_equity_history(path: str, captured_at: dt.datetime, total_equity: float, log_line=None):
@@ -492,12 +538,19 @@ def _calc_mdd_from_equity_points(points: List[Tuple[dt.datetime, float]]) -> Opt
 
 def _resolve_status_emoji(daily_pnl_pct: float, risk_state: dict) -> str:
     if bool((risk_state or {}).get("halted_flag", False)):
-        return "🔴"
+        return "\U0001F6D1"
     if _to_float(daily_pnl_pct, 0.0) < 0:
-        return "🟡"
-    return "🟢"
+        return "\U0001F7E1"
+    return "\U0001F7E2"
 
 
+def _status_label(status_emoji: str) -> str:
+    code = str(status_emoji or "").strip()
+    if code == "\U0001F6D1":
+        return "HALT"
+    if code == "\U0001F7E1":
+        return "CAUTION"
+    return "NORMAL"
 def build_strategy_metrics_month(rows_month: List[Dict[str, str]]):
     out = {}
     for strategy in ("MAIN", "SCALP_BTC"):
@@ -574,41 +627,50 @@ def build_report_text(
     krw_balance = max(0.0, _to_float((snapshot or {}).get("krw_balance", 0.0), 0.0))
     coin_value = max(0.0, _to_float((snapshot or {}).get("coin_value", 0.0), 0.0))
     total_equity = max(0.0, _to_float((snapshot or {}).get("total_equity", 0.0), 0.0))
-    has_coin = bool((snapshot or {}).get("has_coin", False))
-
-    coin_value_text = f"{coin_value:,.0f}원"
-    if not has_coin:
-        coin_value_text = "0원 (보유 없음)"
+    daily_krw = _to_float((pnl_amounts or {}).get("daily_krw", 0.0), 0.0)
+    daily_pct = _to_float((pnl_amounts or {}).get("daily_pct", 0.0), 0.0)
+    month_krw = _to_float((pnl_amounts or {}).get("month_krw", 0.0), 0.0)
+    month_pct = _to_float((pnl_amounts or {}).get("month_pct", 0.0), 0.0)
     month_mdd_text = f"{_to_float(month_mdd_pct, 0.0):.2f}%" if month_mdd_pct is not None else "N/A"
-
-    main_stats = by_strategy.get("MAIN", {"n": 0, "wr": 0.0, "avg": 0.0})
-    scalp_stats = by_strategy.get("SCALP_BTC", {"n": 0, "wr": 0.0, "avg": 0.0})
+    month_compound = _to_float((month or {}).get("cum", 0.0), 0.0)
+    main_stats = (by_strategy or {}).get("MAIN", {"n": 0, "wr": 0.0, "avg": 0.0})
+    scalp_stats = (by_strategy or {}).get("SCALP_BTC", {"n": 0, "wr": 0.0, "avg": 0.0})
+    status_code = str(status_emoji or "\U0001F7E2")
+    status_text = _status_label(status_code)
+    sep = "\u2501" * 18
 
     lines = [
-        f"📊 일일 성적 리포트 (KST) | {report_end.strftime('%Y-%m-%d 21:00')}",
-        f"기간: {day_start.strftime('%m/%d 21:00')} ~ {report_end.strftime('%m/%d 21:00')}",
+        f"\U0001F4CA \uC77C\uC77C \uC131\uC801 \uB9AC\uD3EC\uD2B8 (KST) | {report_end.strftime('%Y-%m-%d 21:00')}",
+        f"\uAE30\uAC04: {day_start.strftime('%m/%d 21:00')} ~ {report_end.strftime('%m/%d 21:00')}",
         "",
-        "🏦 계좌 스냅샷",
-        f"- KRW 잔고: {krw_balance:,.0f}원",
-        f"- 코인 평가금: {coin_value_text}",
-        f"- 총자산: {total_equity:,.0f}원",
+        sep,
+        "\U0001F3E6 \uACC4\uC88C \uC2A4\uB0C5\uC0F7",
+        f"- KRW \uC794\uACE0: {krw_balance:,.0f}\uC6D0",
+        f"- \uCF54\uC778 \uD3C9\uAC00\uAE08: {coin_value:,.0f}\uC6D0",
+        f"- \uCD1D\uC790\uC0B0: {total_equity:,.0f}\uC6D0",
+        f"- \uC804\uC77C \uB300\uBE44: {daily_krw:+,.0f}\uC6D0 ({daily_pct:+.2f}%)",
         "",
-        "📅 오늘",
-        f"- 거래 {int(day.get('n', 0))} | 승률 {_to_float(day.get('wr', 0.0), 0.0):.2f}% | 평균 {_to_float(day.get('avg', 0.0), 0.0):+.2f}%",
-        f"- 일일 손익: {_to_float(pnl_amounts.get('daily_krw', 0.0), 0.0):+,.0f}원 ({_to_float(pnl_amounts.get('daily_pct', 0.0), 0.0):+.2f}%)",
-        f"- 최대익절 {_to_float(day.get('max', 0.0), 0.0):+.2f}% | 최대손절 {_to_float(day.get('min', 0.0), 0.0):+.2f}%",
-        f"- 손절비중 {_to_float(day.get('sl_ratio', 0.0), 0.0):.2f}% | 최근10평균 {_to_float(day.get('avg10', 0.0), 0.0):+.2f}%",
+        sep,
+        "\U0001F4C5 \uC624\uB298",
+        f"- \uAC70\uB798 {int((day or {}).get('n', 0))} | \uC2B9\uB960 {_to_float((day or {}).get('wr', 0.0), 0.0):.2f}% | \uD3C9\uADE0 {_to_float((day or {}).get('avg', 0.0), 0.0):+.2f}%",
+        f"- \uC77C\uC77C \uC2E4\uD604\uC190\uC775: {daily_krw:+,.0f}\uC6D0 ({daily_pct:+.2f}%)",
+        f"- \uCD5C\uB300\uC775\uC808 {_to_float((day or {}).get('max', 0.0), 0.0):+.2f}% | \uCD5C\uB300\uC190\uC808 {_to_float((day or {}).get('min', 0.0), 0.0):+.2f}%",
+        f"- \uC190\uC808\uBE44\uC911 {_to_float((day or {}).get('sl_ratio', 0.0), 0.0):.2f}% | \uCD5C\uADFC10\uD3C9\uADE0 {_to_float((day or {}).get('avg10', 0.0), 0.0):+.2f}%",
         "",
-        f"📆 이번 달 ({report_end.strftime('%Y-%m')})",
-        f"- 거래 {int(month.get('n', 0))} | 승률 {_to_float(month.get('wr', 0.0), 0.0):.2f}% | 평균 {_to_float(month.get('avg', 0.0), 0.0):+.2f}%",
-        f"- 월간 손익: {_to_float(pnl_amounts.get('month_krw', 0.0), 0.0):+,.0f}원 ({_to_float(pnl_amounts.get('month_pct', 0.0), 0.0):+.2f}%)",
-        f"- 월간 MDD: {month_mdd_text}",
+        sep,
+        f"\U0001F4C6 \uC774\uBC88 \uB2EC ({report_end.strftime('%Y-%m')})",
+        f"- \uAC70\uB798 {int((month or {}).get('n', 0))} | \uC2B9\uB960 {_to_float((month or {}).get('wr', 0.0), 0.0):.2f}% | \uD3C9\uADE0 {_to_float((month or {}).get('avg', 0.0), 0.0):+.2f}%",
+        f"- \uC6D4\uAC04 \uC2E4\uD604\uC190\uC775: {month_krw:+,.0f}\uC6D0 ({month_pct:+.2f}%)",
+        f"- \uC6D4\uAC04 \uBCF5\uB9AC: {month_compound:+.2f}%",
+        f"- \uC6D4\uAC04 MDD: {month_mdd_text}",
         "",
-        "📌 전략별 (이번 달)",
-        f"- MAIN: 거래 {int(main_stats.get('n', 0))} | 승률 {_to_float(main_stats.get('wr', 0.0), 0.0):.2f}% | 평균 {_to_float(main_stats.get('avg', 0.0), 0.0):+.2f}%",
-        f"- SCALP_BTC: 거래 {int(scalp_stats.get('n', 0))} | 승률 {_to_float(scalp_stats.get('wr', 0.0), 0.0):.2f}% | 평균 {_to_float(scalp_stats.get('avg', 0.0), 0.0):+.2f}%",
+        sep,
+        "\U0001F4CC \uC804\uB7B5\uBCC4 (\uC774\uBC88 \uB2EC)",
+        f"- MAIN: \uAC70\uB798 {int(_to_float(main_stats.get('n', 0), 0.0))} | \uC2B9\uB960 {_to_float(main_stats.get('wr', 0.0), 0.0):.2f}% | \uD3C9\uADE0 {_to_float(main_stats.get('avg', 0.0), 0.0):+.2f}%",
+        f"- SCALP_BTC: \uAC70\uB798 {int(_to_float(scalp_stats.get('n', 0), 0.0))} | \uC2B9\uB960 {_to_float(scalp_stats.get('wr', 0.0), 0.0):.2f}% | \uD3C9\uADE0 {_to_float(scalp_stats.get('avg', 0.0), 0.0):+.2f}%",
         "",
-        f"상태: {str(status_emoji or '🟢')}",
+        sep,
+        f"\uC0C1\uD0DC: {status_code} {status_text}",
     ]
     return "\n".join(lines)
 
@@ -977,3 +1039,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

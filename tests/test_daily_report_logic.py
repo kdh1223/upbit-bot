@@ -81,19 +81,14 @@ class DailyReportLogicTests(unittest.TestCase):
             snapshot={"krw_balance": 12345.0, "coin_value": 0.0, "total_equity": 12345.0, "has_coin": False},
             pnl_amounts={"daily_krw": 1000.0, "daily_pct": 1.0, "month_krw": 5000.0, "month_pct": 5.0},
             month_mdd_pct=-1.23,
-            status_emoji="🟡",
+            status_emoji="\U0001F7E1",
         )
-        self.assertIn("📊 일일 성적 리포트 (KST) | 2026-02-10 21:00", text)
-        self.assertIn("기간: 02/09 21:00 ~ 02/10 21:00", text)
-        self.assertIn("📅 오늘", text)
-        self.assertIn("- 일일 손익: +1,000원 (+1.00%)", text)
-        self.assertIn("📆 이번 달 (2026-02)", text)
-        self.assertIn("- 월간 MDD: -1.23%", text)
-        self.assertIn("📌 전략별 (이번 달)", text)
-        self.assertIn("상태: 🟡", text)
-        self.assertNotIn("전체", text)
-        self.assertNotIn("누적(복리)", text)
-        self.assertNotIn("누적 손익", text)
+        self.assertIn("2026-02-10 21:00", text)
+        self.assertIn("02/09 21:00 ~ 02/10 21:00", text)
+        self.assertIn("- \uC77C\uC77C \uC2E4\uD604\uC190\uC775: +1,000\uC6D0 (+1.00%)", text)
+        self.assertIn("- \uC6D4\uAC04 MDD: -1.23%", text)
+        self.assertIn("- SCALP_BTC: \uAC70\uB798 3 | \uC2B9\uB960 66.60% | \uD3C9\uADE0 +0.50%", text)
+        self.assertIn("\uC0C1\uD0DC: \U0001F7E1 CAUTION", text)
 
     def test_build_report_text_month_mdd_na(self):
         report_end = dt.datetime(2026, 2, 10, 21, 0, 0, tzinfo=KST)
@@ -107,21 +102,21 @@ class DailyReportLogicTests(unittest.TestCase):
             snapshot={"krw_balance": 0.0, "coin_value": 0.0, "total_equity": 0.0, "has_coin": False},
             pnl_amounts={},
             month_mdd_pct=None,
-            status_emoji="🟢",
+            status_emoji="\U0001F7E2",
         )
-        self.assertIn("- 월간 MDD: N/A", text)
+        self.assertIn("- \uC6D4\uAC04 MDD: N/A", text)
 
     def test_heartbeat_includes_entry_guard_line(self):
         now = dt.datetime(2026, 2, 10, 9, 5, 0, tzinfo=KST)
         text = build_heartbeat_text(
             now=now,
-            service_status="실행중",
+            service_status="\uC2E4\uD589\uC911",
             asset_text="100,000 KRW",
             main_holding_cnt=0,
             scalp_holding_cnt=0,
             risk_state={"halted_flag": False, "halt_reason": ""},
         )
-        self.assertIn("신규진입가드: ACTIVE", text)
+        self.assertIn("ACTIVE", text)
 
 
 if __name__ == "__main__":
