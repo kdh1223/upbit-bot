@@ -430,6 +430,7 @@ SCALP_BTC_MIN_ORDER_BUFFER = 1.02
 # ===============================
 STATE_FILE = "bot_state.json"
 STATE_SAVE_INTERVAL_SEC = 30
+INSTANCE_LOCK_PATH = "/home/ubuntu/upbit-bot/.upbit_bot.instance.lock"
 
 TRADE_LOG_PATH = "trade_log.csv"
 STATUS_PRINT_SEC = 60
