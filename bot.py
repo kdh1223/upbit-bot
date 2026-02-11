@@ -347,6 +347,7 @@ def _update_global_risk_cut_state(
 
     drop_guard_pct = max(0.0, _safe_float(getattr(config, "RISK_EQUITY_DROP_GUARD_PCT", 0.20), 0.20))
     drop_guard_ticks = max(1, int(getattr(config, "RISK_EQUITY_DROP_GUARD_TICKS", 30)))
+    strict_no_holdings = bool(getattr(config, "RISK_EQUITY_DROP_GUARD_STRICT_NO_HOLDINGS", True))
     prev_drop_guard_streak = max(0, int(s.get("eq_drop_guard_streak", 0)))
     suspicious_drop = (
         holdings_cnt <= 0
@@ -357,7 +358,11 @@ def _update_global_risk_cut_state(
 
     if suspicious_drop:
         s["eq_drop_guard_streak"] = prev_drop_guard_streak + 1
-        if int(s["eq_drop_guard_streak"]) < drop_guard_ticks:
+        if strict_no_holdings:
+            # No open positions: treat deep equity drop as API noise by default.
+            cur_eq = float(last_good_eq)
+            used_last_good = True
+        elif int(s["eq_drop_guard_streak"]) < drop_guard_ticks:
             cur_eq = float(last_good_eq)
             used_last_good = True
         else:

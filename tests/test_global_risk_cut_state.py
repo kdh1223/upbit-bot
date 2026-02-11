@@ -16,6 +16,7 @@ class GlobalRiskCutStateTests(unittest.TestCase):
         self._set("RISK_CUT_CONFIRM_TICKS", 3)
         self._set("RISK_EQUITY_DROP_GUARD_PCT", 0.20)
         self._set("RISK_EQUITY_DROP_GUARD_TICKS", 30)
+        self._set("RISK_EQUITY_DROP_GUARD_STRICT_NO_HOLDINGS", True)
 
     def tearDown(self):
         for name, original in self._backup.items():
@@ -64,9 +65,29 @@ class GlobalRiskCutStateTests(unittest.TestCase):
         self.assertAlmostEqual(float(info.get("last_good_equity", 0.0)), 100_000.0, places=6)
         self.assertFalse(info.get("halted", False))
 
-    def test_sudden_drop_without_holdings_is_guarded_temporarily(self):
+    def test_sudden_drop_without_holdings_is_guarded_strictly(self):
         self._set("RISK_CUT_CONFIRM_TICKS", 1)
         self._set("RISK_EQUITY_DROP_GUARD_TICKS", 3)
+        state = bot._normalize_runtime_risk_state({})
+        base = dt.datetime(2026, 2, 11, 10, 0, 0)
+
+        bot._update_global_risk_cut_state(now=base, equity=100_000.0, risk_state=state, holdings_count=0)
+        snap = []
+        for i in range(1, 6):
+            info, _, triggered = bot._update_global_risk_cut_state(
+                now=base + dt.timedelta(seconds=i),
+                equity=69_000.0,
+                risk_state=state,
+                holdings_count=0,
+            )
+            snap.append((info, triggered))
+
+        self.assertTrue(all(not x[0]["halted"] for x in snap))
+
+    def test_sudden_drop_without_holdings_can_fallback_to_legacy_behavior(self):
+        self._set("RISK_CUT_CONFIRM_TICKS", 1)
+        self._set("RISK_EQUITY_DROP_GUARD_TICKS", 3)
+        self._set("RISK_EQUITY_DROP_GUARD_STRICT_NO_HOLDINGS", False)
         state = bot._normalize_runtime_risk_state({})
         base = dt.datetime(2026, 2, 11, 10, 0, 0)
 

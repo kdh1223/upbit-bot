@@ -42,6 +42,7 @@ EVENT_TITLE = {
 _CRITICAL_MISSED_EVENTS = {
     "ORDER_BUY_FILLED",
     "ORDER_SELL_FILLED",
+    "POSITION_CLOSED",
     "ORDER_PARTIAL_FILL",
     "TP1_HIT",
     "TP2_HIT",
@@ -415,13 +416,18 @@ def tg_notify(event_type: str, message: str):
     if not text:
         return False
 
+    code = str(event_type or "").upper().strip()
     _flush_spool(force=False)
     payload = {"text": text}
     ok = _send_with_retry(event_type=event_type, payload_kind="sendMessage", payload=payload)
     if ok:
+        if code == "POSITION_CLOSED":
+            print("[TG_SEND] event=POSITION_CLOSED")
         _flush_spool(force=True)
         return True
 
+    if code == "POSITION_CLOSED":
+        print("[TG_FAIL] event=POSITION_CLOSED queued")
     _append_spool(_spool_item(event_type=event_type, payload_kind="sendMessage", payload=payload))
     _alert_telegram_missed(event_type=event_type, payload_kind="sendMessage")
     return False

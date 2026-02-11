@@ -251,6 +251,9 @@ RISK_CUT_CONFIRM_TICKS = 3
 # until this many consecutive ticks confirm the drop.
 RISK_EQUITY_DROP_GUARD_PCT = 0.20
 RISK_EQUITY_DROP_GUARD_TICKS = 30
+# When no position is held, keep using last-good equity on suspicious drops
+# to prevent false account-level risk halts from transient KRW balance glitches.
+RISK_EQUITY_DROP_GUARD_STRICT_NO_HOLDINGS = True
 
 # ===============================
 # MAIN strategy

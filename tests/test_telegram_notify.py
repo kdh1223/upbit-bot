@@ -4,6 +4,7 @@ import tempfile
 import unittest
 from unittest import mock
 
+import utils.telegram_notify as telegram_notify
 from utils.telegram_notify import build_event_message, build_order_message, flush_telegram_spool, tg_notify
 
 
@@ -26,6 +27,9 @@ class TelegramNotifyTests(unittest.TestCase):
         self.assertIn("\uAC00\uACA9:", msg)
         self.assertIn("\uC218\uB7C9:", msg)
         self.assertIn("\uC0AC\uC720: ENTRY", msg)
+
+    def test_position_closed_is_critical_missed_event(self):
+        self.assertTrue(telegram_notify._is_critical_event("POSITION_CLOSED"))
 
     def test_tg_notify_returns_false_without_env(self):
         old_env_file = os.environ.get("TELEGRAM_ENV_FILE")
@@ -74,6 +78,43 @@ class TelegramNotifyTests(unittest.TestCase):
                     rows = [json.loads(line) for line in f if line.strip()]
                 self.assertGreaterEqual(len(rows), 1)
                 self.assertEqual(rows[0].get("event_type"), "ORDER_BUY_FILLED")
+            finally:
+                if old_token is None:
+                    os.environ.pop("TELEGRAM_TOKEN", None)
+                else:
+                    os.environ["TELEGRAM_TOKEN"] = old_token
+                if old_chat is None:
+                    os.environ.pop("TELEGRAM_CHAT_ID", None)
+                else:
+                    os.environ["TELEGRAM_CHAT_ID"] = old_chat
+                if old_spool is None:
+                    os.environ.pop("TELEGRAM_SPOOL_PATH", None)
+                else:
+                    os.environ["TELEGRAM_SPOOL_PATH"] = old_spool
+                if old_env_file is None:
+                    os.environ.pop("TELEGRAM_ENV_FILE", None)
+                else:
+                    os.environ["TELEGRAM_ENV_FILE"] = old_env_file
+
+    def test_position_closed_failure_prints_missed_alert(self):
+        old_token = os.environ.get("TELEGRAM_TOKEN")
+        old_chat = os.environ.get("TELEGRAM_CHAT_ID")
+        old_spool = os.environ.get("TELEGRAM_SPOOL_PATH")
+        old_env_file = os.environ.get("TELEGRAM_ENV_FILE")
+        with tempfile.TemporaryDirectory() as td:
+            spool_path = os.path.join(td, "telegram_spool.jsonl")
+            os.environ["TELEGRAM_TOKEN"] = "test_token"
+            os.environ["TELEGRAM_CHAT_ID"] = "test_chat"
+            os.environ["TELEGRAM_SPOOL_PATH"] = spool_path
+            os.environ["TELEGRAM_ENV_FILE"] = "__missing__.env"
+            try:
+                with mock.patch("requests.post", side_effect=RuntimeError("network down")), mock.patch(
+                    "time.sleep", return_value=None
+                ), mock.patch("builtins.print") as mock_print:
+                    ok = tg_notify("POSITION_CLOSED", "closed")
+                self.assertFalse(ok)
+                joined = "\n".join(" ".join(str(x) for x in c.args) for c in mock_print.call_args_list)
+                self.assertIn("[ALERT][TELEGRAM_MISSED] event=POSITION_CLOSED kind=sendMessage", joined)
             finally:
                 if old_token is None:
                     os.environ.pop("TELEGRAM_TOKEN", None)
