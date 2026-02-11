@@ -36,6 +36,17 @@ class DailyReportLogicTests(unittest.TestCase):
         self.assertEqual(m["n"], 1)
         self.assertAlmostEqual(m["avg"], -1.0, places=6)
 
+    def test_build_metrics_repairs_legacy_minus_100_pnl_from_prices(self):
+        rows = [
+            {"pnl_pct": "-100.0", "entry_price": "3316", "exit_price": "3277", "reason": "STOPLOSS"},
+            {"pnl_pct": "-0.93", "entry_price": "3557", "exit_price": "3548", "reason": "STOPLOSS"},
+            {"pnl_pct": "-1.18", "entry_price": "3316", "exit_price": "3277", "reason": "STOPLOSS"},
+        ]
+        m = build_metrics(rows)
+        self.assertEqual(m["n"], 3)
+        self.assertGreater(m["avg"], -10.0)
+        self.assertGreater(m["min"], -10.0)
+
     def test_snapshot_mdd_is_negative(self):
         points = [
             (dt.datetime(2026, 2, 1, 21, 0, 0, tzinfo=KST), 1_000_000.0),

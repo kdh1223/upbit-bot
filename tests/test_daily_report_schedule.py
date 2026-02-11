@@ -49,6 +49,23 @@ class DailyReportScheduleTests(unittest.TestCase):
         self.assertFalse(ok)
         self.assertTrue(any("outside KST window" in line for line in logs))
 
+    def test_blocks_send_before_target_even_within_legacy_pre_window(self):
+        logs = []
+        with TemporaryDirectory() as td:
+            self._set("REPORT_SCHEDULE_STATE_FILE", str(Path(td) / "schedule_state.json"))
+            now = dt.datetime(2026, 2, 11, 20, 45, 0, tzinfo=KST)
+            ok, _ = _should_send_scheduled(
+                now=now,
+                task_key="daily_report",
+                target_hour=21,
+                target_min=0,
+                window_min=30,
+                force=False,
+                log_line=logs.append,
+            )
+        self.assertFalse(ok)
+        self.assertTrue(any("before target" in line for line in logs))
+
     def test_allows_once_and_dedupes_same_kst_day(self):
         logs = []
         with TemporaryDirectory() as td:

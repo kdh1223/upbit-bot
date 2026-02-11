@@ -4,6 +4,7 @@ import argparse
 import csv
 import datetime as dt
 import json
+import math
 import os
 import subprocess
 import traceback
@@ -157,11 +158,39 @@ def _is_partial_reason(reason: str) -> bool:
     return code in {"TP1", "TP2_PARTIAL"}
 
 
+def _derive_pnl_pct_from_prices(row: Dict[str, str]) -> Optional[float]:
+    entry = _to_float((row or {}).get("entry_price", 0.0), 0.0)
+    exit_ = _to_float((row or {}).get("exit_price", 0.0), 0.0)
+    if entry > 0 and exit_ > 0:
+        return (float(exit_) / float(entry) - 1.0) * 100.0
+    return None
+
+
+def _row_pnl_pct_for_metrics(row: Dict[str, str]) -> float:
+    """
+    Guard daily-report stats from legacy malformed pnl_pct (e.g. -100% artifacts).
+    Prefer logged pnl_pct, but if it is clearly invalid and prices are sane, fallback
+    to price-derived pnl.
+    """
+    logged = _to_float((row or {}).get("pnl_pct", 0.0), 0.0)
+    if not math.isfinite(logged):
+        logged = 0.0
+
+    derived = _derive_pnl_pct_from_prices(row)
+    if derived is None or (not math.isfinite(derived)):
+        return float(logged)
+
+    # Legacy settlement glitch occasionally wrote -100% even when exit/entry shows normal loss.
+    if float(logged) <= -95.0 and float(derived) > -30.0:
+        return float(derived)
+    return float(logged)
+
+
 def _compound_return_pct(rows: List[Dict[str, str]]) -> float:
     rows = [r for r in rows if not _is_partial_reason(r.get("reason", ""))]
     mult = 1.0
     for row in rows:
-        pnl = _to_float(row.get("pnl_pct", 0.0), 0.0)
+        pnl = _row_pnl_pct_for_metrics(row)
         mult *= (1.0 + pnl / 100.0)
     return (mult - 1.0) * 100.0
 
@@ -169,13 +198,13 @@ def _compound_return_pct(rows: List[Dict[str, str]]) -> float:
 def build_metrics(rows: List[Dict[str, str]]):
     rows = [r for r in rows if not _is_partial_reason(r.get("reason", ""))]
     n = len(rows)
-    pnls = [_to_float(row.get("pnl_pct", 0.0), 0.0) for row in rows]
+    pnls = [_row_pnl_pct_for_metrics(row) for row in rows]
     wins = sum(1 for x in pnls if x > 0)
     wr = (wins / n * 100.0) if n > 0 else 0.0
     avg = (sum(pnls) / n) if n > 0 else 0.0
     cum = _compound_return_pct(rows) if n > 0 else 0.0
-    max_pnl = max(pnls) if pnls else 0.0
-    min_pnl = min(pnls) if pnls else 0.0
+    max_pnl = max((x for x in pnls if x > 0), default=0.0)
+    min_pnl = min((x for x in pnls if x < 0), default=0.0)
     sl_cnt = sum(1 for row in rows if _is_stop_reason(row.get("reason", "")))
     sl_ratio = (sl_cnt / n * 100.0) if n > 0 else 0.0
     recent = pnls[-10:]
@@ -751,11 +780,17 @@ def _should_send_scheduled(
         return True, target
 
     w_min = max(1, int(window_min))
-    delta_min = abs((kst_now - target).total_seconds()) / 60.0
+    delta_min = (kst_now - target).total_seconds() / 60.0
+    if delta_min < 0:
+        log_line(
+            f"[INFO] {task_key} skip: outside KST window (before target) "
+            f"now={kst_now.strftime('%H:%M')} target={target.strftime('%H:%M')} window=+{w_min}m"
+        )
+        return False, target
     if delta_min > float(w_min):
         log_line(
             f"[INFO] {task_key} skip: outside KST window "
-            f"now={kst_now.strftime('%H:%M')} target={target.strftime('%H:%M')} window=+/-{w_min}m"
+            f"now={kst_now.strftime('%H:%M')} target={target.strftime('%H:%M')} window=+{w_min}m"
         )
         return False, target
 
@@ -824,8 +859,11 @@ def main():
             return
         if not has_telegram_credentials():
             log_line("[WARN] TELEGRAM_TOKEN/TELEGRAM_CHAT_ID missing; heartbeat will be queued to spool")
-        send_heartbeat(_kst_now(now), log_line)
-        _mark_scheduled_sent("heartbeat", target, log_line)
+        hb_ok = send_heartbeat(_kst_now(now), log_line)
+        if hb_ok:
+            _mark_scheduled_sent("heartbeat", target, log_line)
+        else:
+            log_line("[WARN] heartbeat not marked as sent due telegram delivery failure")
         return
 
     should_send_report, report_target = _should_send_scheduled(
@@ -927,9 +965,10 @@ def main():
     text_ok = bool(tg_notify(event_type="DAILY_REPORT", message=text))
     if text_ok:
         log_line("[OK] telegram text sent")
+        _mark_scheduled_sent("daily_report", report_target, log_line)
     else:
         log_line("[WARN] telegram text send failed or queued to spool")
-    _mark_scheduled_sent("daily_report", report_target, log_line)
+        log_line("[WARN] daily_report not marked as sent due telegram delivery failure")
 
 
 if __name__ == "__main__":
