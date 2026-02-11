@@ -1552,10 +1552,10 @@ def _scalp_btc_close_position(
         )
         return False, f"sell_failed:{err_msg}"
 
-        state["total_sell_krw"] = max(0.0, _safe_float(state.get("total_sell_krw", 0.0), 0.0)) + (float(qty) * float(cur))
-        state["last_exit_reason"] = exit_reason
-        total_sell_krw = float(state.get("total_sell_krw", 0.0))
-        realized_krw = float(total_sell_krw) - float(total_buy_krw)
+    state["total_sell_krw"] = max(0.0, _safe_float(state.get("total_sell_krw", 0.0), 0.0)) + (float(qty) * float(cur))
+    state["last_exit_reason"] = exit_reason
+    total_sell_krw = float(state.get("total_sell_krw", 0.0))
+    realized_krw = float(total_sell_krw) - float(total_buy_krw)
     realized_pct = (realized_krw / float(total_buy_krw) * 100.0) if total_buy_krw > 0 else 0.0
 
     cd_min = int(getattr(config, "SCALP_BTC_COOLDOWN_PROFIT_MIN", 10))
