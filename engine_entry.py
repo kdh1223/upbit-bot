@@ -9,6 +9,8 @@ from indicators import check_filters, get_rsi, intraday_trend_ok, minute_entry_o
 from strategy import calc_target
 from utils.telegram_notify import notify_event, notify_order
 
+_SURGE_GUARD_LAST_LOG = {}
+
 
 def _safe_caches(prices):
     caches = prices.get("_caches")
@@ -47,6 +49,106 @@ def _normalize_main_mode(mode: str) -> str:
     if m not in {"AGGRESSIVE", "CONSERVATIVE"}:
         m = "CONSERVATIVE"
     return m
+
+
+def _safe_pct_change(cur: float, base: float) -> float:
+    try:
+        c = float(cur)
+        b = float(base)
+        if b <= 0:
+            return 0.0
+        return ((c / b) - 1.0) * 100.0
+    except Exception:
+        return 0.0
+
+
+def _surge_guard_exempt_tickers() -> set:
+    raw = getattr(config, "SURGE_EXTRA_GUARD_EXEMPT_TICKERS", {"KRW-BTC", "KRW-ETH", "KRW-XRP"})
+    if isinstance(raw, str):
+        items = [x.strip().upper() for x in raw.split(",")]
+        return {x for x in items if x}
+    if isinstance(raw, (list, tuple, set)):
+        out = set()
+        for x in raw:
+            s = str(x).strip().upper()
+            if s:
+                out.add(s)
+        return out
+    return {"KRW-BTC", "KRW-ETH", "KRW-XRP"}
+
+
+def _log_surge_guard_block_once(ticker: str, reason: str, now):
+    key = f"{str(ticker).upper()}::{str(reason)}"
+    try:
+        bucket = now.replace(second=0, microsecond=0)
+    except Exception:
+        bucket = str(now)
+    if _SURGE_GUARD_LAST_LOG.get(key) == bucket:
+        return
+    _SURGE_GUARD_LAST_LOG[key] = bucket
+    print(f"[ENTRY_BLOCK][MAIN] reason={reason} ticker={ticker}")
+
+
+def _main_surge_extra_guard_ok(ticker: str, now, minute_cache) -> tuple[bool, str]:
+    if not bool(getattr(config, "SURGE_EXTRA_GUARD_ENABLED", True)):
+        return True, "DISABLED"
+
+    t = str(ticker or "").upper().strip()
+    if not t:
+        return True, "EMPTY"
+
+    if t in _surge_guard_exempt_tickers():
+        return True, "EXEMPT"
+
+    interval = str(getattr(config, "SURGE_EXTRA_GUARD_INTERVAL", "minute1"))
+    cache_sec = max(0.0, float(getattr(config, "SURGE_EXTRA_GUARD_CACHE_SEC", 5)))
+    cache_key = f"main_surge_guard::{t}"
+    cached = minute_cache.get(cache_key)
+    if cached and (now - cached[1]).total_seconds() < cache_sec:
+        return bool(cached[0]), str(cached[2])
+
+    try:
+        df = pyupbit.get_ohlcv(t, interval=interval, count=8)
+    except Exception:
+        minute_cache[cache_key] = (True, now, "FETCH_ERROR")
+        return True, "FETCH_ERROR"
+
+    if df is None or len(df) < 6:
+        minute_cache[cache_key] = (True, now, "DATA_SHORT")
+        return True, "DATA_SHORT"
+
+    try:
+        close_now = float(df["close"].iloc[-1])
+        close_prev_1m = float(df["close"].iloc[-2])
+        close_prev_5m = float(df["close"].iloc[-6])
+        open_now = float(df["open"].iloc[-1])
+    except Exception:
+        minute_cache[cache_key] = (True, now, "DATA_NAN")
+        return True, "DATA_NAN"
+
+    move_1m = abs(_safe_pct_change(close_now, close_prev_1m))
+    move_5m = abs(_safe_pct_change(close_now, close_prev_5m))
+    body_now = abs(_safe_pct_change(close_now, open_now))
+
+    lim_1m = max(0.1, float(getattr(config, "SURGE_EXTRA_GUARD_1M_MAX_PCT", 3.0)))
+    lim_5m = max(0.1, float(getattr(config, "SURGE_EXTRA_GUARD_5M_MAX_PCT", 10.0)))
+    lim_body = max(0.1, float(getattr(config, "SURGE_EXTRA_GUARD_BODY_MAX_PCT", 2.5)))
+
+    if move_1m >= lim_1m:
+        reason = f"SURGE_GUARD_1M({move_1m:.2f}%>={lim_1m:.2f}%)"
+        minute_cache[cache_key] = (False, now, reason)
+        return False, reason
+    if move_5m >= lim_5m:
+        reason = f"SURGE_GUARD_5M({move_5m:.2f}%>={lim_5m:.2f}%)"
+        minute_cache[cache_key] = (False, now, reason)
+        return False, reason
+    if body_now >= lim_body:
+        reason = f"SURGE_GUARD_BODY({body_now:.2f}%>={lim_body:.2f}%)"
+        minute_cache[cache_key] = (False, now, reason)
+        return False, reason
+
+    minute_cache[cache_key] = (True, now, "OK")
+    return True, "OK"
 
 
 def _normalize_main_tp_ratios(tp1, tp2, runner):
@@ -318,6 +420,11 @@ def try_main_entries(
             can_new, _ = position_manager.can_open_new_position(state, ticker)
             if not can_new:
                 continue
+
+        surge_guard_ok, surge_guard_reason = _main_surge_extra_guard_ok(ticker, now, minute_cache)
+        if not surge_guard_ok:
+            _log_surge_guard_block_once(ticker, surge_guard_reason, now)
+            continue
 
         if not entry_passes_filters(
             ticker,
