@@ -29,6 +29,7 @@ from indicators import (
 from market import (
     filter_tradeable_tickers,
     get_balance,
+    get_balance_info,
     get_top_tickers_by_value,
     get_upbit_krw_markets,
     load_keys,
@@ -981,7 +982,8 @@ def estimate_equity(krw: float, strategy_state: dict, prices: dict, upbit, inact
         # Prefer live balance but fall back to state qty on transient API errors.
         vol = 0.0
         try:
-            vol = float(get_balance(upbit, coin))
+            _, total_vol = get_balance_info(upbit, coin)
+            vol = float(total_vol)
         except Exception:
             vol = 0.0
         if vol <= 0:
@@ -2064,17 +2066,20 @@ def run():
                 price_targets.add(btc_ticker)
             prices = batch_get_prices(price_targets)
 
-            krw = float(get_balance(upbit, "KRW"))
+            krw_avail, krw_total = get_balance_info(upbit, "KRW")
+            krw = max(0.0, float(krw_avail))
+            krw_for_equity = max(float(krw), float(krw_total))
             prices["_krw"] = krw
             prices["_caches"] = (day_cache, intraday_cache, minute_cache)
 
-            equity = estimate_equity(krw, strategy_state, prices, upbit, inactive_positions=inactive_positions)
+            equity = estimate_equity(krw_for_equity, strategy_state, prices, upbit, inactive_positions=inactive_positions)
             if _scalp_btc_is_holding(scalp_btc_state):
                 btc_px = prices.get(btc_ticker)
                 if btc_px is not None:
                     qty = float(scalp_btc_state.get("qty", 0.0))
                     if bool(getattr(config, "REAL_ORDER", False)):
-                        qty = float(get_balance(upbit, btc_ticker.split("-")[1]))
+                        _, qty_total = get_balance_info(upbit, btc_ticker.split("-")[1])
+                        qty = float(qty_total)
                     if qty > 0:
                         equity += qty * float(btc_px)
 

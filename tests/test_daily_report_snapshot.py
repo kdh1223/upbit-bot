@@ -31,7 +31,7 @@ class DailyReportSnapshotTests(unittest.TestCase):
             return None
 
         with patch("run_daily_report.load_keys", return_value=("a", "b")), patch(
-            "run_daily_report.get_balance", return_value=50_000.0
+            "run_daily_report.get_balance_info", return_value=(50_000.0, 50_000.0)
         ), patch("run_daily_report.pyupbit.Upbit", return_value=_FakeUpbit(accounts)), patch(
             "run_daily_report.pyupbit.get_tickers", return_value=["KRW-BTC", "KRW-ETH"]
         ), patch(
@@ -48,7 +48,7 @@ class DailyReportSnapshotTests(unittest.TestCase):
         accounts = [{"currency": "USDT", "balance": "10", "locked": "0"}]
 
         with patch("run_daily_report.load_keys", return_value=("a", "b")), patch(
-            "run_daily_report.get_balance", return_value=12_345.0
+            "run_daily_report.get_balance_info", return_value=(12_345.0, 12_345.0)
         ), patch("run_daily_report.pyupbit.Upbit", return_value=_FakeUpbit(accounts)), patch(
             "run_daily_report.pyupbit.get_tickers", return_value=["KRW-BTC", "KRW-ETH"]
         ):
@@ -59,7 +59,18 @@ class DailyReportSnapshotTests(unittest.TestCase):
         self.assertEqual(snapshot["total_equity"], 12_345.0)
         self.assertTrue(any("skip non-KRW market holdings" in line for line in logs))
 
+    def test_snapshot_uses_total_krw_including_locked(self):
+        logs = []
+        accounts = []
+        with patch("run_daily_report.load_keys", return_value=("a", "b")), patch(
+            "run_daily_report.get_balance_info", return_value=(69_366.0, 99_115.0)
+        ), patch("run_daily_report.pyupbit.Upbit", return_value=_FakeUpbit(accounts)):
+            snapshot = _safe_account_snapshot(logs.append)
+
+        self.assertEqual(snapshot["krw_available"], 69_366.0)
+        self.assertEqual(snapshot["krw_balance"], 99_115.0)
+        self.assertEqual(snapshot["total_equity"], 99_115.0)
+
 
 if __name__ == "__main__":
     unittest.main()
-

@@ -56,10 +56,10 @@ def _warn_balance_issue_once(msg: str):
     print(f"[WARN] balance fetch issue: {msg}")
 
 
-def _pick_balance_from_accounts(accounts, currency: str) -> float:
+def _pick_balance_fields_from_accounts(accounts, currency: str) -> Tuple[float, float]:
     cur = str(currency or "").upper().strip()
     if not cur:
-        return 0.0
+        return 0.0, 0.0
 
     for row in accounts:
         if not isinstance(row, dict):
@@ -68,26 +68,37 @@ def _pick_balance_from_accounts(accounts, currency: str) -> float:
         if coin != cur:
             continue
         try:
-            return float(row.get("balance") or 0.0)
+            bal = float(row.get("balance") or 0.0)
         except Exception:
-            return 0.0
-    return 0.0
+            bal = 0.0
+        try:
+            locked = float(row.get("locked") or 0.0)
+        except Exception:
+            locked = 0.0
+        return max(0.0, bal), max(0.0, locked)
+    return 0.0, 0.0
 
 
-def get_balance(upbit: pyupbit.Upbit, currency: str) -> float:
+def get_balance_info(upbit: pyupbit.Upbit, currency: str) -> Tuple[float, float]:
     """
     Safe balance fetch wrapper.
     Avoids noisy pyupbit.get_balance() exception-class prints and handles
     unexpected payloads defensively.
+
+    Returns:
+    - available balance
+    - total balance (available + locked)
     """
     try:
         accounts = upbit.get_balances()
     except Exception as e:
         _warn_balance_issue_once(f"{type(e).__name__}: {e}")
-        return 0.0
+        return 0.0, 0.0
 
     if isinstance(accounts, list):
-        return _pick_balance_from_accounts(accounts, currency)
+        bal, locked = _pick_balance_fields_from_accounts(accounts, currency)
+        total = max(0.0, float(bal) + float(locked))
+        return float(max(0.0, bal)), float(total)
 
     if isinstance(accounts, dict):
         err = accounts.get("error")
@@ -97,9 +108,26 @@ def get_balance(upbit: pyupbit.Upbit, currency: str) -> float:
             _warn_balance_issue_once(f"api_error name={name} msg={msg}")
         else:
             _warn_balance_issue_once(f"unexpected dict payload keys={list(accounts.keys())[:5]}")
-        return 0.0
+        return 0.0, 0.0
 
     _warn_balance_issue_once(f"unexpected payload type={type(accounts).__name__}")
+    return 0.0, 0.0
+
+
+def get_balance(upbit: pyupbit.Upbit, currency: str) -> float:
+    bal, _ = get_balance_info(upbit, currency)
+    return float(max(0.0, bal))
+
+
+def get_total_balance(upbit: pyupbit.Upbit, currency: str) -> float:
+    _, total = get_balance_info(upbit, currency)
+    return float(max(0.0, total))
+
+
+def _pick_balance_from_accounts(accounts, currency: str) -> float:
+    # Backward-compatible helper used by legacy call sites/tests.
+    bal, _ = _pick_balance_fields_from_accounts(accounts, currency)
+    return float(max(0.0, bal))
     return 0.0
 
 

@@ -13,7 +13,7 @@ from zoneinfo import ZoneInfo
 import pyupbit
 
 import config
-from market import get_balance, load_keys
+from market import get_balance_info, load_keys
 from state_store import load_state
 from utils.log_paths import list_trade_log_paths, report_log_path_for, trade_log_path_for
 from utils.telegram_notify import has_telegram_credentials, load_telegram_env_file, tg_notify
@@ -266,6 +266,7 @@ def _fetch_price_map_with_fallback(tickers: List[str], log_line=None) -> Dict[st
 def _safe_account_snapshot(log_line):
     snapshot = {
         "krw_balance": 0.0,
+        "krw_available": 0.0,
         "coin_value": 0.0,
         "total_equity": 0.0,
         "has_coin": False,
@@ -273,8 +274,9 @@ def _safe_account_snapshot(log_line):
     try:
         access, secret = load_keys()
         upbit = pyupbit.Upbit(access, secret)
-        krw_balance = float(get_balance(upbit, "KRW"))
-        snapshot["krw_balance"] = float(max(0.0, krw_balance))
+        krw_available, krw_total = get_balance_info(upbit, "KRW")
+        snapshot["krw_available"] = float(max(0.0, krw_available))
+        snapshot["krw_balance"] = float(max(0.0, krw_total))
 
         coin_qty = {}
         try:
@@ -627,7 +629,7 @@ def _safe_krw_balance(log_line) -> str:
     try:
         access, secret = load_keys()
         upbit = pyupbit.Upbit(access, secret)
-        krw = float(get_balance(upbit, "KRW"))
+        _avail, krw = get_balance_info(upbit, "KRW")
         return f"{krw:,.0f} KRW"
     except Exception as e:
         log_line(f"[ERR] heartbeat balance calc failed: {type(e).__name__}: {e}")

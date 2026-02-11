@@ -18,7 +18,7 @@ class EquityEstimateFallbackTests(unittest.TestCase):
         }
         prices = {}
 
-        with patch("bot.get_balance", return_value=0.0):
+        with patch("bot.get_balance_info", return_value=(0.0, 0.0)):
             eq = bot.estimate_equity(krw=50_000.0, strategy_state=strategy_state, prices=prices, upbit=object())
 
         # 50,000 + (0.1234 * 100,000) = 62,340
@@ -37,7 +37,7 @@ class EquityEstimateFallbackTests(unittest.TestCase):
         }
         prices = {"KRW-BTC": 120_000.0}
 
-        with patch("bot.get_balance", return_value=1.0):
+        with patch("bot.get_balance_info", return_value=(1.0, 1.0)):
             eq = bot.estimate_equity(krw=10_000.0, strategy_state=strategy_state, prices=prices, upbit=object())
 
         self.assertAlmostEqual(eq, 130_000.0, places=6)
@@ -57,7 +57,7 @@ class EquityEstimateFallbackTests(unittest.TestCase):
         }
         prices = {"KRW-BTC": 120_000.0}
 
-        with patch("bot.get_balance", return_value=0.0):
+        with patch("bot.get_balance_info", return_value=(0.0, 0.0)):
             eq = bot.estimate_equity(krw=10_000.0, strategy_state=strategy_state, prices=prices, upbit=object())
 
         self.assertAlmostEqual(eq, 130_000.0, places=6)
