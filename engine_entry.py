@@ -86,8 +86,36 @@ def _resolve_main_tp_ratios(mode: str):
     )
 
 
-def _apply_main_tp_profile_on_entry(state_row: dict, mode: str):
+def _resolve_small_equity_tp_override(equity):
+    if not bool(getattr(config, "SMALL_EQUITY_MAIN_TP_PROFILE_ENABLED", False)):
+        return None
+
+    try:
+        eq = float(equity)
+    except Exception:
+        return None
+
+    max_equity = float(getattr(config, "SMALL_EQUITY_MAIN_TP_MAX_EQUITY", 200_000))
+    if eq <= 0 or eq > max_equity:
+        return None
+
+    row = getattr(config, "SMALL_EQUITY_MAIN_TP_RATIOS", None)
+    if not isinstance(row, dict):
+        row = {"TP1": 0.60, "TP2": 0.00, "RUNNER": 0.40}
+
+    return _normalize_main_tp_ratios(
+        row.get("TP1", 0.60),
+        row.get("TP2", 0.00),
+        row.get("RUNNER", 0.40),
+    )
+
+
+def _apply_main_tp_profile_on_entry(state_row: dict, mode: str, equity=None):
     tp1_ratio, tp2_ratio, runner_ratio = _resolve_main_tp_ratios(mode)
+    small_equity_ratios = _resolve_small_equity_tp_override(equity)
+    if small_equity_ratios is not None:
+        tp1_ratio, tp2_ratio, runner_ratio = small_equity_ratios
+
     state_row["entry_mode"] = _normalize_main_mode(mode)
     state_row["tp1_ratio"] = float(tp1_ratio)
     state_row["tp2_ratio"] = float(tp2_ratio)
@@ -365,7 +393,7 @@ def try_main_entries(
                 entry_ts=float(now.timestamp()),
             )
             state[ticker]["entry_bucket"] = "CORE"
-            _apply_main_tp_profile_on_entry(state[ticker], mode=main_mode)
+            _apply_main_tp_profile_on_entry(state[ticker], mode=main_mode, equity=equity)
             if isinstance(entry_params, dict):
                 state[ticker]["sl_one_pct"] = abs(float(entry_params.get("sl_one", 0.0)))
                 # MAIN always uses TP1/TP2/RUNNER staged exits.

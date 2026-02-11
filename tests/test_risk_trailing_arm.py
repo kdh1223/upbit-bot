@@ -205,6 +205,31 @@ class RiskTrailingArmTests(unittest.TestCase):
         self.assertTrue(r2.get("closed", False))
         self.assertEqual(r2.get("reason"), "RUNNER_TRAIL")
 
+    def test_main_tp1_arms_runner_when_tp2_ratio_zero(self):
+        self._set(
+            "TP_TABLE",
+            {
+                "LOW": {"TP1_PCT": 0.01, "TP2_PCT": 0.02, "TRAIL_BACK_PCT": 0.006},
+                "MID": {"TP1_PCT": 0.01, "TP2_PCT": 0.02, "TRAIL_BACK_PCT": 0.006},
+                "FULL": {"TP1_PCT": 0.01, "TP2_PCT": 0.02, "TRAIL_BACK_PCT": 0.006},
+                "HALT": {"TP1_PCT": 0.0, "TP2_PCT": 0.0, "TRAIL_BACK_PCT": 0.0},
+            },
+        )
+        state = self._base_state(entry_ts=1_000.0)
+        state["tp1_ratio"] = 0.60
+        state["tp2_ratio"] = 0.0
+        state["runner_ratio"] = 0.40
+
+        r1 = apply_risk_rules(None, "KRW-TEST", state, 101.1, self._mock_sell, now=1_120.0, strategy_tag="MAIN")
+        self.assertFalse(r1.get("closed", False))
+        self.assertTrue(state.get("tp1_done", False))
+        self.assertFalse(state.get("tp2_done", False))
+        self.assertTrue(state.get("runner_active", False))
+
+        r2 = apply_risk_rules(None, "KRW-TEST", state, 100.3, self._mock_sell, now=1_150.0, strategy_tag="MAIN")
+        self.assertTrue(r2.get("closed", False))
+        self.assertEqual(r2.get("reason"), "RUNNER_TRAIL")
+
     def test_main_runner_timeout_close(self):
         self._set(
             "TP_TABLE",

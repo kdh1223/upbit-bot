@@ -89,9 +89,9 @@ USE_MARKET_REGIME = False
 
 REGIME_INVEST_FRAC = {
     "HALT": 0.0,
-    "LOW": 0.6,
-    "MID": 0.6,
-    "FULL": 0.6,
+    "LOW": 0.7,
+    "MID": 0.7,
+    "FULL": 0.7,
 }
 REGIME_HOLDINGS_MULT = {
     "HALT": 1.0,
@@ -173,6 +173,11 @@ MAIN_TP_RATIOS = {
     "CONSERVATIVE": {"TP1": 0.60, "TP2": 0.30, "RUNNER": 0.10},
     "AGGRESSIVE": {"TP1": 0.40, "TP2": 0.40, "RUNNER": 0.20},
 }
+
+# Small account safety profile (applied on new MAIN entries only).
+SMALL_EQUITY_MAIN_TP_PROFILE_ENABLED = True
+SMALL_EQUITY_MAIN_TP_MAX_EQUITY = 200_000
+SMALL_EQUITY_MAIN_TP_RATIOS = {"TP1": 0.60, "TP2": 0.00, "RUNNER": 0.40}
 
 # MAIN runner (remaining size after TP2 partial) controls
 MAIN_RUNNER_TRAIL_GIVEBACK_PCT = 0.007

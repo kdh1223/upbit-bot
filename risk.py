@@ -351,6 +351,12 @@ def _ensure_main_stage_state(state: dict, now_ts: float, cur: float):
             state["runner_start_ts"] = float(now_ts)
 
 
+def _should_arm_runner_after_tp1(state: dict) -> bool:
+    tp2_ratio = _as_nonneg_float(state.get("tp2_ratio", 0.0), 0.0)
+    runner_ratio = _as_nonneg_float(state.get("runner_ratio", 0.0), 0.0)
+    return (tp2_ratio <= 1e-12) and (runner_ratio > 0.0)
+
+
 def _estimate_entry_qty(state: dict, entry: float) -> float:
     qty_hint = _as_nonneg_float(state.get("qty", 0.0), 0.0)
     if qty_hint > 0:
@@ -521,6 +527,15 @@ def apply_risk_rules(upbit, ticker: str, state: dict, cur: float, market_sell, n
                     dust_closed = _close_main_dust_after_partial()
                     if dust_closed:
                         return dust_closed
+
+                    if _should_arm_runner_after_tp1(state):
+                        state["runner_active"] = True
+                        state["runner_hwm"] = max(
+                            _as_nonneg_float(state.get("runner_hwm", 0.0), 0.0),
+                            float(cur),
+                        )
+                        if _as_nonneg_float(state.get("runner_start_ts", 0.0), 0.0) <= 0:
+                            state["runner_start_ts"] = float(now_ts)
 
         # MAIN staged TP2 partial -> activate runner
         if (not bool(state.get("tp2_done", False))) and tp2 > 0 and pnl >= tp2:
