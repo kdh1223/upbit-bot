@@ -13,8 +13,10 @@ from zoneinfo import ZoneInfo
 
 import pyupbit
 
+from bot import _calc_auto_strategy_mode, _entry_guard_window, apply_market_regime, estimate_equity, get_base_position_settings
 import config
-from market import get_balance_info, load_keys
+from indicators import get_market_regime
+from market import get_balance_info, get_upbit_krw_markets, load_keys
 from state_store import load_state
 from utils.log_paths import list_trade_log_paths, report_log_path_for, trade_log_path_for
 from utils.telegram_notify import has_telegram_credentials, load_telegram_env_file, tg_notify
@@ -683,6 +685,174 @@ def _count_holdings(strategy_state: dict, strategy: str) -> int:
     return int(out)
 
 
+def _copy_state_with_scalp_btc(strategy_state: dict, scalp_btc_state: dict) -> dict:
+    copied = {}
+    for strategy, bucket in (strategy_state or {}).items():
+        copied[str(strategy)] = {str(t): dict(pos or {}) for t, pos in ((bucket or {}).items())}
+
+    if bool((scalp_btc_state or {}).get("holding", False)):
+        ticker = str((scalp_btc_state or {}).get("ticker") or getattr(config, "SCALP_BTC_TICKER", "KRW-BTC")).upper().strip()
+        if ticker:
+            scalp_bucket = copied.setdefault("SCALP", {})
+            merged = dict(scalp_bucket.get(ticker, {}) or {})
+            merged.update(dict(scalp_btc_state or {}))
+            merged["holding"] = True
+            if _to_float(merged.get("entry", 0.0), 0.0) <= 0:
+                merged["entry"] = _to_float(merged.get("entry_price", 0.0), 0.0)
+            scalp_bucket[ticker] = merged
+    return copied
+
+
+def _collect_holding_tickers(strategy_state: dict, inactive_positions: dict) -> List[str]:
+    out: Set[str] = set()
+    for bucket in (strategy_state or {}).values():
+        for ticker, pos in ((bucket or {}).items()):
+            if bool((pos or {}).get("holding", False)):
+                t = str(ticker or "").upper().strip()
+                if t:
+                    out.add(t)
+    for ticker, pos in ((inactive_positions or {}).items()):
+        if bool((pos or {}).get("holding", False)):
+            t = str(ticker or "").upper().strip()
+            if t:
+                out.add(t)
+    return sorted(out)
+
+
+def _trading_day_start_21(now: dt.datetime) -> dt.datetime:
+    kst_now = _kst_now(now)
+    today_21 = kst_now.replace(hour=21, minute=0, second=0, microsecond=0)
+    if kst_now >= today_21:
+        return today_21
+    return today_21 - dt.timedelta(days=1)
+
+
+def _safe_market_regime(log_line) -> str:
+    if not bool(getattr(config, "USE_MARKET_REGIME", False)):
+        return "OFF"
+    try:
+        regime = str(get_market_regime() or "UNKNOWN").upper().strip()
+        return regime or "UNKNOWN"
+    except Exception as e:
+        if callable(log_line):
+            log_line(f"[WARN] mini_report regime calc failed: {type(e).__name__}: {e}")
+        return "UNKNOWN"
+
+
+def _safe_auto_mode(log_line, market_info: dict) -> str:
+    if not bool(getattr(config, "AUTO_STRATEGY_MODE", True)):
+        return "OFF"
+    try:
+        mode, _why = _calc_auto_strategy_mode(market_info=market_info)
+        mode = str(mode or "UNKNOWN").upper().strip()
+        return mode or "UNKNOWN"
+    except Exception as e:
+        if callable(log_line):
+            log_line(f"[WARN] mini_report auto mode calc failed: {type(e).__name__}: {e}")
+        return "UNKNOWN"
+
+
+def _safe_max_holdings_from_equity(equity: float, regime: str, log_line) -> int:
+    try:
+        _base_per_trade, base_max_holdings = get_base_position_settings(float(equity))
+        max_holdings = int(base_max_holdings)
+        if bool(getattr(config, "USE_MARKET_REGIME", False)):
+            _, max_holdings = apply_market_regime(float(equity), _base_per_trade, base_max_holdings, str(regime or "FULL"))
+        return max(1, int(max_holdings))
+    except Exception as e:
+        if callable(log_line):
+            log_line(f"[WARN] mini_report max_holdings calc failed: {type(e).__name__}: {e}")
+        return max(1, int(getattr(config, "MAX_HOLDINGS", 2)))
+
+
+def build_0900_mini_report_text(
+    regime: str,
+    auto_mode: str,
+    holding_cnt: int,
+    max_holdings: int,
+    equity_krw: float,
+    daily_pct: float,
+    month_mdd_pct: Optional[float],
+    guard_active: bool,
+    risk_state: dict,
+) -> str:
+    halted = bool((risk_state or {}).get("halted_flag", False))
+    halt_reason = str((risk_state or {}).get("halt_reason") or "").strip()
+    month_mdd_text = "N/A" if month_mdd_pct is None else f"{_to_float(month_mdd_pct, 0.0):+.2f}%"
+    lines = [
+        "\U0001F4CA 09:00 \uC6B4\uC601 \uC0C1\uD0DC (KST)",
+        "",
+        f"\uB808\uC9D0: {str(regime or 'UNKNOWN')} | AUTO: {str(auto_mode or 'UNKNOWN')}",
+        f"\uBCF4\uC720: {int(holding_cnt)} / {int(max_holdings)}",
+        f"\uCD1D\uC790\uC0B0: {max(0.0, _to_float(equity_krw, 0.0)):,.0f}\uC6D0",
+        f"\uC77C\uC190\uC775: {_to_float(daily_pct, 0.0):+.2f}% | \uC6D4 MDD: {month_mdd_text}",
+    ]
+    if halted:
+        if halt_reason:
+            lines.append(f"\uC0C1\uD0DC: \u26D4 HALTED ({halt_reason})")
+        else:
+            lines.append("\uC0C1\uD0DC: \u26D4 HALTED")
+    else:
+        lines.append(f"09:00~09:15 \uC2E0\uADDC\uC9C4\uC785\uAC00\uB4DC: {'ACTIVE' if bool(guard_active) else 'INACTIVE'}")
+    return "\n".join(lines)
+
+
+def send_0900_mini_report(now: dt.datetime, log_line):
+    try:
+        kst_now = _kst_now(now)
+        strategy_state, _, inactive_positions, scalp_btc_state, risk_state = load_state()
+        state_for_eq = _copy_state_with_scalp_btc(strategy_state, scalp_btc_state)
+
+        access, secret = load_keys()
+        upbit = pyupbit.Upbit(access, secret)
+        _krw_available, krw_total = get_balance_info(upbit, "KRW")
+        krw_total = max(0.0, _to_float(krw_total, 0.0))
+
+        holding_tickers = _collect_holding_tickers(state_for_eq, inactive_positions)
+        price_map = _fetch_price_map_with_fallback(holding_tickers, log_line=log_line)
+        equity = max(0.0, _to_float(estimate_equity(krw_total, state_for_eq, price_map, upbit, inactive_positions), 0.0))
+
+        market_info = get_upbit_krw_markets()
+        regime = _safe_market_regime(log_line)
+        auto_mode = _safe_auto_mode(log_line, market_info)
+        max_holdings = _safe_max_holdings_from_equity(equity, regime, log_line)
+        holding_cnt = _count_holdings(state_for_eq, "MAIN") + _count_holdings(state_for_eq, "SCALP")
+
+        day_start = _trading_day_start_21(kst_now)
+        month_start = day_start.replace(day=1, hour=21, minute=0, second=0, microsecond=0)
+        history_path = str(getattr(config, "REPORT_EQUITY_HISTORY_PATH", EQUITY_HISTORY_JSONL))
+        anchor_max_after_sec = float(getattr(config, "REPORT_ANCHOR_MAX_AFTER_SEC", EQUITY_ANCHOR_MAX_AFTER_SEC))
+        equity_history = _load_equity_history(history_path, log_line=log_line)
+
+        daily_anchor = _find_anchor_equity(equity_history, day_start, max_after_sec=anchor_max_after_sec)
+        _, daily_pct, _ = _calc_snapshot_pnl(equity, daily_anchor)
+        month_points = _build_month_equity_points(equity_history, month_start, kst_now, equity)
+        month_mdd_pct = _calc_mdd_from_equity_points(month_points)
+
+        guard_active, _, _, _ = _entry_guard_window(kst_now)
+        msg = build_0900_mini_report_text(
+            regime=regime,
+            auto_mode=auto_mode,
+            holding_cnt=holding_cnt,
+            max_holdings=max_holdings,
+            equity_krw=equity,
+            daily_pct=daily_pct,
+            month_mdd_pct=month_mdd_pct,
+            guard_active=guard_active,
+            risk_state=risk_state,
+        )
+        ok = bool(tg_notify(event_type="MORNING_MINI_REPORT", message=msg))
+        if ok:
+            log_line("[OK] 09:00 mini report telegram sent")
+        else:
+            log_line("[WARN] 09:00 mini report telegram send failed or queued to spool")
+        return ok
+    except Exception as e:
+        log_line(f"[ERR] 09:00 mini report failed: {type(e).__name__}: {e}")
+        log_line(traceback.format_exc().strip())
+        return False
+
+
 def _safe_service_status(service_name: str = DEFAULT_SERVICE_NAME) -> str:
     cmd = ["systemctl", "is-active", str(service_name or DEFAULT_SERVICE_NAME)]
     try:
@@ -877,6 +1047,73 @@ def _mark_scheduled_sent(task_key: str, target: dt.datetime, log_line):
     _save_schedule_state(path, state, log_line)
 
 
+def _mark_schedule_sent_key(task_key: str, value: str, log_line):
+    path = _schedule_state_path()
+    state = _load_schedule_state(path, log_line)
+    state[str(task_key)] = str(value or "")
+    _save_schedule_state(path, state, log_line)
+
+
+def _is_last_day_of_month(ts: dt.datetime) -> bool:
+    kst_ts = _kst_now(ts)
+    return (kst_ts + dt.timedelta(days=1)).month != kst_ts.month
+
+
+def _should_append_month_end_block(report_end: dt.datetime, log_line):
+    if not _is_last_day_of_month(report_end):
+        return False, report_end.strftime("%Y-%m")
+    month_key = _kst_now(report_end).strftime("%Y-%m")
+    path = _schedule_state_path()
+    state = _load_schedule_state(path, log_line)
+    if str(state.get("month_end_report") or "") == month_key:
+        log_line(f"[INFO] month_end_report skip: already sent for {month_key}")
+        return False, month_key
+    return True, month_key
+
+
+def build_month_end_report_block(
+    report_end: dt.datetime,
+    month_metrics: dict,
+    by_strategy: dict,
+    month_mdd_pct: Optional[float],
+    month_start_equity: float,
+    month_end_equity: float,
+) -> str:
+    ym = _kst_now(report_end).strftime("%Y-%m")
+    month_start_equity = max(0.0, _to_float(month_start_equity, 0.0))
+    month_end_equity = max(0.0, _to_float(month_end_equity, 0.0))
+    month_diff = month_end_equity - month_start_equity
+    month_diff_pct = (month_diff / month_start_equity * 100.0) if month_start_equity > 0 else 0.0
+    month_mdd_text = "N/A" if month_mdd_pct is None else f"{_to_float(month_mdd_pct, 0.0):+.2f}%"
+
+    main_stats = (by_strategy or {}).get("MAIN", {"n": 0, "wr": 0.0, "avg": 0.0})
+    scalp_stats = (by_strategy or {}).get("SCALP_BTC", {"n": 0, "wr": 0.0, "avg": 0.0})
+    sep = "\u2501" * 18
+
+    lines = [
+        sep,
+        f"\U0001F4C6 \uC6D4\uAC04 \uCD5C\uC885 \uC131\uACFC ({ym})",
+        "",
+        f"- \uAC70\uB798 {int((month_metrics or {}).get('n', 0))}\uD68C",
+        f"- \uC2B9\uB960 {_to_float((month_metrics or {}).get('wr', 0.0), 0.0):.2f}%",
+        f"- \uD3C9\uADE0 {_to_float((month_metrics or {}).get('avg', 0.0), 0.0):+.2f}%",
+        f"- \uC6D4\uAC04 \uBCF5\uB9AC {_to_float((month_metrics or {}).get('cum', 0.0), 0.0):+.2f}%",
+        f"- \uC6D4\uAC04 MDD {month_mdd_text}",
+        "",
+        sep,
+        "\U0001F4CC \uC804\uB7B5\uBCC4 \uC6D4\uAC04 \uC694\uC57D",
+        f"- MAIN: \uAC70\uB798 {int(_to_float(main_stats.get('n', 0), 0.0))} | \uC2B9\uB960 {_to_float(main_stats.get('wr', 0.0), 0.0):.2f}% | \uD3C9\uADE0 {_to_float(main_stats.get('avg', 0.0), 0.0):+.2f}%",
+        f"- SCALP_BTC: \uAC70\uB798 {int(_to_float(scalp_stats.get('n', 0), 0.0))} | \uC2B9\uB960 {_to_float(scalp_stats.get('wr', 0.0), 0.0):.2f}% | \uD3C9\uADE0 {_to_float(scalp_stats.get('avg', 0.0), 0.0):+.2f}%",
+        "",
+        sep,
+        "\U0001F4B0 \uC790\uC0B0 \uBCC0\uD654",
+        f"- \uC2DC\uC791 \uC790\uC0B0: {month_start_equity:,.0f}\uC6D0",
+        f"- \uC885\uB8CC \uC790\uC0B0: {month_end_equity:,.0f}\uC6D0",
+        f"- \uC21C\uC99D\uAC00: {month_diff:+,.0f}\uC6D0 ({month_diff_pct:+.2f}%)",
+    ]
+    return "\n".join(lines)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--xlsx", action="store_true")
@@ -912,24 +1149,25 @@ def main():
     report_min = int(getattr(config, "REPORT_SEND_KST_MIN", 0))
 
     if args.heartbeat_only or args.scheduled_heartbeat:
+        mini_window_min = 1
         should_send, target = _should_send_scheduled(
             now=now,
             task_key="heartbeat",
             target_hour=hb_hour,
             target_min=hb_min,
-            window_min=schedule_window_min,
+            window_min=mini_window_min,
             force=bool(args.force),
             log_line=log_line,
         )
         if not should_send:
             return
         if not has_telegram_credentials():
-            log_line("[WARN] TELEGRAM_TOKEN/TELEGRAM_CHAT_ID missing; heartbeat will be queued to spool")
-        hb_ok = send_heartbeat(_kst_now(now), log_line)
-        if hb_ok:
+            log_line("[WARN] TELEGRAM_TOKEN/TELEGRAM_CHAT_ID missing; mini report will be queued to spool")
+        mini_ok = send_0900_mini_report(_kst_now(now), log_line)
+        if mini_ok:
             _mark_scheduled_sent("heartbeat", target, log_line)
         else:
-            log_line("[WARN] heartbeat not marked as sent due telegram delivery failure")
+            log_line("[WARN] 09:00 mini report not marked as sent due telegram delivery failure")
         return
 
     should_send_report, report_target = _should_send_scheduled(
@@ -979,6 +1217,21 @@ def main():
 
     month_points = _build_month_equity_points(equity_history, month_start, now, total_equity)
     month_mdd_pct = _calc_mdd_from_equity_points(month_points)
+    append_month_end_block, month_end_key = _should_append_month_end_block(report_end, log_line)
+    month_end_block = ""
+    if append_month_end_block:
+        month_start_equity = float(month_anchor) if month_anchor is not None else 0.0
+        if month_start_equity <= 0:
+            month_start_equity = float(total_equity)
+            log_line("[WARN] month-end start equity anchor missing; using current equity fallback")
+        month_end_block = build_month_end_report_block(
+            report_end=report_end,
+            month_metrics=month_metrics,
+            by_strategy=by_strategy,
+            month_mdd_pct=month_mdd_pct,
+            month_start_equity=month_start_equity,
+            month_end_equity=total_equity,
+        )
 
     _append_equity_history(history_path, now, total_equity, log_line=log_line)
 
@@ -1024,6 +1277,8 @@ def main():
         month_mdd_pct=month_mdd_pct,
         status_emoji=status_emoji,
     )
+    if month_end_block:
+        text = f"{text}\n\n{month_end_block}"
 
     if not has_telegram_credentials():
         log_line("[WARN] TELEGRAM_TOKEN/TELEGRAM_CHAT_ID missing; report notifications will be queued to spool")
@@ -1032,6 +1287,8 @@ def main():
     if text_ok:
         log_line("[OK] telegram text sent")
         _mark_scheduled_sent("daily_report", report_target, log_line)
+        if append_month_end_block:
+            _mark_schedule_sent_key("month_end_report", month_end_key, log_line)
     else:
         log_line("[WARN] telegram text send failed or queued to spool")
         log_line("[WARN] daily_report not marked as sent due telegram delivery failure")

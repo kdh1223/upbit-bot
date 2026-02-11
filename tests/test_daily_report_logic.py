@@ -2,7 +2,15 @@ import datetime as dt
 import unittest
 from zoneinfo import ZoneInfo
 
-from run_daily_report import _calc_mdd_from_equity_points, build_heartbeat_text, build_metrics, build_report_text, report_window_21_to_21
+from run_daily_report import (
+    _calc_mdd_from_equity_points,
+    build_0900_mini_report_text,
+    build_heartbeat_text,
+    build_metrics,
+    build_month_end_report_block,
+    build_report_text,
+    report_window_21_to_21,
+)
 
 
 KST = ZoneInfo("Asia/Seoul")
@@ -117,6 +125,56 @@ class DailyReportLogicTests(unittest.TestCase):
             risk_state={"halted_flag": False, "halt_reason": ""},
         )
         self.assertIn("ACTIVE", text)
+
+    def test_build_0900_mini_report_text_normal(self):
+        text = build_0900_mini_report_text(
+            regime="FULL",
+            auto_mode="AGGRESSIVE",
+            holding_cnt=1,
+            max_holdings=2,
+            equity_krw=97_512.0,
+            daily_pct=-2.49,
+            month_mdd_pct=-30.01,
+            guard_active=True,
+            risk_state={"halted_flag": False, "halt_reason": ""},
+        )
+        self.assertIn("09:00", text)
+        self.assertIn("레짐: FULL | AUTO: AGGRESSIVE", text)
+        self.assertIn("보유: 1 / 2", text)
+        self.assertIn("신규진입가드: ACTIVE", text)
+
+    def test_build_0900_mini_report_text_halted(self):
+        text = build_0900_mini_report_text(
+            regime="FULL",
+            auto_mode="CONSERVATIVE",
+            holding_cnt=0,
+            max_holdings=2,
+            equity_krw=100_000.0,
+            daily_pct=0.0,
+            month_mdd_pct=-5.0,
+            guard_active=False,
+            risk_state={"halted_flag": True, "halt_reason": "TOTAL_MDD_LIMIT"},
+        )
+        self.assertIn("상태: ⛔ HALTED (TOTAL_MDD_LIMIT)", text)
+        self.assertNotIn("신규진입가드", text)
+
+    def test_build_month_end_report_block(self):
+        report_end = dt.datetime(2026, 2, 28, 21, 0, 0, tzinfo=KST)
+        text = build_month_end_report_block(
+            report_end=report_end,
+            month_metrics={"n": 9, "wr": 44.44, "avg": -5.21, "cum": -7.82},
+            by_strategy={
+                "MAIN": {"n": 8, "wr": 50.0, "avg": -5.75},
+                "SCALP_BTC": {"n": 1, "wr": 0.0, "avg": -2.1},
+            },
+            month_mdd_pct=-30.01,
+            month_start_equity=100_000.0,
+            month_end_equity=97_512.0,
+        )
+        self.assertIn("월간 최종 성과 (2026-02)", text)
+        self.assertIn("전략별 월간 요약", text)
+        self.assertIn("SCALP_BTC: 거래 1 | 승률 0.00% | 평균 -2.10%", text)
+        self.assertIn("순증가: -2,488원 (-2.49%)", text)
 
 
 if __name__ == "__main__":

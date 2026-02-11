@@ -5,7 +5,7 @@ from tempfile import TemporaryDirectory
 from zoneinfo import ZoneInfo
 
 import config
-from run_daily_report import _mark_scheduled_sent, _should_send_scheduled
+from run_daily_report import _mark_schedule_sent_key, _mark_scheduled_sent, _should_append_month_end_block, _should_send_scheduled
 
 
 KST = ZoneInfo("Asia/Seoul")
@@ -110,6 +110,27 @@ class DailyReportScheduleTests(unittest.TestCase):
                 log_line=logs.append,
             )
         self.assertTrue(ok)
+
+    def test_month_end_report_is_last_day_only(self):
+        logs = []
+        with TemporaryDirectory() as td:
+            self._set("REPORT_SCHEDULE_STATE_FILE", str(Path(td) / "schedule_state.json"))
+            not_last_day = dt.datetime(2026, 2, 27, 21, 0, 0, tzinfo=KST)
+            ok, _ = _should_append_month_end_block(not_last_day, logs.append)
+        self.assertFalse(ok)
+
+    def test_month_end_report_dedupes_by_month(self):
+        logs = []
+        with TemporaryDirectory() as td:
+            self._set("REPORT_SCHEDULE_STATE_FILE", str(Path(td) / "schedule_state.json"))
+            month_end = dt.datetime(2026, 2, 28, 21, 0, 0, tzinfo=KST)
+            ok1, key1 = _should_append_month_end_block(month_end, logs.append)
+            self.assertTrue(ok1)
+            self.assertEqual(key1, "2026-02")
+            _mark_schedule_sent_key("month_end_report", key1, logs.append)
+            ok2, _ = _should_append_month_end_block(month_end + dt.timedelta(minutes=5), logs.append)
+        self.assertFalse(ok2)
+        self.assertTrue(any("already sent" in line for line in logs))
 
 
 if __name__ == "__main__":
