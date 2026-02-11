@@ -88,7 +88,7 @@ COST_ROUNDTRIP_PCT = 0.0015
 # ===============================
 # Market regime
 # ===============================
-USE_MARKET_REGIME = True
+USE_MARKET_REGIME = False
 
 REGIME_INVEST_FRAC = {
     "HALT": 0.0,
