@@ -42,6 +42,26 @@ class EquityEstimateFallbackTests(unittest.TestCase):
 
         self.assertAlmostEqual(eq, 130_000.0, places=6)
 
+    def test_estimate_equity_falls_back_to_initial_volume_minus_realized_cost(self):
+        strategy_state = {
+            "MAIN": {
+                "KRW-BTC": {
+                    "holding": True,
+                    "entry": 100_000.0,
+                    "initial_volume": 2.0,
+                    "total_buy_krw": 200_000.0,
+                    "realized_cost_krw": 100_000.0,
+                }
+            },
+            "SCALP": {},
+        }
+        prices = {"KRW-BTC": 120_000.0}
+
+        with patch("bot.get_balance", return_value=0.0):
+            eq = bot.estimate_equity(krw=10_000.0, strategy_state=strategy_state, prices=prices, upbit=object())
+
+        self.assertAlmostEqual(eq, 130_000.0, places=6)
+
 
 if __name__ == "__main__":
     unittest.main()

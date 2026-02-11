@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import patch
 
 import config
 from risk import apply_risk_rules
@@ -227,6 +228,45 @@ class RiskTrailingArmTests(unittest.TestCase):
         r2 = apply_risk_rules(None, "KRW-TEST", state, 101.0, self._mock_sell, now=1_181.0, strategy_tag="MAIN")
         self.assertTrue(r2.get("closed", False))
         self.assertEqual(r2.get("reason"), "RUNNER_TIMEOUT")
+
+    def test_main_tp1_transient_zero_balance_does_not_force_close(self):
+        self._set("REAL_ORDER", True)
+        self._set("MIN_ORDER_KRW", 5_000)
+        self._set(
+            "TP_TABLE",
+            {
+                "LOW": {"TP1_PCT": 0.01, "TP2_PCT": 0.05, "TRAIL_BACK_PCT": 0.006},
+                "MID": {"TP1_PCT": 0.01, "TP2_PCT": 0.05, "TRAIL_BACK_PCT": 0.006},
+                "FULL": {"TP1_PCT": 0.01, "TP2_PCT": 0.05, "TRAIL_BACK_PCT": 0.006},
+                "HALT": {"TP1_PCT": 0.0, "TP2_PCT": 0.0, "TRAIL_BACK_PCT": 0.0},
+            },
+        )
+        state = self._base_state(entry_ts=1_000.0)
+        qty = 1_044.17175768
+        state["entry"] = 28.5
+        state["peak"] = 28.5
+        state["initial_volume"] = qty
+        state["invested_krw"] = qty * 28.5
+        state["total_buy_krw"] = qty * 28.5
+        state["tp1_ratio"] = 0.5
+        state["tp2_ratio"] = 0.3
+        state["runner_ratio"] = 0.2
+
+        with patch("risk.get_balance", side_effect=[qty, qty, 0.0]), patch("risk.notify_order", return_value=True):
+            result = apply_risk_rules(
+                upbit=object(),
+                ticker="KRW-POKT",
+                state=state,
+                cur=28.9,
+                market_sell=self._mock_sell,
+                now=1_130.0,
+                strategy_tag="MAIN",
+            )
+
+        self.assertFalse(result.get("closed", False))
+        self.assertTrue(state.get("tp1_done", False))
+        expected_sell = qty * 0.5 * 28.9
+        self.assertAlmostEqual(float(state.get("total_sell_krw", 0.0)), expected_sell, places=6)
 
 
 if __name__ == "__main__":

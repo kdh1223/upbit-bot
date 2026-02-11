@@ -364,9 +364,18 @@ def manage_positions(
                     "realized_krw": float(realized_krw),
                     "realized_pct": float(pnl_pct),
                     "last_exit_reason": str(last_exit_reason),
+                    "tp1_done": bool(s.get("tp1_done", False)),
+                    "tp2_done": bool(s.get("tp2_done", False)),
+                    "tp1_ratio": float(s.get("tp1_ratio", 0.0) or 0.0),
+                    "tp2_ratio": float(s.get("tp2_ratio", 0.0) or 0.0),
+                    "runner_ratio": float(s.get("runner_ratio", 0.0) or 0.0),
+                    "tp1_pnl_pct": s.get("tp1_pnl_pct"),
+                    "tp2_pnl_pct": s.get("tp2_pnl_pct"),
+                    "final_notified": bool(s.get("final_notified", False)),
                 }
             )
 
+            s["final_notified"] = True
             s["holding"] = False
             s["add_count"] = 0
             s["invested_krw"] = 0.0
@@ -388,6 +397,9 @@ def manage_positions(
             s["total_buy_krw"] = 0.0
             s["total_sell_krw"] = 0.0
             s["last_exit_reason"] = ""
+            s["final_notified"] = False
+            s["tp1_pnl_pct"] = None
+            s["tp2_pnl_pct"] = None
             s["strategy_tag"] = strategy
             s["entry_ts"] = 0.0
             s["trail_armed"] = False

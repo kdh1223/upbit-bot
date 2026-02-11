@@ -682,10 +682,110 @@ def send_heartbeat(now: dt.datetime, log_line):
     return ok
 
 
+def _schedule_state_path() -> str:
+    path = str(getattr(config, "REPORT_SCHEDULE_STATE_FILE", "report_schedule_state.json") or "").strip()
+    return path or "report_schedule_state.json"
+
+
+def _kst_now(ts: dt.datetime) -> dt.datetime:
+    if not isinstance(ts, dt.datetime):
+        return now_kst()
+    if ts.tzinfo is None:
+        return ts.replace(tzinfo=KST)
+    return ts.astimezone(KST)
+
+
+def _target_time_kst(now: dt.datetime, hour: int, minute: int) -> dt.datetime:
+    base = _kst_now(now)
+    h = min(23, max(0, int(hour)))
+    m = min(59, max(0, int(minute)))
+    return base.replace(hour=h, minute=m, second=0, microsecond=0)
+
+
+def _load_schedule_state(path: str, log_line) -> dict:
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            return data
+        return {}
+    except Exception as e:
+        log_line(f"[WARN] schedule state load failed: {type(e).__name__}: {e}")
+        return {}
+
+
+def _save_schedule_state(path: str, data: dict, log_line):
+    tmp = f"{path}.tmp"
+    try:
+        parent = os.path.dirname(path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data or {}, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, path)
+    except Exception as e:
+        log_line(f"[WARN] schedule state save failed: {type(e).__name__}: {e}")
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except Exception:
+            pass
+
+
+def _should_send_scheduled(
+    now: dt.datetime,
+    task_key: str,
+    target_hour: int,
+    target_min: int,
+    window_min: int,
+    force: bool,
+    log_line,
+):
+    kst_now = _kst_now(now)
+    target = _target_time_kst(kst_now, target_hour, target_min)
+    if force:
+        return True, target
+
+    w_min = max(1, int(window_min))
+    delta_min = abs((kst_now - target).total_seconds()) / 60.0
+    if delta_min > float(w_min):
+        log_line(
+            f"[INFO] {task_key} skip: outside KST window "
+            f"now={kst_now.strftime('%H:%M')} target={target.strftime('%H:%M')} window=+/-{w_min}m"
+        )
+        return False, target
+
+    path = _schedule_state_path()
+    state = _load_schedule_state(path, log_line)
+    day_key = target.strftime("%Y-%m-%d")
+    last_key = str(state.get(task_key) or "")
+    if last_key == day_key:
+        log_line(f"[INFO] {task_key} skip: already sent for {day_key} KST")
+        return False, target
+    return True, target
+
+
+def _mark_scheduled_sent(task_key: str, target: dt.datetime, log_line):
+    path = _schedule_state_path()
+    state = _load_schedule_state(path, log_line)
+    state[str(task_key)] = str(target.strftime("%Y-%m-%d"))
+    _save_schedule_state(path, state, log_line)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--xlsx", action="store_true")
     parser.add_argument("--heartbeat-only", action="store_true")
+    parser.add_argument("--scheduled-report", action="store_true")
+    parser.add_argument("--scheduled-heartbeat", action="store_true")
+    parser.add_argument("--force", action="store_true")
+    parser.add_argument(
+        "--schedule-window-min",
+        type=int,
+        default=max(1, int(getattr(config, "REPORT_SCHEDULE_WINDOW_MIN", 30))),
+    )
     args = parser.parse_args()
 
     now = now_kst()
@@ -702,10 +802,40 @@ def main():
 
     load_telegram_env_file("/etc/default/telegram-bot")
 
-    if args.heartbeat_only:
+    schedule_window_min = max(1, int(args.schedule_window_min))
+    hb_hour = int(getattr(config, "HEARTBEAT_SEND_KST_HOUR", 9))
+    hb_min = int(getattr(config, "HEARTBEAT_SEND_KST_MIN", 0))
+    report_hour = int(getattr(config, "REPORT_SEND_KST_HOUR", 21))
+    report_min = int(getattr(config, "REPORT_SEND_KST_MIN", 0))
+
+    if args.heartbeat_only or args.scheduled_heartbeat:
+        should_send, target = _should_send_scheduled(
+            now=now,
+            task_key="heartbeat",
+            target_hour=hb_hour,
+            target_min=hb_min,
+            window_min=schedule_window_min,
+            force=bool(args.force),
+            log_line=log_line,
+        )
+        if not should_send:
+            return
         if not has_telegram_credentials():
             log_line("[WARN] TELEGRAM_TOKEN/TELEGRAM_CHAT_ID missing; heartbeat will be queued to spool")
-        send_heartbeat(now, log_line)
+        send_heartbeat(_kst_now(now), log_line)
+        _mark_scheduled_sent("heartbeat", target, log_line)
+        return
+
+    should_send_report, report_target = _should_send_scheduled(
+        now=now,
+        task_key="daily_report",
+        target_hour=report_hour,
+        target_min=report_min,
+        window_min=schedule_window_min,
+        force=bool(args.force),
+        log_line=log_line,
+    )
+    if not should_send_report:
         return
 
     rows_all, files = load_all_trades(".")
@@ -797,6 +927,7 @@ def main():
         log_line("[OK] telegram text sent")
     else:
         log_line("[WARN] telegram text send failed or queued to spool")
+    _mark_scheduled_sent("daily_report", report_target, log_line)
 
 
 if __name__ == "__main__":

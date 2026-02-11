@@ -28,7 +28,16 @@ def _is_real_order() -> bool:
 def _get_volume(upbit, ticker: str, state: dict) -> float:
     if _is_real_order():
         coin = ticker.split("-")[1]
-        return float(get_balance(upbit, coin))
+        live_vol = _as_nonneg_float(get_balance(upbit, coin), 0.0)
+        if live_vol > 0:
+            return float(live_vol)
+
+        # Upbit balance can transiently return 0 right after partial fills.
+        # Fall back to state-based remaining qty to avoid false FORCE_CLOSE settlement.
+        fallback_vol = _estimated_remaining_qty_from_state(state)
+        if fallback_vol > 0:
+            return float(fallback_vol)
+        return 0.0
     return float(state.get("initial_volume", 0.0))
 
 
@@ -53,6 +62,33 @@ def _as_nonneg_float(value, default: float = 0.0) -> float:
         return max(0.0, float(value))
     except Exception:
         return max(0.0, float(default))
+
+
+def _estimated_remaining_qty_from_state(state: dict) -> float:
+    entry = _as_nonneg_float(state.get("entry", 0.0), 0.0)
+
+    qty_hint = _as_nonneg_float(state.get("qty", 0.0), 0.0)
+    init_vol = _as_nonneg_float(state.get("initial_volume", 0.0), 0.0)
+    buy_krw = _as_nonneg_float(state.get("total_buy_krw", state.get("invested_krw", 0.0)), 0.0)
+
+    base_qty = 0.0
+    if qty_hint > 0:
+        base_qty = float(qty_hint)
+    elif entry > 0 and buy_krw > 0:
+        base_qty = float(buy_krw / entry)
+    elif init_vol > 0:
+        base_qty = float(init_vol)
+
+    if base_qty <= 0:
+        return 0.0
+
+    sold_qty = 0.0
+    if entry > 0:
+        realized_cost = _as_nonneg_float(state.get("realized_cost_krw", 0.0), 0.0)
+        if realized_cost > 0:
+            sold_qty = float(realized_cost / entry)
+
+    return max(0.0, float(base_qty) - float(sold_qty))
 
 
 def _ensure_position_accounting(state: dict, strategy_tag: str):
@@ -316,6 +352,9 @@ def _ensure_main_stage_state(state: dict, now_ts: float, cur: float):
 
 
 def _estimate_entry_qty(state: dict, entry: float) -> float:
+    qty_hint = _as_nonneg_float(state.get("qty", 0.0), 0.0)
+    if qty_hint > 0:
+        return float(qty_hint)
     if entry > 0:
         total_buy_krw = _as_nonneg_float(state.get("total_buy_krw", state.get("invested_krw", 0.0)), 0.0)
         if total_buy_krw > 0:
@@ -469,7 +508,8 @@ def apply_risk_rules(upbit, ticker: str, state: dict, cur: float, market_sell, n
                         price=float(cur),
                         qty=float(sell_qty),
                         reason="TP1",
-                    )
+                    ) if bool(getattr(config, "TELEGRAM_PARTIAL_NOTIFY", False)) else None
+                    state["tp1_pnl_pct"] = float(pnl * 100.0)
                     partials.append(
                         {
                             "reason": "TP1",
@@ -521,7 +561,8 @@ def apply_risk_rules(upbit, ticker: str, state: dict, cur: float, market_sell, n
                         price=float(cur),
                         qty=float(sell_qty),
                         reason="TP2_PARTIAL",
-                    )
+                    ) if bool(getattr(config, "TELEGRAM_PARTIAL_NOTIFY", False)) else None
+                    state["tp2_pnl_pct"] = float(pnl * 100.0)
                     partials.append(
                         {
                             "reason": "TP2_PARTIAL",
@@ -676,7 +717,8 @@ def apply_risk_rules(upbit, ticker: str, state: dict, cur: float, market_sell, n
                     price=float(cur),
                     qty=float(sell_qty),
                     reason="TP1",
-                )
+                ) if bool(getattr(config, "TELEGRAM_PARTIAL_NOTIFY", False)) else None
+                state["tp1_pnl_pct"] = float(pnl * 100.0)
 
     # 3) TP2 partial
     if (tp_one is None) and (not bool(state.get("tp2", False))) and tp2 > 0 and pnl >= tp2:
@@ -709,7 +751,8 @@ def apply_risk_rules(upbit, ticker: str, state: dict, cur: float, market_sell, n
                     price=float(cur),
                     qty=float(sell_qty),
                     reason="TP2",
-                )
+                ) if bool(getattr(config, "TELEGRAM_PARTIAL_NOTIFY", False)) else None
+                state["tp2_pnl_pct"] = float(pnl * 100.0)
 
     # 4) Trailing arm/close: arm only after elapsed time + minimum profit threshold.
     if (not bool(state.get("trail_armed", False))) and elapsed_sec >= trail_arm_sec:

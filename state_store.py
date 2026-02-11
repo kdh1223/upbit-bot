@@ -44,6 +44,9 @@ def _default_risk_state():
         "peak_equity": 0.0,
         "day_start_equity": 0.0,
         "day_key": "",
+        "last_good_equity": 0.0,
+        "daily_breach_streak": 0,
+        "mdd_breach_streak": 0,
         "halted_flag": False,
         "halt_reason": "",
         "halted_at_ts": 0.0,
@@ -215,6 +218,15 @@ def _normalize_position_state(raw: dict):
     s["tp2_done"] = bool(s.get("tp2_done", s.get("tp2", False)))
     s["tp1"] = bool(s["tp1_done"])
     s["tp2"] = bool(s["tp2_done"])
+    s["final_notified"] = bool(s.get("final_notified", False))
+    try:
+        s["tp1_pnl_pct"] = float(s.get("tp1_pnl_pct")) if s.get("tp1_pnl_pct") is not None else None
+    except Exception:
+        s["tp1_pnl_pct"] = None
+    try:
+        s["tp2_pnl_pct"] = float(s.get("tp2_pnl_pct")) if s.get("tp2_pnl_pct") is not None else None
+    except Exception:
+        s["tp2_pnl_pct"] = None
 
     if stage_tag == "MAIN":
         tp1_ratio = _as_nonneg_ratio("tp1_ratio")
@@ -363,6 +375,18 @@ def _normalize_risk_state(raw: dict):
     except Exception:
         state["day_start_equity"] = 0.0
     state["day_key"] = str(state.get("day_key") or "")
+    try:
+        state["last_good_equity"] = max(0.0, float(state.get("last_good_equity", 0.0)))
+    except Exception:
+        state["last_good_equity"] = 0.0
+    try:
+        state["daily_breach_streak"] = max(0, int(state.get("daily_breach_streak", 0)))
+    except Exception:
+        state["daily_breach_streak"] = 0
+    try:
+        state["mdd_breach_streak"] = max(0, int(state.get("mdd_breach_streak", 0)))
+    except Exception:
+        state["mdd_breach_streak"] = 0
     state["halted_flag"] = bool(state.get("halted_flag", False))
     state["halt_reason"] = str(state.get("halt_reason") or "")
     try:

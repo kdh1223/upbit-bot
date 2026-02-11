@@ -44,6 +44,7 @@ from utils.telegram_notify import (
     load_telegram_env_file,
     notify_event,
     notify_order,
+    tg_notify,
 )
 
 
@@ -54,6 +55,7 @@ _TG_LAST_ERR_KEY = ""
 _TG_LAST_RISKCUT_AT = 0.0
 _TG_ENV_WARNED = False
 _INSTANCE_LOCK_FH = None
+_RECENT_CLOSE_NOTIFY = {}
 KST = ZoneInfo("Asia/Seoul")
 
 AUTO_PARAM_SETS = {
@@ -272,6 +274,9 @@ def _default_runtime_risk_state():
         "peak_equity": 0.0,
         "day_start_equity": 0.0,
         "day_key": "",
+        "last_good_equity": 0.0,
+        "daily_breach_streak": 0,
+        "mdd_breach_streak": 0,
         "halted_flag": False,
         "halt_reason": "",
         "halted_at_ts": 0.0,
@@ -285,6 +290,15 @@ def _normalize_runtime_risk_state(raw: dict):
     s["peak_equity"] = max(0.0, _safe_float(s.get("peak_equity", 0.0), 0.0))
     s["day_start_equity"] = max(0.0, _safe_float(s.get("day_start_equity", 0.0), 0.0))
     s["day_key"] = str(s.get("day_key") or "")
+    s["last_good_equity"] = max(0.0, _safe_float(s.get("last_good_equity", 0.0), 0.0))
+    try:
+        s["daily_breach_streak"] = max(0, int(s.get("daily_breach_streak", 0)))
+    except Exception:
+        s["daily_breach_streak"] = 0
+    try:
+        s["mdd_breach_streak"] = max(0, int(s.get("mdd_breach_streak", 0)))
+    except Exception:
+        s["mdd_breach_streak"] = 0
     s["halted_flag"] = bool(s.get("halted_flag", False))
     s["halt_reason"] = str(s.get("halt_reason") or "")
     s["halted_at_ts"] = max(0.0, _safe_float(s.get("halted_at_ts", 0.0), 0.0))
@@ -302,11 +316,24 @@ def _update_global_risk_cut_state(now: dt.datetime, equity: float, risk_state: d
     triggered = False
     s = risk_state
 
-    cur_eq = max(0.0, float(equity))
+    raw_eq = max(0.0, float(equity))
+    last_good_eq = max(0.0, _safe_float(s.get("last_good_equity", 0.0), 0.0))
+    used_last_good = False
+    if raw_eq <= 0 and last_good_eq > 0:
+        cur_eq = float(last_good_eq)
+        used_last_good = True
+    else:
+        cur_eq = float(raw_eq)
+    if cur_eq > 0 and abs(float(last_good_eq) - float(cur_eq)) > 1e-9:
+        s["last_good_equity"] = float(cur_eq)
+        changed = True
+
     day_key = now.date().isoformat()
     if str(s.get("day_key") or "") != day_key:
         s["day_key"] = day_key
         s["day_start_equity"] = float(cur_eq)
+        s["daily_breach_streak"] = 0
+        s["mdd_breach_streak"] = 0
         changed = True
         print(
             f"[RISK] day rollover | day_key={day_key} day_start_equity={float(s['day_start_equity']):,.0f}"
@@ -331,11 +358,21 @@ def _update_global_risk_cut_state(now: dt.datetime, equity: float, risk_state: d
 
     daily_limit = _normalize_loss_limit_pct(getattr(config, "DAILY_MAX_LOSS_PCT", -5.0), -5.0)
     mdd_limit = _normalize_loss_limit_pct(getattr(config, "GLOBAL_MDD_LIMIT_PCT", -15.0), -15.0)
+    confirm_ticks = max(1, int(getattr(config, "RISK_CUT_CONFIRM_TICKS", 3)))
+
+    daily_hit = daily_loss_pct <= daily_limit
+    mdd_hit = mdd_pct <= mdd_limit
+    prev_daily_streak = int(s.get("daily_breach_streak", 0))
+    prev_mdd_streak = int(s.get("mdd_breach_streak", 0))
+    s["daily_breach_streak"] = (prev_daily_streak + 1) if daily_hit else 0
+    s["mdd_breach_streak"] = (prev_mdd_streak + 1) if mdd_hit else 0
+    if (s["daily_breach_streak"] != prev_daily_streak) or (s["mdd_breach_streak"] != prev_mdd_streak):
+        changed = True
 
     halt_reason = ""
-    if daily_loss_pct <= daily_limit:
+    if int(s.get("daily_breach_streak", 0)) >= confirm_ticks:
         halt_reason = "DAILY_LOSS_LIMIT"
-    if mdd_pct <= mdd_limit:
+    if int(s.get("mdd_breach_streak", 0)) >= confirm_ticks:
         halt_reason = "TOTAL_MDD_LIMIT"
 
     prev_halted = bool(s.get("halted_flag", False))
@@ -368,9 +405,14 @@ def _update_global_risk_cut_state(now: dt.datetime, equity: float, risk_state: d
         "mdd_pct": float(mdd_pct),
         "daily_limit": float(daily_limit),
         "mdd_limit": float(mdd_limit),
+        "confirm_ticks": int(confirm_ticks),
+        "daily_breach_streak": int(s.get("daily_breach_streak", 0)),
+        "mdd_breach_streak": int(s.get("mdd_breach_streak", 0)),
         "day_key": str(day_key),
         "day_start_equity": float(day_start),
         "peak_equity": float(peak_equity),
+        "last_good_equity": float(s.get("last_good_equity", 0.0)),
+        "used_last_good_equity": bool(used_last_good),
     }
     return info, changed, triggered
 
@@ -537,6 +579,171 @@ def _fmt_krw(value: float) -> str:
         return "0"
 
 
+def _fmt_price(value: float) -> str:
+    try:
+        v = float(value)
+    except Exception:
+        return "0"
+    if v <= 0:
+        return "0"
+    if v >= 1000:
+        return f"{v:,.0f}"
+    return f"{v:.8f}".rstrip("0").rstrip(".")
+
+
+def _final_reason_label(raw_reason: str) -> str:
+    r = str(raw_reason or "").upper().strip()
+    if r in {"STOPLOSS", "FORCE_CLOSE"}:
+        return r
+    return "FINAL"
+
+
+def _ratio_percent_text(value: float) -> str:
+    try:
+        return f"{float(value):.0f}"
+    except Exception:
+        return "0"
+
+
+def _pct_text(value: float) -> str:
+    try:
+        return f"{float(value):+.2f}"
+    except Exception:
+        return "0.00"
+
+
+def _build_final_close_message(event: dict) -> str:
+    strategy_tag = str(event.get("strategy_tag", event.get("strategy", "MAIN")) or "MAIN").upper().strip()
+    ticker = str(event.get("ticker", "") or "")
+    entry_price = _safe_float(event.get("entry_price", 0.0), 0.0)
+    exit_price = _safe_float(event.get("exit_price", 0.0), 0.0)
+    total_buy_krw = _safe_float(event.get("total_buy_krw", 0.0), 0.0)
+    total_sell_krw = _safe_float(event.get("total_sell_krw", 0.0), 0.0)
+    pnl_krw = float(total_sell_krw) - float(total_buy_krw)
+    pnl_pct = (float(pnl_krw) / float(total_buy_krw) * 100.0) if total_buy_krw > 0 else 0.0
+
+    tp1_done = bool(event.get("tp1_done", False))
+    tp2_done = bool(event.get("tp2_done", False))
+    tp1_ratio = max(0.0, _safe_float(event.get("tp1_ratio", 0.0), 0.0)) if tp1_done else 0.0
+    tp2_ratio = max(0.0, _safe_float(event.get("tp2_ratio", 0.0), 0.0)) if tp2_done else 0.0
+    final_ratio = max(0.0, 1.0 - tp1_ratio - tp2_ratio)
+    if (tp1_ratio + tp2_ratio + final_ratio) <= 0:
+        final_ratio = 1.0
+
+    sum_ratio = tp1_ratio + tp2_ratio + final_ratio
+    tp1_ratio_pct = (tp1_ratio / sum_ratio) * 100.0 if sum_ratio > 0 else 0.0
+    tp2_ratio_pct = (tp2_ratio / sum_ratio) * 100.0 if sum_ratio > 0 else 0.0
+    final_ratio_pct = (final_ratio / sum_ratio) * 100.0 if sum_ratio > 0 else 100.0
+
+    tp1_pnl = event.get("tp1_pnl_pct")
+    tp2_pnl = event.get("tp2_pnl_pct")
+    tp1_pnl_pct = _pct_text(tp1_pnl) if tp1_pnl is not None else _pct_text(0.0)
+    tp2_pnl_pct = _pct_text(tp2_pnl) if tp2_pnl is not None else _pct_text(0.0)
+    final_pnl_pct = _pct_text(((exit_price / entry_price) - 1.0) * 100.0 if entry_price > 0 else 0.0)
+
+    reason = _final_reason_label(event.get("last_exit_reason", event.get("reason", "")))
+
+    lines = [
+        "\U0001F535 \uD3EC\uC9C0\uC158 \uC885\uB8CC",
+        "",
+        f"\uC804\uB7B5: {strategy_tag}",
+        f"\uC885\uBAA9: {ticker}",
+        "",
+        "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501",
+        "\U0001F4E5 \uB9E4\uC218 \uC694\uC57D",
+        f"- \uD3C9\uADE0\uB2E8\uAC00: {_fmt_price(entry_price)}",
+        f"- \uCD1D\uB9E4\uC218\uAE08: {_fmt_krw(total_buy_krw)} KRW",
+        "",
+        "\U0001F4E4 \uB9E4\uB3C4 \uC694\uC57D",
+    ]
+
+    if tp1_done:
+        lines.append(f"- TP1: {tp1_pnl_pct}% | {_ratio_percent_text(tp1_ratio_pct)}%")
+    if tp2_done:
+        lines.append(f"- TP2: {tp2_pnl_pct}% | {_ratio_percent_text(tp2_ratio_pct)}%")
+    lines.append(f"- \uCD5C\uC885\uB9E4\uB3C4: {final_pnl_pct}% | {_ratio_percent_text(final_ratio_pct)}%")
+
+    lines.extend(
+        [
+            "",
+            "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501",
+            "\U0001F4CA \uCD5C\uC885 \uACB0\uACFC",
+            f"- \uCD1D\uB9E4\uB3C4\uAE08: {_fmt_krw(total_sell_krw)} KRW",
+            f"- \uC190\uC775\uAE08: {_fmt_krw(pnl_krw)} KRW",
+            f"- \uC218\uC775\uB960: {_pct_text(pnl_pct)}%",
+            "",
+            f"\uC0AC\uC720: {reason}",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def _close_notify_dedupe_key(
+    strategy_tag: str,
+    ticker: str,
+    reason_code: str,
+    close_time,
+    total_buy_krw: float,
+    total_sell_krw: float,
+) -> str:
+    if isinstance(close_time, dt.datetime):
+        ts_txt = close_time.strftime("%Y%m%d%H%M%S")
+    else:
+        ts_txt = "na"
+    return (
+        f"{str(strategy_tag or '').upper().strip()}|{str(ticker or '').upper().strip()}|"
+        f"{str(reason_code or '').upper().strip()}|{ts_txt}|"
+        f"{int(round(max(0.0, float(total_buy_krw))))}|{int(round(max(0.0, float(total_sell_krw))))}"
+    )
+
+
+def _allow_close_notify_once(event_key: str) -> bool:
+    ttl_sec = max(1.0, float(getattr(config, "CLOSE_NOTIFY_DEDUPE_SEC", 10)))
+    now_ts = time.time()
+    expired = []
+    for k, ts in _RECENT_CLOSE_NOTIFY.items():
+        if (now_ts - float(ts)) > ttl_sec:
+            expired.append(k)
+    for k in expired:
+        _RECENT_CLOSE_NOTIFY.pop(k, None)
+    prev_ts = _RECENT_CLOSE_NOTIFY.get(event_key)
+    if prev_ts is not None and (now_ts - float(prev_ts)) <= ttl_sec:
+        return False
+    _RECENT_CLOSE_NOTIFY[event_key] = float(now_ts)
+    return True
+
+
+def _settlement_totals_sanity(
+    total_buy_krw: float,
+    total_sell_krw: float,
+    close_qty: float,
+    exit_price: float,
+    raw_reason: str,
+):
+    buy_krw = max(0.0, _safe_float(total_buy_krw, 0.0))
+    sell_krw = max(0.0, _safe_float(total_sell_krw, 0.0))
+    qty = max(0.0, _safe_float(close_qty, 0.0))
+    px = max(0.0, _safe_float(exit_price, 0.0))
+    min_leg_sell = float(qty) * float(px) if (qty > 0 and px > 0) else 0.0
+
+    # If close leg price/qty is known, ensure settlement includes at least that leg.
+    if min_leg_sell > 0 and sell_krw < min_leg_sell:
+        sell_krw = float(min_leg_sell)
+
+    min_ratio = _safe_float(getattr(config, "SETTLEMENT_MIN_SELL_RATIO", 0.55), 0.55)
+    min_ratio = max(0.1, min(0.95, float(min_ratio)))
+    reason_txt = str(raw_reason or "").lower()
+    is_dust = "dust" in reason_txt
+
+    suspicious = False
+    if buy_krw > 0:
+        if sell_krw <= 0:
+            suspicious = not is_dust
+        else:
+            suspicious = (sell_krw / buy_krw) < min_ratio and (not is_dust)
+    return float(buy_krw), float(sell_krw), bool(suspicious), float(min_ratio)
+
+
 def _notify_close_settlement(
     strategy_tag: str,
     ticker: str,
@@ -613,29 +820,70 @@ def _notify_closed_trade_events(events):
         if not isinstance(close_time, dt.datetime):
             close_time = now_kst()
 
-        if "dust" not in str(e.get("reason", "") or "").lower():
-            notify_order(
-                event_type="ORDER_SELL_FILLED",
-                strategy_tag=strategy_tag,
-                ticker=ticker,
-                price=float(exit_price),
-                qty=float(qty),
-                reason=reason_code,
-            )
-        _, pnl_pct = _notify_close_settlement(
+        dedupe_key = _close_notify_dedupe_key(
             strategy_tag=strategy_tag,
             ticker=ticker,
-            total_buy_krw=float(total_buy_krw),
-            total_sell_krw=float(total_sell_krw),
-            last_exit_reason=exit_reason,
+            reason_code=exit_reason,
+            close_time=close_time,
+            total_buy_krw=total_buy_krw,
+            total_sell_krw=total_sell_krw,
+        )
+        if not _allow_close_notify_once(dedupe_key):
+            print(f"[NOTIFY] skip duplicate close notify: {ticker} reason={exit_reason}")
+            continue
+
+        total_buy_krw, total_sell_krw, suspicious_settlement, min_ratio = _settlement_totals_sanity(
+            total_buy_krw=total_buy_krw,
+            total_sell_krw=total_sell_krw,
+            close_qty=qty,
+            exit_price=exit_price,
+            raw_reason=e.get("reason", raw_reason),
         )
 
+        if suspicious_settlement:
+            print(
+                f"[WARN][SETTLEMENT] blocked suspicious settlement: {ticker} "
+                f"buy={total_buy_krw:,.0f} sell={total_sell_krw:,.0f} ratio={min_ratio:.2f}"
+            )
+            notify_event(
+                event_type="EXCEPTION_RAISED",
+                lines=[
+                    f"정산 보류: {ticker}",
+                    f"총매수={_fmt_krw(total_buy_krw)} KRW",
+                    f"총매도={_fmt_krw(total_sell_krw)} KRW",
+                    f"사유={exit_reason} (sell/buy<{min_ratio:.2f})",
+                ],
+            )
+            continue
+
+        final_reason = _final_reason_label(exit_reason)
+        if final_reason not in {"FINAL", "STOPLOSS", "FORCE_CLOSE"}:
+            continue
+        if bool(e.get("final_notified", False)):
+            print(f"[NOTIFY] skip final close (already notified): {ticker} reason={final_reason}")
+            continue
+
+        message = _build_final_close_message(
+            {
+                **e,
+                "strategy_tag": strategy_tag,
+                "entry_price": entry_price,
+                "exit_price": exit_price,
+                "total_buy_krw": total_buy_krw,
+                "total_sell_krw": total_sell_krw,
+                "last_exit_reason": final_reason,
+            }
+        )
+        tg_notify(event_type="POSITION_CLOSED", message=message)
+
+        realized_krw = float(total_sell_krw) - float(total_buy_krw)
+        realized_pct = (float(realized_krw) / float(total_buy_krw) * 100.0) if total_buy_krw > 0 else 0.0
         _notify_trade_result(
             ticker=ticker,
             qty=qty,
             entry_price=entry_price,
             exit_price=exit_price,
-            pnl_pct=pnl_pct,
+            pnl_pct=realized_pct,
         )
         _notify_monthly_stats(close_time)
 
@@ -701,6 +949,29 @@ def _iter_all_states(strategy_state: dict, inactive_positions: dict = None):
         yield "INACTIVE", ticker, s
 
 
+def _fallback_position_qty(state: dict) -> float:
+    qty_hint = max(0.0, _safe_float((state or {}).get("qty", 0.0), 0.0))
+    init_vol = max(0.0, _safe_float((state or {}).get("initial_volume", 0.0), 0.0))
+    entry = max(0.0, _safe_float((state or {}).get("entry", (state or {}).get("entry_price", 0.0)), 0.0))
+    buy_krw = max(0.0, _safe_float((state or {}).get("total_buy_krw", (state or {}).get("invested_krw", 0.0)), 0.0))
+    realized_cost = max(0.0, _safe_float((state or {}).get("realized_cost_krw", 0.0), 0.0))
+
+    base_qty = 0.0
+    if qty_hint > 0:
+        base_qty = float(qty_hint)
+    elif entry > 0 and buy_krw > 0:
+        base_qty = float(buy_krw / entry)
+    elif init_vol > 0:
+        base_qty = float(init_vol)
+
+    if base_qty <= 0:
+        return 0.0
+    if entry > 0 and realized_cost > 0:
+        sold_qty = float(realized_cost / entry)
+        return max(0.0, float(base_qty) - float(sold_qty))
+    return float(base_qty)
+
+
 def estimate_equity(krw: float, strategy_state: dict, prices: dict, upbit, inactive_positions: dict = None) -> float:
     equity = float(krw)
     for _, ticker, s in _iter_all_states(strategy_state, inactive_positions):
@@ -714,10 +985,7 @@ def estimate_equity(krw: float, strategy_state: dict, prices: dict, upbit, inact
         except Exception:
             vol = 0.0
         if vol <= 0:
-            try:
-                vol = float(s.get("qty", 0.0))
-            except Exception:
-                vol = 0.0
+            vol = _fallback_position_qty(s)
         if vol <= 0:
             continue
         p = prices.get(ticker)
@@ -1201,13 +1469,45 @@ def _scalp_btc_close_position(
                     "SCALP_BTC",
                 ],
             )
-            _, notify_pct = _notify_close_settlement(
-                strategy_tag=strategy_tag,
-                ticker=ticker,
-                total_buy_krw=float(total_buy_krw),
-                total_sell_krw=float(total_sell_krw),
-                last_exit_reason=exit_reason,
+            total_buy_krw, total_sell_krw, suspicious_settlement, min_ratio = _settlement_totals_sanity(
+                total_buy_krw=total_buy_krw,
+                total_sell_krw=total_sell_krw,
+                close_qty=qty,
+                exit_price=cur,
+                raw_reason=exit_reason,
             )
+            notify_pct = 0.0
+            if suspicious_settlement:
+                print(
+                    f"[WARN][SETTLEMENT] blocked suspicious settlement: {ticker} "
+                    f"buy={total_buy_krw:,.0f} sell={total_sell_krw:,.0f} ratio={min_ratio:.2f}"
+                )
+                notify_event(
+                    event_type="EXCEPTION_RAISED",
+                    lines=[
+                        f"정산 보류: {ticker}",
+                        f"총매수={_fmt_krw(total_buy_krw)} KRW",
+                        f"총매도={_fmt_krw(total_sell_krw)} KRW",
+                        f"사유={_final_reason_label(exit_reason)} (sell/buy<{min_ratio:.2f})",
+                    ],
+                )
+            else:
+                message = _build_final_close_message(
+                    {
+                        "strategy_tag": strategy_tag,
+                        "ticker": ticker,
+                        "entry_price": entry,
+                        "exit_price": cur,
+                        "total_buy_krw": total_buy_krw,
+                        "total_sell_krw": total_sell_krw,
+                        "last_exit_reason": _final_reason_label(exit_reason),
+                        "tp1_done": False,
+                        "tp2_done": False,
+                    }
+                )
+                tg_notify(event_type="POSITION_CLOSED", message=message)
+                realized_krw = float(total_sell_krw) - float(total_buy_krw)
+                notify_pct = (realized_krw / float(total_buy_krw) * 100.0) if total_buy_krw > 0 else 0.0
             _notify_trade_result(
                 ticker=ticker,
                 qty=float(qty),
@@ -1252,10 +1552,10 @@ def _scalp_btc_close_position(
         )
         return False, f"sell_failed:{err_msg}"
 
-    state["total_sell_krw"] = max(0.0, _safe_float(state.get("total_sell_krw", 0.0), 0.0)) + (float(qty) * float(cur))
-    state["last_exit_reason"] = exit_reason
-    total_sell_krw = float(state.get("total_sell_krw", 0.0))
-    realized_krw = float(total_sell_krw) - float(total_buy_krw)
+        state["total_sell_krw"] = max(0.0, _safe_float(state.get("total_sell_krw", 0.0), 0.0)) + (float(qty) * float(cur))
+        state["last_exit_reason"] = exit_reason
+        total_sell_krw = float(state.get("total_sell_krw", 0.0))
+        realized_krw = float(total_sell_krw) - float(total_buy_krw)
     realized_pct = (realized_krw / float(total_buy_krw) * 100.0) if total_buy_krw > 0 else 0.0
 
     cd_min = int(getattr(config, "SCALP_BTC_COOLDOWN_PROFIT_MIN", 10))
@@ -1288,21 +1588,45 @@ def _scalp_btc_close_position(
             "SCALP_BTC",
         ],
     )
-    notify_order(
-        event_type="ORDER_SELL_FILLED",
-        strategy_tag=strategy_tag,
-        ticker=ticker,
-        price=float(cur),
-        qty=float(qty),
-        reason=order_reason,
+    total_buy_krw, total_sell_krw, suspicious_settlement, min_ratio = _settlement_totals_sanity(
+        total_buy_krw=total_buy_krw,
+        total_sell_krw=total_sell_krw,
+        close_qty=qty,
+        exit_price=cur,
+        raw_reason=exit_reason,
     )
-    _, notify_pct = _notify_close_settlement(
-        strategy_tag=strategy_tag,
-        ticker=ticker,
-        total_buy_krw=float(total_buy_krw),
-        total_sell_krw=float(total_sell_krw),
-        last_exit_reason=exit_reason,
-    )
+    notify_pct = 0.0
+    if suspicious_settlement:
+        print(
+            f"[WARN][SETTLEMENT] blocked suspicious settlement: {ticker} "
+            f"buy={total_buy_krw:,.0f} sell={total_sell_krw:,.0f} ratio={min_ratio:.2f}"
+        )
+        notify_event(
+            event_type="EXCEPTION_RAISED",
+            lines=[
+                f"정산 보류: {ticker}",
+                f"총매수={_fmt_krw(total_buy_krw)} KRW",
+                f"총매도={_fmt_krw(total_sell_krw)} KRW",
+                f"사유={_final_reason_label(exit_reason)} (sell/buy<{min_ratio:.2f})",
+            ],
+        )
+    else:
+        message = _build_final_close_message(
+            {
+                "strategy_tag": strategy_tag,
+                "ticker": ticker,
+                "entry_price": entry,
+                "exit_price": cur,
+                "total_buy_krw": total_buy_krw,
+                "total_sell_krw": total_sell_krw,
+                "last_exit_reason": _final_reason_label(exit_reason),
+                "tp1_done": False,
+                "tp2_done": False,
+            }
+        )
+        tg_notify(event_type="POSITION_CLOSED", message=message)
+        realized_krw = float(total_sell_krw) - float(total_buy_krw)
+        notify_pct = (realized_krw / float(total_buy_krw) * 100.0) if total_buy_krw > 0 else 0.0
     _notify_trade_result(
         ticker=ticker,
         qty=float(qty),

@@ -98,6 +98,9 @@ def init_position_state(
         "total_buy_krw": float(buy_krw),
         "total_sell_krw": 0.0,
         "last_exit_reason": "",
+        "final_notified": False,
+        "tp1_pnl_pct": None,
+        "tp2_pnl_pct": None,
         "strategy_tag": tag,
     }
 

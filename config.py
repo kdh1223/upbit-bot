@@ -237,6 +237,8 @@ COOLDOWN_LOSS_MIN = 30
 DAILY_MAX_LOSS_PCT = -5.0
 GLOBAL_MDD_LIMIT_PCT = -15.0
 RISK_CUT_FORCE_CLOSE = False
+# Require consecutive breaches before risk-cut fires (spike guard).
+RISK_CUT_CONFIRM_TICKS = 3
 
 # ===============================
 # MAIN strategy
@@ -418,6 +420,21 @@ DAILY_REPORT_SEND_MONTH_IMAGE = False
 TELEGRAM_SPOOL_FLUSH_SEC = 30
 TELEGRAM_SPOOL_FLUSH_LIMIT = 50
 INITIAL_CAPITAL = 1_000_000
+
+# Telegram notification policy
+TELEGRAM_PARTIAL_NOTIFY = False
+
+# Daily report / heartbeat schedule gate (KST)
+REPORT_SEND_KST_HOUR = 21
+REPORT_SEND_KST_MIN = 0
+HEARTBEAT_SEND_KST_HOUR = 9
+HEARTBEAT_SEND_KST_MIN = 0
+REPORT_SCHEDULE_WINDOW_MIN = 30
+REPORT_SCHEDULE_STATE_FILE = "report_schedule_state.json"
+
+# Settlement sanity guards
+SETTLEMENT_MIN_SELL_RATIO = 0.55
+CLOSE_NOTIFY_DEDUPE_SEC = 10
 
 # ===============================
 # Position management

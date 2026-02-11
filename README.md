@@ -55,3 +55,32 @@ sudo systemctl restart upbit-bot
 sudo systemctl status upbit-bot --no-pager
 sudo journalctl -u upbit-bot -n 200 --no-pager
 ```
+
+## Daily report and heartbeat schedule (KST-safe)
+`run_daily_report.py` now enforces KST send windows and day-level dedupe by default.
+
+- Daily report target: `21:00 KST`
+- Heartbeat target: `09:00 KST`
+- Allowed window: `+/- 30 minutes` (configurable by `REPORT_SCHEDULE_WINDOW_MIN` or `--schedule-window-min`)
+- Manual override: add `--force`
+
+Recommended cron on UTC servers:
+```bash
+# 21:00 KST == 12:00 UTC
+0 12 * * * cd ~/upbit-bot && ./.venv/bin/python run_daily_report.py
+
+# 09:00 KST == 00:00 UTC
+0 0 * * * cd ~/upbit-bot && ./.venv/bin/python run_daily_report.py --heartbeat-only
+```
+
+Alternative (safer against missed cron runs):
+```bash
+*/5 * * * * cd ~/upbit-bot && ./.venv/bin/python run_daily_report.py --scheduled-report
+*/5 * * * * cd ~/upbit-bot && ./.venv/bin/python run_daily_report.py --scheduled-heartbeat
+```
+
+If you need to send immediately (outside schedule window), run:
+```bash
+cd ~/upbit-bot && ./.venv/bin/python run_daily_report.py --force
+cd ~/upbit-bot && ./.venv/bin/python run_daily_report.py --heartbeat-only --force
+```
