@@ -409,11 +409,11 @@ def minute_test_signal(ticker):
 
 def scalp_btc_entry_signal(ticker):
     """
-    BTC-only scalp signal (oversold + rebound confirmation):
+    BTC-only scalp signal V2 (oversold + rebound confirmation):
     - Environment:
       RSI <= oversold threshold and recent volume spike exists
-    - Rebound trigger:
-      satisfy at least 2 of 3
+    - Rebound trigger (V2):
+      RSI upturn is mandatory, and price must reclaim either prev-high or EMA9
     """
     interval = str(getattr(config, "SCALP_BTC_TF", "minute15"))
     rsi_len = int(getattr(config, "SCALP_BTC_RSI_LEN", 14))
@@ -422,8 +422,14 @@ def scalp_btc_entry_signal(ticker):
     vol_mult = float(getattr(config, "SCALP_BTC_VOL_SPIKE_MULT", 1.5))
     vol_win = max(1, int(getattr(config, "SCALP_BTC_VOL_SPIKE_WINDOW", 3)))
     ema_fast = max(2, int(getattr(config, "SCALP_BTC_EMA_FAST", 9)))
+    # V2 anti-falling-knife guard: fast EMA below slower EMA and fast EMA keeps falling.
+    ema_slow_guard = 21
+    # V2 panic-candle guard (internal constants, easy to tune later).
+    atr_len = 14
+    atr_body_mult = 0.9
+    close_pos_min = 0.40
 
-    min_needed = max(40, vol_lb + vol_win + 5, rsi_len + 5, ema_fast + 5)
+    min_needed = max(40, vol_lb + vol_win + 5, rsi_len + 5, ema_fast + 5, ema_slow_guard + 5, atr_len + 5)
     df = pyupbit.get_ohlcv(ticker, interval=interval, count=min_needed + 10)
     if df is None or len(df) < min_needed:
         return False
@@ -431,23 +437,42 @@ def scalp_btc_entry_signal(ticker):
         return False
 
     close = df["close"]
+    open_ = df["open"]
     high = df["high"]
+    low = df["low"]
     volume = df["volume"]
 
     rsi_series = get_rsi(df, rsi_len)
-    ema_series = get_ema(close, ema_fast)
+    ema_fast_series = get_ema(close, ema_fast)
+    ema_slow_series = get_ema(close, ema_slow_guard)
+    atr_series = get_atr(df, atr_len)
     vol_ma = volume.rolling(vol_lb).mean()
 
     close_now = safe_last(close)
-    ema_now = safe_last(ema_series)
+    ema_now = safe_last(ema_fast_series)
+    ema_slow_now = safe_last(ema_slow_series)
     rsi_now = safe_last(rsi_series)
+    atr_now = safe_last(atr_series)
     if None in (close_now, ema_now, rsi_now):
         return False
 
     try:
         prev_high = float(high.iloc[-2])
         rsi_prev = float(rsi_series.iloc[-2])
-        if prev_high != prev_high or rsi_prev != rsi_prev:
+        ema_prev = float(ema_fast_series.iloc[-2])
+        ema_prev2 = float(ema_fast_series.iloc[-3])
+        open_now = float(open_.iloc[-1])
+        high_now = float(high.iloc[-1])
+        low_now = float(low.iloc[-1])
+        if (
+            prev_high != prev_high
+            or rsi_prev != rsi_prev
+            or ema_prev != ema_prev
+            or ema_prev2 != ema_prev2
+            or open_now != open_now
+            or high_now != high_now
+            or low_now != low_now
+        ):
             return False
     except Exception:
         return False
@@ -459,19 +484,35 @@ def scalp_btc_entry_signal(ticker):
     if not (cond_env_rsi and cond_env_vol):
         return False
 
-    trig_1 = float(close_now) > float(prev_high)
-    trig_2 = float(close_now) > float(ema_now)
-    trig_3 = float(rsi_now) > float(rsi_prev)
-    trig_count = int(trig_1) + int(trig_2) + int(trig_3)
-    ok = trig_count >= 2
+    # V2 (change-2): block steep downtrend regime.
+    ema_down_slope = float(ema_now) < float(ema_prev) < float(ema_prev2)
+    if ema_slow_now is None:
+        downtrend_block = ema_down_slope
+    else:
+        downtrend_block = (float(ema_now) < float(ema_slow_now)) and ema_down_slope
+    if downtrend_block:
+        return False
+
+    # V2 (optional-3): block panic/weak candle even when volume spikes.
+    body_size = abs(float(close_now) - float(open_now))
+    close_pos = (float(close_now) - float(low_now)) / max(float(high_now) - float(low_now), 1e-12)
+    if (float(close_now) < float(open_now) and (atr_now is not None) and float(atr_now) > 0 and body_size > float(atr_now) * atr_body_mult):
+        return False
+    if close_pos < close_pos_min:
+        return False
+
+    # V2 (change-1): RSI upturn mandatory + (breakout OR EMA reclaim).
+    trig_rsi_up = float(rsi_now) > float(rsi_prev)
+    trig_price_reclaim = (float(close_now) > float(prev_high)) or (float(close_now) > float(ema_now))
+    trig_count = int(trig_rsi_up) + int(trig_price_reclaim)
+    ok = bool(trig_rsi_up and trig_price_reclaim)
 
     if ok and bool(getattr(config, "DEBUG_TRADE_FLOW", False)):
         print(
             f"[SCALP_BTC_진입근거] {ticker} rsi_now={float(rsi_now):.2f}<=os({rsi_os:.2f}) "
-            f"vol_spike=1 triggers={trig_count}/3 close={float(close_now):.2f} ema={float(ema_now):.2f}"
+            f"vol_spike=1 triggers={trig_count}/2 close={float(close_now):.2f} ema={float(ema_now):.2f}"
         )
     return bool(ok)
-
 
 def scalp_entry_signal(ticker, conservative=False):
     """
