@@ -47,6 +47,15 @@ class DailyReportLogicTests(unittest.TestCase):
         self.assertGreater(m["avg"], -10.0)
         self.assertGreater(m["min"], -10.0)
 
+    def test_build_metrics_repairs_large_mismatch_pnl_from_prices(self):
+        rows = [
+            {"pnl_pct": "-49.30", "entry_price": "28.50", "exit_price": "28.90", "reason": "FORCE_CLOSE"},
+            {"pnl_pct": "-1.03", "entry_price": "29.10", "exit_price": "29.10", "reason": "STOPLOSS"},
+        ]
+        m = build_metrics(rows)
+        self.assertEqual(m["n"], 2)
+        self.assertGreater(m["avg"], -5.0)
+
     def test_snapshot_mdd_is_negative(self):
         points = [
             (dt.datetime(2026, 2, 1, 21, 0, 0, tzinfo=KST), 1_000_000.0),

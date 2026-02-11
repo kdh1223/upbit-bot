@@ -183,6 +183,10 @@ def _row_pnl_pct_for_metrics(row: Dict[str, str]) -> float:
     # Legacy settlement glitch occasionally wrote -100% even when exit/entry shows normal loss.
     if float(logged) <= -95.0 and float(derived) > -30.0:
         return float(derived)
+    # Additional guard: if logged pnl largely disagrees with price-derived pnl,
+    # prefer derived value to avoid distorted stats from malformed legacy rows.
+    if abs(float(logged) - float(derived)) >= 20.0 and abs(float(derived)) <= 30.0:
+        return float(derived)
     return float(logged)
 
 
@@ -602,7 +606,7 @@ def build_report_text(
         "",
         "📌 전략별 (이번 달)",
         f"- MAIN: 거래 {int(main_stats.get('n', 0))} | 승률 {_to_float(main_stats.get('wr', 0.0), 0.0):.2f}% | 평균 {_to_float(main_stats.get('avg', 0.0), 0.0):+.2f}%",
-        f"- SCALP_BTC: 거래 {int(scalp_stats.get('n', 0))}",
+        f"- SCALP_BTC: 거래 {int(scalp_stats.get('n', 0))} | 승률 {_to_float(scalp_stats.get('wr', 0.0), 0.0):.2f}% | 평균 {_to_float(scalp_stats.get('avg', 0.0), 0.0):+.2f}%",
         "",
         f"상태: {str(status_emoji or '🟢')}",
     ]
