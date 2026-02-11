@@ -47,6 +47,10 @@ def _default_risk_state():
         "last_good_equity": 0.0,
         "daily_breach_streak": 0,
         "mdd_breach_streak": 0,
+        "eq_drop_guard_streak": 0,
+        "last_risk_alert_ts": 0.0,
+        "last_risk_alert_reason": "",
+        "last_risk_alert_day_key": "",
         "halted_flag": False,
         "halt_reason": "",
         "halted_at_ts": 0.0,
@@ -387,6 +391,16 @@ def _normalize_risk_state(raw: dict):
         state["mdd_breach_streak"] = max(0, int(state.get("mdd_breach_streak", 0)))
     except Exception:
         state["mdd_breach_streak"] = 0
+    try:
+        state["eq_drop_guard_streak"] = max(0, int(state.get("eq_drop_guard_streak", 0)))
+    except Exception:
+        state["eq_drop_guard_streak"] = 0
+    try:
+        state["last_risk_alert_ts"] = max(0.0, float(state.get("last_risk_alert_ts", 0.0)))
+    except Exception:
+        state["last_risk_alert_ts"] = 0.0
+    state["last_risk_alert_reason"] = str(state.get("last_risk_alert_reason") or "")
+    state["last_risk_alert_day_key"] = str(state.get("last_risk_alert_day_key") or "")
     state["halted_flag"] = bool(state.get("halted_flag", False))
     state["halt_reason"] = str(state.get("halt_reason") or "")
     try:

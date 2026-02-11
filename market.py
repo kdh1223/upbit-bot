@@ -267,7 +267,10 @@ def filter_tradeable_tickers(
 
     seen = set()
     use_market_registry = isinstance(market_info, dict) and len(market_info) > 0
-    exclude_caution = bool(getattr(config, "EXCLUDE_CAUTION", True))
+    block_warning = getattr(config, "BLOCK_MARKET_WARNING", None)
+    if block_warning is None:
+        block_warning = bool(getattr(config, "EXCLUDE_CAUTION", True))
+    block_warning = bool(block_warning)
 
     for ticker in tickers:
         if not isinstance(ticker, str):
@@ -285,7 +288,7 @@ def filter_tradeable_tickers(
             reason = "STABLECOIN"
         elif symbol in USER_EXCLUDED_SYMBOLS:
             reason = "USER_EXCLUDED"
-        elif strict_registry and exclude_caution and (not use_market_registry):
+        elif strict_registry and block_warning and (not use_market_registry):
             reason = "MARKET_INFO_UNAVAILABLE"
         elif use_market_registry:
             info = market_info.get(t)
@@ -293,8 +296,8 @@ def filter_tradeable_tickers(
                 reason = "NOT_LISTED_OR_HALTED"
             else:
                 warning = _normalize_market_warning(info.get("market_warning") or info.get("warning") or "NONE")
-                if exclude_caution and warning != "NONE":
-                    reason = "CAUTION"
+                if block_warning and warning != "NONE":
+                    reason = "MARKET_WARNING"
 
         if reason:
             inactive.append(t)
@@ -324,7 +327,7 @@ def get_krw_market_snapshots_24h(
     tickers, inactive, reasons = filter_tradeable_tickers(tickers, market_info)
     for t in inactive:
         reason = reasons.get(t, "UNKNOWN")
-        if reason == "CAUTION":
+        if reason == "MARKET_WARNING":
             print(f"[FILTER] moved to inactive: {t} (CAUTION)")
 
     total = len(tickers)

@@ -352,10 +352,17 @@ def _send_with_retry(event_type: str, payload_kind: str, payload: Dict) -> bool:
                 )
             return True
         except Exception as e:
+            status = ""
+            resp = getattr(e, "response", None)
+            try:
+                if resp is not None and getattr(resp, "status_code", None) is not None:
+                    status = f" status={int(resp.status_code)}"
+            except Exception:
+                status = ""
             print(
                 f"[WARN][TELEGRAM] send failed attempt={attempt}/{max_attempt} "
                 f"kind={payload_kind} event={str(event_type or '').upper().strip()} "
-                f"err={type(e).__name__}: {e}"
+                f"err={type(e).__name__}: {e}{status}"
             )
             print(traceback.format_exc().rstrip())
             if attempt < max_attempt:
@@ -464,4 +471,9 @@ def notify_order(
         qty=qty,
         reason=reason,
     )
-    return tg_notify(event_type=event_type, message=msg)
+    ok = tg_notify(event_type=event_type, message=msg)
+    code = str(event_type or "").upper().strip()
+    if code in {"ORDER_BUY_FILLED", "ORDER_SELL_FILLED", "ORDER_BUY_FAILED", "ORDER_SELL_FAILED"}:
+        status = "TG_SEND" if ok else "TG_FAIL"
+        print(f"[{status}] order {code} {str(ticker or '').upper().strip()}")
+    return ok

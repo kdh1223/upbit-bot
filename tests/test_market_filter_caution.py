@@ -35,7 +35,7 @@ class MarketFilterCautionTests(unittest.TestCase):
         )
         self.assertEqual(active, [])
         self.assertEqual(inactive, ["KRW-ZRO"])
-        self.assertEqual(reasons.get("KRW-ZRO"), "CAUTION")
+        self.assertEqual(reasons.get("KRW-ZRO"), "MARKET_WARNING")
 
     def test_blocks_entry_when_market_info_missing_in_strict_mode(self):
         active, inactive, reasons = market.filter_tradeable_tickers(

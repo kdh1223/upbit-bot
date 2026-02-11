@@ -279,6 +279,9 @@ def _default_runtime_risk_state():
         "daily_breach_streak": 0,
         "mdd_breach_streak": 0,
         "eq_drop_guard_streak": 0,
+        "last_risk_alert_ts": 0.0,
+        "last_risk_alert_reason": "",
+        "last_risk_alert_day_key": "",
         "halted_flag": False,
         "halt_reason": "",
         "halted_at_ts": 0.0,
@@ -305,6 +308,12 @@ def _normalize_runtime_risk_state(raw: dict):
         s["eq_drop_guard_streak"] = max(0, int(s.get("eq_drop_guard_streak", 0)))
     except Exception:
         s["eq_drop_guard_streak"] = 0
+    try:
+        s["last_risk_alert_ts"] = max(0.0, float(s.get("last_risk_alert_ts", 0.0)))
+    except Exception:
+        s["last_risk_alert_ts"] = 0.0
+    s["last_risk_alert_reason"] = str(s.get("last_risk_alert_reason") or "")
+    s["last_risk_alert_day_key"] = str(s.get("last_risk_alert_day_key") or "")
     s["halted_flag"] = bool(s.get("halted_flag", False))
     s["halt_reason"] = str(s.get("halt_reason") or "")
     s["halted_at_ts"] = max(0.0, _safe_float(s.get("halted_at_ts", 0.0), 0.0))
@@ -468,14 +477,21 @@ def _update_global_risk_cut_state(
     return info, changed, triggered
 
 
-def _notify_risk_cut_once(info: dict, equity: float):
+def _notify_risk_cut_once(info: dict, equity: float, risk_state: dict, persist_state_fn=None):
     global _TG_LAST_RISKCUT_AT
     cooldown = max(0, int(60))
     now_ts = time.time()
     if (now_ts - _TG_LAST_RISKCUT_AT) < float(cooldown):
         return
-
+    if not isinstance(info, dict):
+        return
     reason = str(info.get("reason") or "RISK_CUT")
+    day_key = str(info.get("day_key") or "")
+    last_reason = str((risk_state or {}).get("last_risk_alert_reason") or "")
+    last_day = str((risk_state or {}).get("last_risk_alert_day_key") or "")
+    if reason and (reason == last_reason) and (day_key == last_day):
+        return
+
     daily = float(info.get("daily_loss_pct", 0.0))
     mdd = float(info.get("mdd_pct", 0.0))
     print(f"[ALERT] RISK CUT {reason} | equity={float(equity):,.0f} daily={daily:+.2f}% mdd={mdd:+.2f}%")
@@ -492,6 +508,15 @@ def _notify_risk_cut_once(info: dict, equity: float):
         ],
     )
     _TG_LAST_RISKCUT_AT = float(now_ts)
+    if isinstance(risk_state, dict):
+        risk_state["last_risk_alert_ts"] = float(now_ts)
+        risk_state["last_risk_alert_reason"] = str(reason)
+        risk_state["last_risk_alert_day_key"] = str(day_key)
+        if callable(persist_state_fn):
+            try:
+                persist_state_fn()
+            except Exception as e:
+                print(f"[WARN] risk state alert save failed: {e}")
 
 
 def _coin_symbol(ticker: str) -> str:
@@ -2154,6 +2179,7 @@ def run():
 
             prev_day_key = str(runtime_risk_state.get("day_key", ""))
             prev_halted = bool(runtime_risk_state.get("halted_flag", False))
+            prev_reason = str(runtime_risk_state.get("halt_reason") or "")
             risk_info, _, risk_triggered = _update_global_risk_cut_state(
                 now,
                 equity,
@@ -2164,13 +2190,13 @@ def run():
             risk_halted = bool(risk_info.get("halted", False))
             halt_reason = str(risk_info.get("reason", ""))
 
-            if risk_triggered:
+            if risk_halted and (risk_triggered or (halt_reason and halt_reason != prev_reason) or (not prev_halted)):
                 print(
                     f"[RISK_CUT] HALT reason={halt_reason} equity={equity:,.0f} "
                     f"daily={float(risk_info.get('daily_loss_pct', 0.0)):+.2f}% "
                     f"mdd={float(risk_info.get('mdd_pct', 0.0)):+.2f}%"
                 )
-                _notify_risk_cut_once(risk_info, equity)
+                _notify_risk_cut_once(risk_info, equity, runtime_risk_state, persist_state_fn=persist_state)
 
             if prev_halted and (not risk_halted):
                 print(

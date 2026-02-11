@@ -84,3 +84,45 @@ If you need to send immediately (outside schedule window), run:
 cd ~/upbit-bot && ./.venv/bin/python run_daily_report.py --force
 cd ~/upbit-bot && ./.venv/bin/python run_daily_report.py --heartbeat-only --force
 ```
+
+## Notification & Risk Diagnostics
+Quick checks after deployment:
+
+1. Telegram order event smoke test
+```bash
+./.venv/bin/python - <<'PY'
+from utils.telegram_notify import notify_order
+notify_order(
+    event_type="ORDER_BUY_FILLED",
+    strategy_tag="MAIN",
+    ticker="KRW-TEST",
+    price=1234,
+    qty=0.1234,
+    reason="ENTRY",
+)
+PY
+```
+
+2. Risk-cut single-alert behavior (no repeated alerts on restart)
+```bash
+./.venv/bin/python - <<'PY'
+import datetime as dt
+import bot
+state = bot._normalize_runtime_risk_state({})
+now = dt.datetime.now()
+bot._update_global_risk_cut_state(now=now, equity=100000, risk_state=state, holdings_count=0)
+info, _, _ = bot._update_global_risk_cut_state(now=now, equity=60000, risk_state=state, holdings_count=0)
+bot._notify_risk_cut_once(info, 60000, state)
+PY
+```
+
+3. Market warning filter check (caution should be blocked)
+```bash
+./.venv/bin/python - <<'PY'
+import market
+active, inactive, reasons = market.filter_tradeable_tickers(
+    ["KRW-ZRO"], {"KRW-ZRO": {"market_warning": "CAUTION"}}, strict_registry=True
+)
+print(active, inactive, reasons)
+PY
+```
