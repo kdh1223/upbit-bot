@@ -139,9 +139,9 @@ class DailyReportLogicTests(unittest.TestCase):
             risk_state={"halted_flag": False, "halt_reason": ""},
         )
         self.assertIn("09:00", text)
-        self.assertIn("레짐: FULL | AUTO: AGGRESSIVE", text)
+        self.assertIn("레짐: FULL | AUTO: 공격형", text)
         self.assertIn("보유: 1 / 2", text)
-        self.assertIn("신규진입가드: ACTIVE", text)
+        self.assertIn("신규진입가드: 활성", text)
 
     def test_build_0900_mini_report_text_halted(self):
         text = build_0900_mini_report_text(

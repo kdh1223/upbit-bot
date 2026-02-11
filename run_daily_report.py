@@ -752,6 +752,19 @@ def _safe_auto_mode(log_line, market_info: dict) -> str:
         return "UNKNOWN"
 
 
+def _display_auto_mode(mode: str) -> str:
+    code = str(mode or "").upper().strip()
+    if code == "CONSERVATIVE":
+        return "\uBCF4\uC218\uD615"
+    if code == "AGGRESSIVE":
+        return "\uACF5\uACA9\uD615"
+    if code == "OFF":
+        return "OFF"
+    if not code:
+        return "UNKNOWN"
+    return code
+
+
 def _safe_max_holdings_from_equity(equity: float, regime: str, log_line) -> int:
     try:
         _base_per_trade, base_max_holdings = get_base_position_settings(float(equity))
@@ -782,7 +795,7 @@ def build_0900_mini_report_text(
     lines = [
         "\U0001F4CA 09:00 \uC6B4\uC601 \uC0C1\uD0DC (KST)",
         "",
-        f"\uB808\uC9D0: {str(regime or 'UNKNOWN')} | AUTO: {str(auto_mode or 'UNKNOWN')}",
+        f"\uB808\uC9D0: {str(regime or 'UNKNOWN')} | AUTO: {_display_auto_mode(auto_mode)}",
         f"\uBCF4\uC720: {int(holding_cnt)} / {int(max_holdings)}",
         f"\uCD1D\uC790\uC0B0: {max(0.0, _to_float(equity_krw, 0.0)):,.0f}\uC6D0",
         f"\uC77C\uC190\uC775: {_to_float(daily_pct, 0.0):+.2f}% | \uC6D4 MDD: {month_mdd_text}",
@@ -793,7 +806,7 @@ def build_0900_mini_report_text(
         else:
             lines.append("\uC0C1\uD0DC: \u26D4 HALTED")
     else:
-        lines.append(f"09:00~09:15 \uC2E0\uADDC\uC9C4\uC785\uAC00\uB4DC: {'ACTIVE' if bool(guard_active) else 'INACTIVE'}")
+        lines.append(f"09:00~09:15 \uC2E0\uADDC\uC9C4\uC785\uAC00\uB4DC: {'\uD65C\uC131' if bool(guard_active) else '\uBE44\uD65C\uC131'}")
     return "\n".join(lines)
 
 
