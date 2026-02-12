@@ -9,11 +9,13 @@ from indicators import (
     check_filters,
     check_filters_with_reason,
     get_rsi,
+    h4_trend_ok,
     intraday_trend_ok,
     minute_entry_ok,
     minute_entry_score,
     safe_last,
     scalp_entry_signal,
+    vol_ok_recent,
 )
 from strategy import calc_target
 from utils.telegram_notify import notify_event, notify_order
@@ -111,6 +113,107 @@ def _get_main_filter_reason(minute_cache: dict, ticker: str) -> str:
     if isinstance(raw, tuple) and len(raw) >= 1:
         return str(raw[0] or "UNKNOWN")
     return "UNKNOWN"
+
+
+def _get_main_entry_score_cached(ticker: str, now, minute_cache: dict):
+    """
+    Return (score:int, reasons:list[str], err_reason:str|None) using main_score cache.
+    """
+    score_key = f"main_score::{ticker}"
+    cache_sec = max(0.0, float(getattr(config, "ENTRY_SCORE_CACHE_SEC", 5)))
+    cached_score = minute_cache.get(score_key)
+    if isinstance(cached_score, tuple) and len(cached_score) == 3:
+        try:
+            if (now - cached_score[2]).total_seconds() < cache_sec:
+                score = int(cached_score[0])
+                reasons = list(cached_score[1]) if isinstance(cached_score[1], (list, tuple)) else []
+                return score, reasons, None
+        except Exception:
+            pass
+
+    try:
+        interval = str(getattr(config, "ENTRY_SCORE_INTERVAL", "minute1"))
+        lookback = max(25, int(getattr(config, "ENTRY_SCORE_LOOKBACK", 40)))
+        df = pyupbit.get_ohlcv(ticker, interval=interval, count=lookback)
+        score, reasons, _ = minute_entry_score(df, cfg=config)
+        score = int(score)
+        reasons = list(reasons or [])
+        minute_cache[score_key] = (score, reasons, now)
+        return score, reasons, None
+    except Exception:
+        return 0, [], "ENTRY_SCORE_CALC_ERR"
+
+
+def _day_ma_soft_bypass_ok(ticker: str, now, minute_cache: dict):
+    """
+    Conservative DAY_MA_FAIL bypass gate.
+    Returns: (ok:bool, score:int, h4_ok:bool|None, vol_ok:bool|None)
+    """
+    if not bool(getattr(config, "DAY_MA_SOFT_BYPASS_ENABLED", False)):
+        return False, 0, None, None
+
+    cooldown_min = max(1, int(getattr(config, "DAY_MA_BYPASS_COOLDOWN_MIN", 60)))
+    cooldown_key = f"day_ma_bypass::{ticker}"
+    last_bypass = minute_cache.get(cooldown_key)
+    if last_bypass is not None:
+        try:
+            if (now - last_bypass).total_seconds() < (cooldown_min * 60.0):
+                return False, 0, None, None
+        except Exception:
+            pass
+
+    score, _reasons, score_err = _get_main_entry_score_cached(ticker, now, minute_cache)
+    if score_err is not None:
+        return False, 0, None, None
+
+    req_score = max(1, int(getattr(config, "DAY_MA_BYPASS_REQUIRE_ENTRY_SCORE", 3)))
+    if int(score) < int(req_score):
+        return False, int(score), None, None
+
+    h4_ok = None
+    if bool(getattr(config, "DAY_MA_BYPASS_REQUIRE_H4_TREND", True)):
+        h4_key = f"day_ma_bypass_h4::{ticker}"
+        cached_h4 = minute_cache.get(h4_key)
+        if isinstance(cached_h4, tuple) and len(cached_h4) == 2:
+            try:
+                if (now - cached_h4[1]).total_seconds() < 60.0:
+                    h4_ok = bool(cached_h4[0])
+            except Exception:
+                h4_ok = None
+        if h4_ok is None:
+            try:
+                df4h = pyupbit.get_ohlcv(ticker, interval="minute240", count=80)
+            except Exception:
+                df4h = None
+            h4_ok = bool(h4_trend_ok(df4h))
+            minute_cache[h4_key] = (bool(h4_ok), now)
+        if not bool(h4_ok):
+            return False, int(score), False, None
+
+    vol_ok = None
+    if bool(getattr(config, "DAY_MA_BYPASS_REQUIRE_VOL_OK", True)):
+        vol_key = f"day_ma_bypass_vol::{ticker}"
+        cached_vol = minute_cache.get(vol_key)
+        if isinstance(cached_vol, tuple) and len(cached_vol) == 2:
+            try:
+                if (now - cached_vol[1]).total_seconds() < 20.0:
+                    vol_ok = bool(cached_vol[0])
+            except Exception:
+                vol_ok = None
+        if vol_ok is None:
+            interval = str(getattr(config, "ENTRY_SCORE_INTERVAL", "minute1"))
+            lookback = max(25, int(getattr(config, "ENTRY_SCORE_LOOKBACK", 40)))
+            try:
+                df_vol = pyupbit.get_ohlcv(ticker, interval=interval, count=lookback)
+            except Exception:
+                df_vol = None
+            vol_ok = bool(vol_ok_recent(df_vol))
+            minute_cache[vol_key] = (bool(vol_ok), now)
+        if not bool(vol_ok):
+            return False, int(score), bool(h4_ok) if h4_ok is not None else None, False
+
+    minute_cache[cooldown_key] = now
+    return True, int(score), bool(h4_ok) if h4_ok is not None else None, bool(vol_ok) if vol_ok is not None else None
 
 
 def _main_surge_extra_guard_ok(ticker: str, now, minute_cache) -> tuple[bool, str]:
@@ -292,26 +395,51 @@ def _main_1m_confirm_ok(ticker: str) -> tuple[bool, str]:
 
 
 def entry_passes_filters(ticker: str, now, day_cache, intraday_cache, minute_cache, main_mode: str = "CONSERVATIVE") -> bool:
-    reason_key = f"main_reason::{ticker}"
-    score_key = f"main_score::{ticker}"
-
     # Daily filter cache
     cached = day_cache.get(ticker)
-    if cached and (now - cached[1]).total_seconds() < float(getattr(config, "DAY_FILTER_CACHE_SEC", 60)):
+    day_cache_sec = float(getattr(config, "DAY_FILTER_CACHE_SEC", 60))
+    day_reason_key = f"main_day_reason::{ticker}"
+    day_reason = None
+    if cached and (now - cached[1]).total_seconds() < day_cache_sec:
         ok_day = bool(cached[0])
         if not ok_day:
-            _set_main_filter_reason(minute_cache, ticker, "DAY_FILTER_FAIL", now)
-            return False
+            cached_reason = minute_cache.get(day_reason_key)
+            if isinstance(cached_reason, tuple) and len(cached_reason) >= 2:
+                try:
+                    if (now - cached_reason[1]).total_seconds() < day_cache_sec:
+                        day_reason = str(cached_reason[0] or "DAY_FILTER_FAIL")
+                except Exception:
+                    day_reason = None
+            if day_reason is None:
+                ok_day_refetch, day_reason_refetch = check_filters_with_reason(ticker)
+                ok_day = bool(ok_day_refetch)
+                day_reason = str(day_reason_refetch or "DAY_FILTER_FAIL")
+                day_cache[ticker] = (ok_day, now)
+                minute_cache[day_reason_key] = (day_reason, now)
     else:
         ok_day, day_reason = check_filters_with_reason(ticker)
         ok_day = bool(ok_day)
+        day_reason = str(day_reason or "DAY_FILTER_FAIL")
         day_cache[ticker] = (ok_day, now)
-        if not ok_day:
+        minute_cache[day_reason_key] = (day_reason, now)
+    if not ok_day:
+        # Conservative bypass: only allow DAY_MA_FAIL to proceed when strict
+        # minute/H4/volume conditions and cooldown pass.
+        if str(day_reason) == "DAY_MA_FAIL" and bool(getattr(config, "DAY_MA_SOFT_BYPASS_ENABLED", False)):
+            bypass_ok, bypass_score, bypass_h4_ok, bypass_vol_ok = _day_ma_soft_bypass_ok(ticker, now, minute_cache)
+            if bypass_ok:
+                req_score = max(1, int(getattr(config, "DAY_MA_BYPASS_REQUIRE_ENTRY_SCORE", 3)))
+                _set_main_filter_reason(minute_cache, ticker, f"DAY_MA_BYPASS(score>={req_score})", now)
+                if bool(getattr(config, "DAY_MA_BYPASS_LOG", True)):
+                    h4_txt = "SKIP" if bypass_h4_ok is None else ("OK" if bool(bypass_h4_ok) else "FAIL")
+                    vol_txt = "SKIP" if bypass_vol_ok is None else ("OK" if bool(bypass_vol_ok) else "FAIL")
+                    print(f"[DAY_MA_BYPASS][MAIN] ticker={ticker} score={int(bypass_score)} h4={h4_txt} vol={vol_txt}")
+            else:
+                _set_main_filter_reason(minute_cache, ticker, "DAY_MA_FAIL", now)
+                return False
+        else:
             _set_main_filter_reason(minute_cache, ticker, str(day_reason or "DAY_FILTER_FAIL"), now)
             return False
-    if not ok_day:
-        _set_main_filter_reason(minute_cache, ticker, "DAY_FILTER_FAIL", now)
-        return False
 
     # Intraday trend cache
     if bool(getattr(config, "USE_INTRADAY_FILTER", False)):
@@ -330,31 +458,10 @@ def entry_passes_filters(ticker: str, now, day_cache, intraday_cache, minute_cac
 
     # Minute timing cache / score gate
     if bool(getattr(config, "ENTRY_SCORE_ENABLED", True)) and bool(getattr(config, "ENTRY_SCORE_REPLACE_MINUTE_OK", True)):
-        score = None
-        reasons = None
-
-        cached_score = minute_cache.get(score_key)
-        cache_sec = max(0.0, float(getattr(config, "ENTRY_SCORE_CACHE_SEC", 5)))
-        if (
-            isinstance(cached_score, tuple)
-            and len(cached_score) == 3
-            and isinstance(cached_score[2], type(now))
-            and (now - cached_score[2]).total_seconds() < cache_sec
-        ):
-            score = int(cached_score[0])
-            reasons = list(cached_score[1]) if isinstance(cached_score[1], (list, tuple)) else []
-        else:
-            try:
-                interval = str(getattr(config, "ENTRY_SCORE_INTERVAL", "minute1"))
-                lookback = max(25, int(getattr(config, "ENTRY_SCORE_LOOKBACK", 40)))
-                df = pyupbit.get_ohlcv(ticker, interval=interval, count=lookback)
-                score, reasons, _ = minute_entry_score(df, cfg=config)
-                score = int(score)
-                reasons = list(reasons or [])
-                minute_cache[score_key] = (score, reasons, now)
-            except Exception:
-                _set_main_filter_reason(minute_cache, ticker, "ENTRY_SCORE_CALC_ERR", now)
-                return False
+        score, reasons, score_err = _get_main_entry_score_cached(ticker, now, minute_cache)
+        if score_err is not None:
+            _set_main_filter_reason(minute_cache, ticker, str(score_err), now)
+            return False
 
         min_score = max(1, int(getattr(config, "MAIN_MIN_ENTRY_SCORE", 2)))
         if int(score) < int(min_score):

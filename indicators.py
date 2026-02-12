@@ -354,6 +354,47 @@ def minute_entry_score(df, cfg=config):
     return int(score), reasons, metrics
 
 
+def h4_trend_ok(df4h):
+    """
+    Conservative higher-timeframe trend check used by DAY_MA bypass.
+    """
+    if df4h is None or len(df4h) < 25 or ("close" not in df4h.columns):
+        return False
+    try:
+        close_series = df4h["close"]
+        ema20 = get_ema(close_series, 20)
+        close_now = safe_last(close_series)
+        ema20_now = safe_last(ema20)
+        ema20_prev = float(ema20.iloc[-2])
+    except Exception:
+        return False
+    vals = [close_now, ema20_now, ema20_prev]
+    if any(v is None for v in vals):
+        return False
+    if any((float(v) != float(v)) for v in vals):
+        return False
+    return bool(float(close_now) > float(ema20_now) and float(ema20_now) > float(ema20_prev))
+
+
+def vol_ok_recent(df, ma_period: int = 20):
+    """
+    Conservative volume health check.
+    """
+    if df is None or len(df) < max(25, int(ma_period) + 2) or ("volume" not in df.columns):
+        return False
+    try:
+        vol_series = df["volume"]
+        vol_now = safe_last(vol_series)
+        vol_ma_now = safe_last(volume_ma(df, int(ma_period)))
+    except Exception:
+        return False
+    if vol_now is None or vol_ma_now is None:
+        return False
+    if float(vol_now) != float(vol_now) or float(vol_ma_now) != float(vol_ma_now) or float(vol_ma_now) <= 0:
+        return False
+    return bool(float(vol_now) > float(vol_ma_now))
+
+
 def minute_test_signal(ticker):
     """
     강화 분봉 실전형 테스트 신호(1분봉)
