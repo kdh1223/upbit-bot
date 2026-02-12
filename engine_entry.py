@@ -501,6 +501,9 @@ def try_main_entries(
             )
             state[ticker]["entry_bucket"] = "CORE"
             _apply_main_tp_profile_on_entry(state[ticker], mode=main_mode, equity=equity)
+            state[ticker]["tp1_adjusted_done"] = False
+            state[ticker]["runner_trail_tightened_done"] = False
+            state[ticker]["runner_trail_giveback_pct"] = None
             if isinstance(entry_params, dict):
                 state[ticker]["sl_one_pct"] = abs(float(entry_params.get("sl_one", 0.0)))
                 # MAIN always uses TP1/TP2/RUNNER staged exits.

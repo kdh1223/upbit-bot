@@ -202,7 +202,7 @@ def _normalize_exit_reason(raw_reason: str) -> str:
 
 def _is_partial_trade_reason(raw_reason: str) -> bool:
     code = str(raw_reason or "").strip().upper()
-    return code in {"TP1", "TP2_PARTIAL"}
+    return code in {"TP1", "TP1_OB_FVG_ADJUST", "TP2_PARTIAL"}
 
 
 def manage_positions(
@@ -385,9 +385,12 @@ def manage_positions(
             s["tp2"] = False
             s["tp1_done"] = False
             s["tp2_done"] = False
+            s["tp1_adjusted_done"] = False
             s["runner_active"] = False
             s["runner_hwm"] = 0.0
             s["runner_start_ts"] = 0.0
+            s["runner_trail_tightened_done"] = False
+            s["runner_trail_giveback_pct"] = None
             s["tp1_ratio"] = 0.0
             s["tp2_ratio"] = 0.0
             s["runner_ratio"] = 0.0

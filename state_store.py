@@ -222,6 +222,8 @@ def _normalize_position_state(raw: dict):
     s["tp2_done"] = bool(s.get("tp2_done", s.get("tp2", False)))
     s["tp1"] = bool(s["tp1_done"])
     s["tp2"] = bool(s["tp2_done"])
+    s["tp1_adjusted_done"] = bool(s.get("tp1_adjusted_done", False))
+    s["runner_trail_tightened_done"] = bool(s.get("runner_trail_tightened_done", False))
     s["final_notified"] = bool(s.get("final_notified", False))
     try:
         s["tp1_pnl_pct"] = float(s.get("tp1_pnl_pct")) if s.get("tp1_pnl_pct") is not None else None
@@ -252,6 +254,7 @@ def _normalize_position_state(raw: dict):
         s["tp1_ratio"] = float(tp1_ratio / total_ratio)
         s["tp2_ratio"] = float(tp2_ratio / total_ratio)
         s["runner_ratio"] = float(runner_ratio / total_ratio)
+        s["runner_trail_giveback_pct"] = _as_optional_pct("runner_trail_giveback_pct")
         s["runner_active"] = bool(s.get("runner_active", False))
         try:
             runner_hwm = float(s.get("runner_hwm", 0.0))
@@ -264,10 +267,14 @@ def _normalize_position_state(raw: dict):
         s["entry_mode"] = mode if mode in {"AGGRESSIVE", "CONSERVATIVE"} else "CONSERVATIVE"
 
         if not bool(s.get("holding", False)):
+            s["tp1_adjusted_done"] = False
+            s["runner_trail_tightened_done"] = False
+            s["runner_trail_giveback_pct"] = None
             s["runner_active"] = False
             s["runner_hwm"] = 0.0
             s["runner_start_ts"] = 0.0
     else:
+        s["runner_trail_giveback_pct"] = _as_optional_pct("runner_trail_giveback_pct")
         s["runner_active"] = bool(s.get("runner_active", False))
         try:
             s["runner_hwm"] = max(0.0, float(s.get("runner_hwm", 0.0)))
@@ -557,9 +564,12 @@ def _repair_strategy_state_with_balance(upbit, state: dict, strategy_tag: str = 
             s["tp2"] = False
             s["tp1_done"] = False
             s["tp2_done"] = False
+            s["tp1_adjusted_done"] = False
             s["runner_active"] = False
             s["runner_hwm"] = 0.0
             s["runner_start_ts"] = 0.0
+            s["runner_trail_tightened_done"] = False
+            s["runner_trail_giveback_pct"] = None
             s["tp1_ratio"] = 0.0
             s["tp2_ratio"] = 0.0
             s["runner_ratio"] = 0.0

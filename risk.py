@@ -6,9 +6,12 @@ import time
 
 import config
 import pyupbit
-from indicators import get_atr
+from indicators import get_atr, get_rsi
 from market import get_balance
 from utils.telegram_notify import notify_order
+
+
+_MAIN_OB_FVG_CACHE = {}
 
 
 def _get_params_by_regime(regime: str):
@@ -331,6 +334,10 @@ def _ensure_main_stage_state(state: dict, now_ts: float, cur: float):
     state["tp2_done"] = bool(tp2_done)
     state["tp1"] = bool(tp1_done)
     state["tp2"] = bool(tp2_done)
+    state["tp1_adjusted_done"] = bool(state.get("tp1_adjusted_done", False))
+    state["runner_trail_tightened_done"] = bool(state.get("runner_trail_tightened_done", False))
+    runner_trail_giveback = _get_state_pct(state, "runner_trail_giveback_pct", None)
+    state["runner_trail_giveback_pct"] = float(runner_trail_giveback) if runner_trail_giveback is not None else None
 
     state["runner_active"] = bool(state.get("runner_active", False))
     state["runner_hwm"] = _as_nonneg_float(state.get("runner_hwm", 0.0), 0.0)
@@ -338,6 +345,9 @@ def _ensure_main_stage_state(state: dict, now_ts: float, cur: float):
     state["runner_start_ts"] = float(runner_start_ts) if runner_start_ts is not None else 0.0
 
     if not bool(state.get("holding", False)):
+        state["tp1_adjusted_done"] = False
+        state["runner_trail_tightened_done"] = False
+        state["runner_trail_giveback_pct"] = None
         state["runner_active"] = False
         state["runner_hwm"] = 0.0
         state["runner_start_ts"] = 0.0
@@ -366,6 +376,179 @@ def _estimate_entry_qty(state: dict, entry: float) -> float:
         if total_buy_krw > 0:
             return float(total_buy_krw / entry)
     return _as_nonneg_float(state.get("initial_volume", 0.0), 0.0)
+
+
+def _as_finite_float(value):
+    try:
+        v = float(value)
+        if v != v:
+            return None
+        return float(v)
+    except Exception:
+        return None
+
+
+def _main_ob_fvg_enabled() -> bool:
+    return bool(getattr(config, "MAIN_OB_FVG_TP_ADJUST_ENABLED", True))
+
+
+def _main_ob_fvg_cache_sec() -> float:
+    return max(0.0, float(getattr(config, "MAIN_OB_FVG_CACHE_SEC", 5.0)))
+
+
+def _extract_bearish_ob_levels(df, lookback: int):
+    levels = []
+    if df is None or len(df) < 2:
+        return levels
+    open_ = df["open"]
+    close = df["close"]
+    n = len(df)
+    start = max(1, n - max(2, int(lookback)))
+    for i in range(start, n):
+        prev_open = _as_finite_float(open_.iloc[i - 1])
+        prev_close = _as_finite_float(close.iloc[i - 1])
+        cur_open = _as_finite_float(open_.iloc[i])
+        cur_close = _as_finite_float(close.iloc[i])
+        if None in (prev_open, prev_close, cur_open, cur_close):
+            continue
+        if not (prev_close > prev_open and cur_close < cur_open):
+            continue
+        prev_low = min(prev_open, prev_close)
+        prev_high = max(prev_open, prev_close)
+        cur_low = min(cur_open, cur_close)
+        cur_high = max(cur_open, cur_close)
+        engulf = (cur_high >= prev_high) and (cur_low <= prev_low)
+        close_confirm = cur_close <= prev_low
+        if engulf and close_confirm:
+            levels.append(float(cur_low))
+            levels.append(float(cur_high))
+    return levels
+
+
+def _extract_bearish_fvg_upper_levels(df, lookback: int):
+    levels = []
+    if df is None or len(df) < 3:
+        return levels
+    high = df["high"]
+    low = df["low"]
+    n = len(df)
+    start = max(2, n - max(3, int(lookback)))
+    for i in range(start, n):
+        low_c1 = _as_finite_float(low.iloc[i - 2])
+        high_c3 = _as_finite_float(high.iloc[i])
+        if None in (low_c1, high_c3):
+            continue
+        if low_c1 > high_c3:
+            levels.append(float(low_c1))
+    return levels
+
+
+def _main_momentum_slowdown(df):
+    out = {
+        "slowdown": False,
+        "two_red": False,
+        "rsi_down": False,
+        "vol_down": False,
+    }
+    if df is None or len(df) < 2:
+        return out
+
+    open_ = df["open"]
+    close = df["close"]
+    volume = df["volume"]
+
+    open_now = _as_finite_float(open_.iloc[-1])
+    close_now = _as_finite_float(close.iloc[-1])
+    open_prev = _as_finite_float(open_.iloc[-2])
+    close_prev = _as_finite_float(close.iloc[-2])
+    if None not in (open_now, close_now, open_prev, close_prev):
+        out["two_red"] = (close_now < open_now) and (close_prev < open_prev)
+
+    try:
+        rsi = get_rsi(df, 14)
+        rsi_now = _as_finite_float(rsi.iloc[-1])
+        rsi_prev = _as_finite_float(rsi.iloc[-2])
+        if None not in (rsi_now, rsi_prev):
+            out["rsi_down"] = float(rsi_now) < float(rsi_prev)
+    except Exception:
+        out["rsi_down"] = False
+
+    try:
+        v_now = _as_finite_float(volume.iloc[-1])
+        v_prev = _as_finite_float(volume.iloc[-2])
+        vma20_now = _as_finite_float(volume.rolling(20).mean().iloc[-1])
+        if None not in (v_now, v_prev, vma20_now):
+            out["vol_down"] = (float(v_now) < float(v_prev)) and (float(v_now) < float(vma20_now))
+    except Exception:
+        out["vol_down"] = False
+
+    out["slowdown"] = bool(out["two_red"] or out["rsi_down"] or out["vol_down"])
+    return out
+
+
+def _main_ob_fvg_context(ticker: str):
+    if not _main_ob_fvg_enabled():
+        return None
+
+    cache_key = str(ticker or "").upper().strip()
+    now_ts = float(time.time())
+    cache_sec = _main_ob_fvg_cache_sec()
+    cached = _MAIN_OB_FVG_CACHE.get(cache_key)
+    if isinstance(cached, dict):
+        cached_ts = _as_finite_float(cached.get("ts"))
+        if cached_ts is not None and (now_ts - float(cached_ts)) <= cache_sec:
+            return cached.get("ctx")
+
+    interval = str(getattr(config, "MAIN_OB_FVG_TF", "minute15")).strip() or "minute15"
+    lookback = max(20, int(getattr(config, "MAIN_OB_FVG_OB_LOOKBACK", 20)))
+    count = max(60, lookback + 25)
+    ctx = None
+
+    try:
+        df = pyupbit.get_ohlcv(ticker, interval=interval, count=count)
+        if df is None or len(df) < max(25, lookback + 3):
+            ctx = None
+        elif not {"open", "high", "low", "close", "volume"}.issubset(df.columns):
+            ctx = None
+        else:
+            ob_levels = _extract_bearish_ob_levels(df, lookback=lookback)
+            fvg_levels = _extract_bearish_fvg_upper_levels(df, lookback=lookback)
+            levels = sorted(set([float(x) for x in (ob_levels + fvg_levels) if _as_finite_float(x) is not None]))
+            slowdown = _main_momentum_slowdown(df)
+            ctx = {
+                "interval": interval,
+                "ob_levels": ob_levels,
+                "fvg_levels": fvg_levels,
+                "levels": levels,
+                "slowdown": bool(slowdown.get("slowdown", False)),
+                "two_red": bool(slowdown.get("two_red", False)),
+                "rsi_down": bool(slowdown.get("rsi_down", False)),
+                "vol_down": bool(slowdown.get("vol_down", False)),
+            }
+    except Exception:
+        ctx = None
+
+    _MAIN_OB_FVG_CACHE[cache_key] = {"ts": now_ts, "ctx": ctx}
+    return ctx
+
+
+def _nearest_upper_resistance(price: float, levels):
+    p = _as_finite_float(price)
+    if p is None or p <= 0:
+        return None, None
+    candidates = []
+    for level in list(levels or []):
+        lv = _as_finite_float(level)
+        if lv is None:
+            continue
+        if lv <= float(p):
+            continue
+        candidates.append(float(lv))
+    if not candidates:
+        return None, None
+    nearest = min(candidates, key=lambda lv: (lv - float(p)))
+    distance = (float(nearest) - float(p)) / float(p)
+    return float(nearest), float(distance)
 
 
 def apply_risk_rules(upbit, ticker: str, state: dict, cur: float, market_sell, now=None, strategy_tag: str = "MAIN"):
@@ -480,8 +663,73 @@ def apply_risk_rules(upbit, ticker: str, state: dict, cur: float, market_sell, n
                 "partials": partials,
             }
 
+        ob_fvg_snapshot = None
+
+        def _load_ob_fvg_snapshot():
+            nonlocal ob_fvg_snapshot
+            if ob_fvg_snapshot is not None:
+                return ob_fvg_snapshot
+
+            ctx = _main_ob_fvg_context(ticker)
+            if not isinstance(ctx, dict):
+                ob_fvg_snapshot = {
+                    "ready": False,
+                    "near_resistance": False,
+                    "slowdown": False,
+                    "nearest_level": None,
+                    "distance": None,
+                }
+                return ob_fvg_snapshot
+
+            nearest_level, distance = _nearest_upper_resistance(float(cur), ctx.get("levels", []))
+            near_max = max(0.0, float(getattr(config, "MAIN_OB_FVG_RESIST_NEAR_PCT", 0.0025)))
+            near_resistance = (distance is not None) and (float(distance) <= float(near_max))
+            ob_fvg_snapshot = {
+                "ready": True,
+                "near_resistance": bool(near_resistance),
+                "slowdown": bool(ctx.get("slowdown", False)),
+                "nearest_level": nearest_level,
+                "distance": distance,
+                "two_red": bool(ctx.get("two_red", False)),
+                "rsi_down": bool(ctx.get("rsi_down", False)),
+                "vol_down": bool(ctx.get("vol_down", False)),
+                "ob_count": len(list(ctx.get("ob_levels", []) or [])),
+                "fvg_count": len(list(ctx.get("fvg_levels", []) or [])),
+            }
+            if bool(getattr(config, "DEBUG_TRADE_FLOW", False)):
+                level_txt = f"{nearest_level:.6f}" if nearest_level is not None else "none"
+                dist_txt = f"{float(distance) * 100.0:.3f}%" if distance is not None else "none"
+                print(
+                    f"[OB_FVG][MAIN] {ticker} level={level_txt} dist={dist_txt} "
+                    f"near={bool(near_resistance)} slow={bool(ctx.get('slowdown', False))} "
+                    f"2red={bool(ctx.get('two_red', False))} rsi_down={bool(ctx.get('rsi_down', False))} "
+                    f"vol_down={bool(ctx.get('vol_down', False))} ob={len(list(ctx.get('ob_levels', []) or []))} "
+                    f"fvg={len(list(ctx.get('fvg_levels', []) or []))}"
+                )
+            return ob_fvg_snapshot
+
         # MAIN staged TP1 partial
-        if (not bool(state.get("tp1_done", False))) and tp1 > 0 and pnl >= tp1:
+        tp1_reason = None
+        tp1_adjust_reason = "TP1_OB_FVG_ADJUST"
+        tp1_base_reason = "TP1"
+        if (not bool(state.get("tp1_done", False))) and tp1 > 0:
+            tp1_min_profit = max(0.0, float(getattr(config, "MAIN_OB_FVG_TP1_MIN_PNL_PCT", 0.0035)))
+            tp1_hit_ratio = max(0.0, float(getattr(config, "MAIN_OB_FVG_TP1_HIT_RATIO", 0.75)))
+            tp1_adjust_eligible = (
+                (not bool(state.get("tp1_adjusted_done", False)))
+                and (pnl > 0.0)
+                and (pnl >= tp1_min_profit)
+                and (pnl >= (float(tp1) * float(tp1_hit_ratio)))
+                and (pnl < float(tp1))
+            )
+            if tp1_adjust_eligible:
+                snap = _load_ob_fvg_snapshot()
+                if bool(snap.get("near_resistance", False)) and bool(snap.get("slowdown", False)):
+                    tp1_reason = tp1_adjust_reason
+            if tp1_reason is None and pnl >= tp1:
+                tp1_reason = tp1_base_reason
+
+        if tp1_reason is not None:
             vol = _get_volume(upbit, ticker, state)
             if vol > 0:
                 base_qty = _estimate_entry_qty(state, entry)
@@ -489,7 +737,7 @@ def apply_risk_rules(upbit, ticker: str, state: dict, cur: float, market_sell, n
                 sell_qty = min(float(target_qty), float(vol))
                 if sell_qty > 0 and _can_order(float(cur), sell_qty):
                     if bool(getattr(config, "DEBUG_TRADE_FLOW", False)):
-                        print(f"[TP1_익절][MAIN] {ticker} pnl={pnl:.4f}")
+                        print(f"[{tp1_reason}][MAIN] {ticker} pnl={pnl:.4f}")
                     ok, err = _execute_sell(
                         upbit,
                         ticker,
@@ -513,17 +761,19 @@ def apply_risk_rules(upbit, ticker: str, state: dict, cur: float, market_sell, n
                         ticker=ticker,
                         price=float(cur),
                         qty=float(sell_qty),
-                        reason="TP1",
+                        reason=str(tp1_reason),
                     ) if bool(getattr(config, "TELEGRAM_PARTIAL_NOTIFY", False)) else None
                     state["tp1_pnl_pct"] = float(pnl * 100.0)
                     partials.append(
                         {
-                            "reason": "TP1",
+                            "reason": str(tp1_reason),
                             "qty": float(sell_qty),
                             "price": float(cur),
                             "pnl_pct": float(pnl * 100.0),
                         }
                     )
+                    if str(tp1_reason) == tp1_adjust_reason:
+                        state["tp1_adjusted_done"] = True
                     dust_closed = _close_main_dust_after_partial()
                     if dust_closed:
                         return dust_closed
@@ -597,7 +847,54 @@ def apply_risk_rules(upbit, ticker: str, state: dict, cur: float, market_sell, n
                 float(cur),
             )
             runner_hwm = _as_nonneg_float(state.get("runner_hwm", 0.0), 0.0)
-            trail_giveback = max(0.0, float(getattr(config, "MAIN_RUNNER_TRAIL_GIVEBACK_PCT", 0.007)))
+            base_runner_trail = max(0.0, float(getattr(config, "MAIN_RUNNER_TRAIL_GIVEBACK_PCT", 0.007)))
+            saved_runner_trail = _get_state_pct(state, "runner_trail_giveback_pct", None)
+            if saved_runner_trail is None:
+                trail_giveback = float(base_runner_trail)
+            else:
+                trail_giveback = max(0.0, float(saved_runner_trail))
+
+            if (
+                bool(state.get("tp2_done", False))
+                and (not bool(state.get("runner_trail_tightened_done", False)))
+                and (pnl > 0.0)
+            ):
+                snap = _load_ob_fvg_snapshot()
+                if bool(snap.get("near_resistance", False)) and bool(snap.get("slowdown", False)):
+                    tighten_factor = float(getattr(config, "MAIN_OB_FVG_RUNNER_TIGHTEN_FACTOR", (2.0 / 3.0)))
+                    tighten_factor = min(1.0, max(0.0, float(tighten_factor)))
+                    tightened = float(base_runner_trail) * float(tighten_factor)
+                    runner_trail_floor = max(0.0, float(getattr(config, "MAIN_OB_FVG_RUNNER_MIN_TRAIL_PCT", 0.003)))
+                    tightened = max(float(runner_trail_floor), float(tightened))
+                    if tightened < float(trail_giveback):
+                        trail_giveback = float(tightened)
+                        state["runner_trail_giveback_pct"] = float(trail_giveback)
+                        state["runner_trail_tightened_done"] = True
+                        partials.append(
+                            {
+                                "reason": "RUNNER_TRAIL_TIGHTEN_OB_FVG",
+                                "qty": 0.0,
+                                "price": float(cur),
+                                "pnl_pct": float(pnl * 100.0),
+                            }
+                        )
+                        if bool(getattr(config, "DEBUG_TRADE_FLOW", False)):
+                            print(
+                                f"[RUNNER_TRAIL_TIGHTEN_OB_FVG][MAIN] {ticker} "
+                                f"trail={float(base_runner_trail) * 100.0:.3f}% -> {float(trail_giveback) * 100.0:.3f}%"
+                            )
+                        if bool(getattr(config, "TELEGRAM_PARTIAL_NOTIFY", False)):
+                            notify_order(
+                                event_type="ORDER_PARTIAL_FILL",
+                                strategy_tag=tag,
+                                ticker=ticker,
+                                price=float(cur),
+                                qty=0.0,
+                                reason="RUNNER_TRAIL_TIGHTEN_OB_FVG",
+                            )
+            elif saved_runner_trail is None:
+                state["runner_trail_giveback_pct"] = float(trail_giveback)
+
             trail_hit = False
             if runner_hwm > 0 and trail_giveback > 0:
                 cut_price = float(runner_hwm) * (1.0 - float(trail_giveback))

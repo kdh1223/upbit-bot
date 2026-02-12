@@ -1,7 +1,10 @@
 import unittest
 from unittest.mock import patch
 
+import pandas as pd
+
 import config
+import risk
 from risk import apply_risk_rules
 
 
@@ -31,6 +34,13 @@ class RiskTrailingArmTests(unittest.TestCase):
         self._set("MAIN_RUNNER_TRAIL_GIVEBACK_PCT", 0.007)
         self._set("MAIN_RUNNER_MAX_HOLD_MIN", 120)
         self._set("MAIN_RUNNER_TIMEOUT_CLOSE_IF_PNL_GE", 0.0)
+        self._set("MAIN_OB_FVG_TP_ADJUST_ENABLED", False)
+        self._set("MAIN_OB_FVG_RESIST_NEAR_PCT", 0.0025)
+        self._set("MAIN_OB_FVG_TP1_MIN_PNL_PCT", 0.0035)
+        self._set("MAIN_OB_FVG_TP1_HIT_RATIO", 0.75)
+        self._set("MAIN_OB_FVG_RUNNER_TIGHTEN_FACTOR", 2.0 / 3.0)
+        self._set("MAIN_OB_FVG_RUNNER_MIN_TRAIL_PCT", 0.003)
+        self._set("MAIN_OB_FVG_CACHE_SEC", 0.0)
         self._set(
             "TP_TABLE",
             {
@@ -40,6 +50,7 @@ class RiskTrailingArmTests(unittest.TestCase):
                 "HALT": {"TP1_PCT": 0.0, "TP2_PCT": 0.0, "TRAIL_BACK_PCT": 0.0},
             },
         )
+        risk._MAIN_OB_FVG_CACHE.clear()
 
     def tearDown(self):
         for name, original in self._backup.items():
@@ -92,6 +103,46 @@ class RiskTrailingArmTests(unittest.TestCase):
             "last_exit_reason": "",
             "strategy_tag": str(strategy_tag or "MAIN").upper(),
         }
+
+    @staticmethod
+    def _main_ob_fvg_df(resistance_level: float):
+        bars = 40
+        base = float(resistance_level) - 1.0
+        open_vals = [base for _ in range(bars)]
+        close_vals = [base for _ in range(bars)]
+        high_vals = [base + 0.2 for _ in range(bars)]
+        low_vals = [base - 0.2 for _ in range(bars)]
+        vol_vals = [140.0 for _ in range(bars)]
+
+        # Bearish FVG near current price:
+        # candle1 low > candle3 high => use candle(-3) and candle(-1).
+        open_vals[-3] = resistance_level + 0.2
+        close_vals[-3] = resistance_level + 0.1
+        high_vals[-3] = resistance_level + 0.3
+        low_vals[-3] = resistance_level
+
+        open_vals[-2] = resistance_level - 0.05
+        close_vals[-2] = resistance_level - 0.25
+        high_vals[-2] = resistance_level
+        low_vals[-2] = resistance_level - 0.3
+
+        open_vals[-1] = resistance_level - 0.15
+        close_vals[-1] = resistance_level - 0.35
+        high_vals[-1] = resistance_level - 0.25
+        low_vals[-1] = resistance_level - 0.5
+
+        vol_vals[-2] = 150.0
+        vol_vals[-1] = 80.0
+
+        return pd.DataFrame(
+            {
+                "open": open_vals,
+                "high": high_vals,
+                "low": low_vals,
+                "close": close_vals,
+                "volume": vol_vals,
+            }
+        )
 
     def test_no_trailing_close_before_arm_window(self):
         state = self._base_state(entry_ts=1_000.0, strategy_tag="SCALP")
@@ -292,6 +343,86 @@ class RiskTrailingArmTests(unittest.TestCase):
         self.assertTrue(state.get("tp1_done", False))
         expected_sell = qty * 0.5 * 28.9
         self.assertAlmostEqual(float(state.get("total_sell_krw", 0.0)), expected_sell, places=6)
+
+    def test_main_tp1_ob_fvg_adjust_triggers_before_base_tp1(self):
+        self._set("MAIN_OB_FVG_TP_ADJUST_ENABLED", True)
+        self._set(
+            "TP_TABLE",
+            {
+                "LOW": {"TP1_PCT": 0.01, "TP2_PCT": 0.02, "TRAIL_BACK_PCT": 0.006},
+                "MID": {"TP1_PCT": 0.01, "TP2_PCT": 0.02, "TRAIL_BACK_PCT": 0.006},
+                "FULL": {"TP1_PCT": 0.01, "TP2_PCT": 0.02, "TRAIL_BACK_PCT": 0.006},
+                "HALT": {"TP1_PCT": 0.0, "TP2_PCT": 0.0, "TRAIL_BACK_PCT": 0.0},
+            },
+        )
+        state = self._base_state(entry_ts=1_000.0)
+        df_15m = self._main_ob_fvg_df(resistance_level=101.0)
+        rsi_series = pd.Series([60.0] * (len(df_15m) - 2) + [55.0, 50.0], index=df_15m.index)
+
+        with patch("risk.pyupbit.get_ohlcv", return_value=df_15m), patch("risk.get_rsi", return_value=rsi_series):
+            result = apply_risk_rules(
+                upbit=None,
+                ticker="KRW-TEST",
+                state=state,
+                cur=100.8,
+                market_sell=self._mock_sell,
+                now=1_140.0,
+                strategy_tag="MAIN",
+            )
+
+        self.assertFalse(result.get("closed", False))
+        self.assertTrue(state.get("tp1_done", False))
+        self.assertTrue(state.get("tp1_adjusted_done", False))
+        reasons = [str(x.get("reason", "")) for x in (result.get("partials", []) or [])]
+        self.assertIn("TP1_OB_FVG_ADJUST", reasons)
+        self.assertNotIn("TP1", reasons)
+
+    def test_main_runner_trail_tighten_ob_fvg_applies_once(self):
+        self._set("MAIN_OB_FVG_TP_ADJUST_ENABLED", True)
+        state = self._base_state(entry_ts=1_000.0)
+        state["tp1_done"] = True
+        state["tp2_done"] = True
+        state["tp1"] = True
+        state["tp2"] = True
+        state["runner_active"] = True
+        state["runner_hwm"] = 105.0
+        state["runner_start_ts"] = 1_060.0
+        state["runner_trail_tightened_done"] = False
+        state["runner_trail_giveback_pct"] = None
+
+        df_15m = self._main_ob_fvg_df(resistance_level=105.0)
+        rsi_series = pd.Series([62.0] * (len(df_15m) - 2) + [58.0, 52.0], index=df_15m.index)
+
+        with patch("risk.pyupbit.get_ohlcv", return_value=df_15m), patch("risk.get_rsi", return_value=rsi_series):
+            r1 = apply_risk_rules(
+                upbit=None,
+                ticker="KRW-TEST",
+                state=state,
+                cur=104.75,
+                market_sell=self._mock_sell,
+                now=1_150.0,
+                strategy_tag="MAIN",
+            )
+            r2 = apply_risk_rules(
+                upbit=None,
+                ticker="KRW-TEST",
+                state=state,
+                cur=104.74,
+                market_sell=self._mock_sell,
+                now=1_160.0,
+                strategy_tag="MAIN",
+            )
+
+        self.assertFalse(r1.get("closed", False))
+        self.assertFalse(r2.get("closed", False))
+        self.assertTrue(state.get("runner_trail_tightened_done", False))
+        tightened = float(state.get("runner_trail_giveback_pct", 0.0))
+        self.assertGreaterEqual(tightened, 0.003)
+        self.assertLess(tightened, 0.007)
+        r1_reasons = [str(x.get("reason", "")) for x in (r1.get("partials", []) or [])]
+        r2_reasons = [str(x.get("reason", "")) for x in (r2.get("partials", []) or [])]
+        self.assertIn("RUNNER_TRAIL_TIGHTEN_OB_FVG", r1_reasons)
+        self.assertNotIn("RUNNER_TRAIL_TIGHTEN_OB_FVG", r2_reasons)
 
 
 if __name__ == "__main__":

@@ -192,15 +192,19 @@ def build_order_message(
     qty,
     reason: str,
 ) -> str:
+    reason_code = str(reason or "").upper().strip()
+    lines = [
+        f"\uC804\uB7B5: {str(strategy_tag or '').upper().strip() or '-'}",
+        f"\uC885\uBAA9: {str(ticker or '').strip() or '-'}",
+        f"\uAC00\uACA9: {_fmt_price(price)}",
+        f"\uC218\uB7C9: {_fmt_qty(qty)}",
+        f"\uC0AC\uC720: {reason_code or '-'}",
+    ]
+    if reason_code in {"TP1_OB_FVG_ADJUST", "RUNNER_TRAIL_TIGHTEN_OB_FVG"}:
+        lines.append("OB/FVG 보정 적용")
     return build_event_message(
         event_type,
-        [
-            f"\uC804\uB7B5: {str(strategy_tag or '').upper().strip() or '-'}",
-            f"\uC885\uBAA9: {str(ticker or '').strip() or '-'}",
-            f"\uAC00\uACA9: {_fmt_price(price)}",
-            f"\uC218\uB7C9: {_fmt_qty(qty)}",
-            f"\uC0AC\uC720: {str(reason or '').upper().strip() or '-'}",
-        ],
+        lines,
     )
 
 

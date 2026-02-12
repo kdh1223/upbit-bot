@@ -28,6 +28,17 @@ class TelegramNotifyTests(unittest.TestCase):
         self.assertIn("\uC218\uB7C9:", msg)
         self.assertIn("\uC0AC\uC720: ENTRY", msg)
 
+    def test_order_message_includes_ob_fvg_adjust_line(self):
+        msg = build_order_message(
+            event_type="ORDER_PARTIAL_FILL",
+            strategy_tag="MAIN",
+            ticker="KRW-BTC",
+            price=100_000_000,
+            qty=0.001,
+            reason="TP1_OB_FVG_ADJUST",
+        )
+        self.assertIn("OB/FVG 보정 적용", msg)
+
     def test_position_closed_is_critical_missed_event(self):
         self.assertTrue(telegram_notify._is_critical_event("POSITION_CLOSED"))
 

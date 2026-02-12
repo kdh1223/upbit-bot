@@ -541,7 +541,7 @@ def _fmt_qty(qty: float) -> str:
 
 def _is_partial_trade_reason(raw_reason: str) -> bool:
     code = str(raw_reason or "").strip().upper()
-    return code in {"TP1", "TP2_PARTIAL"}
+    return code in {"TP1", "TP1_OB_FVG_ADJUST", "TP2_PARTIAL"}
 
 
 def _calc_monthly_stats(now: dt.datetime, trade_log_path: str):
@@ -594,8 +594,24 @@ def _normalize_order_reason(raw_reason: str) -> str:
     s_raw = str(raw_reason or "").strip()
     s = s_raw.lower()
     s_up = s_raw.upper()
-    if s_up in {"ENTRY", "TP1", "TP2", "TP2_PARTIAL", "RUNNER_TRAIL", "RUNNER_TIMEOUT", "TRAILING", "SL", "FORCE_CLOSE"}:
+    if s_up in {
+        "ENTRY",
+        "TP1",
+        "TP1_OB_FVG_ADJUST",
+        "TP2",
+        "TP2_PARTIAL",
+        "RUNNER_TRAIL",
+        "RUNNER_TIMEOUT",
+        "RUNNER_TRAIL_TIGHTEN_OB_FVG",
+        "TRAILING",
+        "SL",
+        "FORCE_CLOSE",
+    }:
         return s_up
+    if "tp1_ob_fvg_adjust" in s:
+        return "TP1_OB_FVG_ADJUST"
+    if "runner_trail_tighten_ob_fvg" in s:
+        return "RUNNER_TRAIL_TIGHTEN_OB_FVG"
     if "tp2_partial" in s:
         return "TP2_PARTIAL"
     if "runner_trail" in s:
@@ -1156,9 +1172,12 @@ def _repair_cross_strategy_duplicate_holdings(strategy_state: dict):
         s["tp2"] = False
         s["tp1_done"] = False
         s["tp2_done"] = False
+        s["tp1_adjusted_done"] = False
         s["runner_active"] = False
         s["runner_hwm"] = 0.0
         s["runner_start_ts"] = 0.0
+        s["runner_trail_tightened_done"] = False
+        s["runner_trail_giveback_pct"] = None
         s["tp1_ratio"] = 0.0
         s["tp2_ratio"] = 0.0
         s["runner_ratio"] = 0.0
