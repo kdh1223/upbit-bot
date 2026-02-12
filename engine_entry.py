@@ -5,7 +5,16 @@ import time
 import config
 import pyupbit
 import position_manager
-from indicators import check_filters, get_rsi, intraday_trend_ok, minute_entry_ok, safe_last, scalp_entry_signal
+from indicators import (
+    check_filters,
+    check_filters_with_reason,
+    get_rsi,
+    intraday_trend_ok,
+    minute_entry_ok,
+    minute_entry_score,
+    safe_last,
+    scalp_entry_signal,
+)
 from strategy import calc_target
 from utils.telegram_notify import notify_event, notify_order
 
@@ -87,6 +96,21 @@ def _log_surge_guard_block_once(ticker: str, reason: str, now):
         return
     _SURGE_GUARD_LAST_LOG[key] = bucket
     print(f"[ENTRY_BLOCK][MAIN] reason={reason} ticker={ticker}")
+
+
+def _set_main_filter_reason(minute_cache: dict, ticker: str, reason: str, now):
+    minute_cache[f"main_reason::{ticker}"] = (str(reason or "UNKNOWN"), now)
+
+
+def _clear_main_filter_reason(minute_cache: dict, ticker: str):
+    minute_cache.pop(f"main_reason::{ticker}", None)
+
+
+def _get_main_filter_reason(minute_cache: dict, ticker: str) -> str:
+    raw = minute_cache.get(f"main_reason::{ticker}")
+    if isinstance(raw, tuple) and len(raw) >= 1:
+        return str(raw[0] or "UNKNOWN")
+    return "UNKNOWN"
 
 
 def _main_surge_extra_guard_ok(ticker: str, now, minute_cache) -> tuple[bool, str]:
@@ -268,14 +292,25 @@ def _main_1m_confirm_ok(ticker: str) -> tuple[bool, str]:
 
 
 def entry_passes_filters(ticker: str, now, day_cache, intraday_cache, minute_cache, main_mode: str = "CONSERVATIVE") -> bool:
+    reason_key = f"main_reason::{ticker}"
+    score_key = f"main_score::{ticker}"
+
     # Daily filter cache
     cached = day_cache.get(ticker)
     if cached and (now - cached[1]).total_seconds() < float(getattr(config, "DAY_FILTER_CACHE_SEC", 60)):
-        ok_day = cached[0]
+        ok_day = bool(cached[0])
+        if not ok_day:
+            _set_main_filter_reason(minute_cache, ticker, "DAY_FILTER_FAIL", now)
+            return False
     else:
-        ok_day = bool(check_filters(ticker))
+        ok_day, day_reason = check_filters_with_reason(ticker)
+        ok_day = bool(ok_day)
         day_cache[ticker] = (ok_day, now)
+        if not ok_day:
+            _set_main_filter_reason(minute_cache, ticker, str(day_reason or "DAY_FILTER_FAIL"), now)
+            return False
     if not ok_day:
+        _set_main_filter_reason(minute_cache, ticker, "DAY_FILTER_FAIL", now)
         return False
 
     # Intraday trend cache
@@ -290,20 +325,58 @@ def entry_passes_filters(ticker: str, now, day_cache, intraday_cache, minute_cac
                 ok_4h = True
             intraday_cache[ticker] = (ok_4h, now)
         if not ok_4h:
+            _set_main_filter_reason(minute_cache, ticker, "INTRADAY_TREND_FAIL", now)
             return False
 
-    # Minute timing cache
-    cached3 = minute_cache.get(ticker)
-    if cached3 and (now - cached3[1]).total_seconds() < float(getattr(config, "MINUTE_ENTRY_CACHE_SEC", 10)):
-        ok_m = cached3[0]
+    # Minute timing cache / score gate
+    if bool(getattr(config, "ENTRY_SCORE_ENABLED", True)) and bool(getattr(config, "ENTRY_SCORE_REPLACE_MINUTE_OK", True)):
+        score = None
+        reasons = None
+
+        cached_score = minute_cache.get(score_key)
+        cache_sec = max(0.0, float(getattr(config, "ENTRY_SCORE_CACHE_SEC", 5)))
+        if (
+            isinstance(cached_score, tuple)
+            and len(cached_score) == 3
+            and isinstance(cached_score[2], type(now))
+            and (now - cached_score[2]).total_seconds() < cache_sec
+        ):
+            score = int(cached_score[0])
+            reasons = list(cached_score[1]) if isinstance(cached_score[1], (list, tuple)) else []
+        else:
+            try:
+                interval = str(getattr(config, "ENTRY_SCORE_INTERVAL", "minute1"))
+                lookback = max(25, int(getattr(config, "ENTRY_SCORE_LOOKBACK", 40)))
+                df = pyupbit.get_ohlcv(ticker, interval=interval, count=lookback)
+                score, reasons, _ = minute_entry_score(df, cfg=config)
+                score = int(score)
+                reasons = list(reasons or [])
+                minute_cache[score_key] = (score, reasons, now)
+            except Exception:
+                _set_main_filter_reason(minute_cache, ticker, "ENTRY_SCORE_CALC_ERR", now)
+                return False
+
+        min_score = max(1, int(getattr(config, "MAIN_MIN_ENTRY_SCORE", 2)))
+        if int(score) < int(min_score):
+            if reasons:
+                reason = f"ENTRY_SCORE_{int(score)}/{int(min_score)}:{'+'.join([str(x) for x in reasons])}"
+            else:
+                reason = f"ENTRY_SCORE_{int(score)}/{int(min_score)}:NONE"
+            _set_main_filter_reason(minute_cache, ticker, reason, now)
+            return False
     else:
-        try:
-            ok_m = bool(minute_entry_ok(ticker))
-        except Exception:
-            ok_m = True
-        minute_cache[ticker] = (ok_m, now)
-    if not ok_m:
-        return False
+        cached3 = minute_cache.get(ticker)
+        if cached3 and (now - cached3[1]).total_seconds() < float(getattr(config, "MINUTE_ENTRY_CACHE_SEC", 10)):
+            ok_m = bool(cached3[0])
+        else:
+            try:
+                ok_m = bool(minute_entry_ok(ticker))
+            except Exception:
+                ok_m = True
+            minute_cache[ticker] = (ok_m, now)
+        if not ok_m:
+            _set_main_filter_reason(minute_cache, ticker, "MINUTE_NOT_OK", now)
+            return False
 
     mode = _normalize_main_mode(main_mode)
     use_1m_confirm = bool(getattr(config, "USE_1M_CONFIRM_FOR_MAIN", True))
@@ -317,10 +390,12 @@ def entry_passes_filters(ticker: str, now, day_cache, intraday_cache, minute_cac
             ok_1m, reason_1m = _main_1m_confirm_ok(ticker)
             minute_cache[key] = (ok_1m, now, str(reason_1m))
         if not ok_1m:
+            _set_main_filter_reason(minute_cache, ticker, f"MAIN_1M_CONFIRM_{str(reason_1m)}", now)
             if bool(getattr(config, "DEBUG_ENTRY_REJECT", False)):
                 print(f"[MAIN_1M_CONFIRM_REJECT] {ticker} {reason_1m}")
             return False
 
+    _clear_main_filter_reason(minute_cache, ticker)
     return True
 
 
@@ -434,6 +509,19 @@ def try_main_entries(
             minute_cache,
             main_mode=main_mode,
         ):
+            if bool(getattr(config, "ENTRY_SCORE_LOG_BLOCKED", True)):
+                reason = _get_main_filter_reason(minute_cache, ticker)
+                block_key = f"main_block_log::{ticker}::{reason}"
+                last_logged = minute_cache.get(block_key)
+                should_log = True
+                if isinstance(last_logged, type(now)):
+                    try:
+                        should_log = (now - last_logged).total_seconds() >= 60.0
+                    except Exception:
+                        should_log = True
+                if should_log:
+                    print(f"[ENTRY_BLOCK][MAIN] reason={reason} ticker={ticker}")
+                    minute_cache[block_key] = now
             continue
 
         cur = prices.get(ticker)

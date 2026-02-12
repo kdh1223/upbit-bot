@@ -1942,6 +1942,8 @@ def _try_scalp_btc_entry(
 def run():
     bot_mode = _resolve_mode()
     enable_main, enable_scalp_legacy, enable_scalp_btc, force_mock_order = _mode_to_strategy_flags(bot_mode)
+    main_include_surge = bool(getattr(config, "MAIN_INCLUDE_SURGE", False))
+    main_surge_source = str(getattr(config, "MAIN_SURGE_SOURCE", "RANKED")).upper().strip()
     if not _acquire_instance_lock():
         return
     atexit.register(_release_instance_lock)
@@ -2020,7 +2022,7 @@ def run():
     core_universe, surge_pool, inactive_universe, inactive_reasons, core_filter_rejects = _core_and_surge_from_ranked(
         raw_ranked, market_info
     )
-    if enable_scalp_legacy:
+    if enable_scalp_legacy or main_include_surge:
         surge_candidates, momentum_seen_at = _update_surge_candidates(surge_pool, momentum_seen_at, now)
     else:
         surge_candidates = []
@@ -2111,7 +2113,7 @@ def run():
                     core_filter_rejects,
                 ) = _core_and_surge_from_ranked(raw_ranked, market_info)
 
-                if enable_scalp_legacy:
+                if enable_scalp_legacy or main_include_surge:
                     surge_candidates, momentum_seen_at = _update_surge_candidates(surge_pool, momentum_seen_at, now)
                 else:
                     surge_candidates = []
@@ -2370,6 +2372,13 @@ def run():
 
             # 3) MAIN entry scan (intent at order-finalization)
             if (not guard_active) and enable_main and main_entry_allowed and total_holding < max_holdings and float(per_trade_main) > 0:
+                main_universe = list(core_universe)
+                if main_include_surge:
+                    if main_surge_source == "MOMENTUM":
+                        main_universe = _dedupe_keep_order(main_universe + list(surge_candidates))
+                    else:
+                        main_universe = _dedupe_keep_order(main_universe + list(surge_pool))
+
                 def before_main_buy(ticker: str, buy_krw: float, cur: float):
                     nonlocal main_entry_intent
                     strict_market_registry = bool(getattr(config, "BLOCK_ENTRY_WHEN_MARKET_INFO_UNAVAILABLE", True))
@@ -2431,7 +2440,7 @@ def run():
                     did_main = try_main_entries(
                         upbit=upbit,
                         now=now,
-                        universe=core_universe,
+                        universe=main_universe,
                         prices=prices,
                         k_map=k_map,
                         state=strategy_state["MAIN"],

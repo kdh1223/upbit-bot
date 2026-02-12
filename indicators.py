@@ -280,6 +280,80 @@ def minute_entry_ok(ticker):
     return True
 
 
+def minute_entry_score(df, cfg=config):
+    """
+    1m entry score for MAIN (0~5).
+    Returns: (score:int, reasons:list[str], metrics:dict)
+    """
+    required_cols = {"open", "high", "low", "close", "volume"}
+    if df is None or len(df) < 25 or (not required_cols.issubset(df.columns)):
+        return 0, ["DATA_SHORT"], {}
+
+    try:
+        close_series = df["close"]
+        high_series = df["high"]
+        vol_series = df["volume"]
+
+        rsi_series = get_rsi(df, 14)
+        ema9_series = get_ema(close_series, 9)
+        vol_ma20_series = volume_ma(df, 20)
+
+        close_now = safe_last(close_series)
+        high_prev = float(high_series.iloc[-2])
+        rsi_now = float(rsi_series.iloc[-1])
+        rsi_prev = float(rsi_series.iloc[-2])
+        ema9_now = float(ema9_series.iloc[-1])
+        ema9_prev = float(ema9_series.iloc[-2])
+        vol_now = float(vol_series.iloc[-1])
+        vol_prev = float(vol_series.iloc[-2])
+        vol_ma20_now = float(vol_ma20_series.iloc[-1])
+    except Exception:
+        return 0, ["DATA_SHORT"], {}
+
+    vals = [close_now, high_prev, rsi_now, rsi_prev, ema9_now, ema9_prev, vol_now, vol_prev, vol_ma20_now]
+    if any((v != v) for v in vals) or close_now is None or vol_ma20_now <= 0:
+        return 0, ["DATA_SHORT"], {}
+
+    score = 0
+    reasons = []
+
+    rsi_max = float(getattr(cfg, "ENTRY_SCORE_RSI_MAX", 55.0))
+    vol_mult = float(getattr(cfg, "ENTRY_SCORE_VOL_MULT", 1.20))
+
+    if (rsi_now > rsi_prev) and (rsi_now <= rsi_max):
+        score += 1
+        reasons.append("RSI_UP")
+
+    if float(close_now) > float(ema9_now):
+        score += 1
+        reasons.append("CLOSE_GT_EMA9")
+
+    if float(close_now) > float(high_prev):
+        score += 1
+        reasons.append("BREAK_PREV_HIGH")
+
+    if float(ema9_now) > float(ema9_prev):
+        score += 1
+        reasons.append("EMA9_UP")
+
+    if (float(vol_now) > float(vol_ma20_now) * float(vol_mult)) and (float(vol_now) > float(vol_prev)):
+        score += 1
+        reasons.append("VOL_SPIKE")
+
+    metrics = {
+        "close_now": float(close_now),
+        "high_prev": float(high_prev),
+        "rsi_now": float(rsi_now),
+        "rsi_prev": float(rsi_prev),
+        "ema9_now": float(ema9_now),
+        "ema9_prev": float(ema9_prev),
+        "vol_now": float(vol_now),
+        "vol_prev": float(vol_prev),
+        "vol_ma20_now": float(vol_ma20_now),
+    }
+    return int(score), reasons, metrics
+
+
 def minute_test_signal(ticker):
     """
     강화 분봉 실전형 테스트 신호(1분봉)

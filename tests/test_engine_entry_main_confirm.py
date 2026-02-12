@@ -15,12 +15,16 @@ class MainConfirm1mTests(unittest.TestCase):
         self._set("USE_1M_CONFIRM_FOR_MAIN", True)
         self._set("MAIN_CONFIRM_1M_CACHE_SEC", 5)
         self._set("DEBUG_ENTRY_REJECT", False)
+        self._set("ENTRY_SCORE_ENABLED", False)
+        self._set("ENTRY_SCORE_REPLACE_MINUTE_OK", False)
 
         self._orig_check_filters = engine_entry.check_filters
+        self._orig_check_filters_with_reason = engine_entry.check_filters_with_reason
         self._orig_minute_entry_ok = engine_entry.minute_entry_ok
         self._orig_main_confirm = engine_entry._main_1m_confirm_ok
 
         engine_entry.check_filters = lambda _ticker: True
+        engine_entry.check_filters_with_reason = lambda _ticker: (True, "OK")
         engine_entry.minute_entry_ok = lambda _ticker: True
 
     def tearDown(self):
@@ -34,6 +38,7 @@ class MainConfirm1mTests(unittest.TestCase):
                 setattr(config, name, original)
 
         engine_entry.check_filters = self._orig_check_filters
+        engine_entry.check_filters_with_reason = self._orig_check_filters_with_reason
         engine_entry.minute_entry_ok = self._orig_minute_entry_ok
         engine_entry._main_1m_confirm_ok = self._orig_main_confirm
 
