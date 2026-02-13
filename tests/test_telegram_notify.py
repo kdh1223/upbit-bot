@@ -28,6 +28,18 @@ class TelegramNotifyTests(unittest.TestCase):
         self.assertIn("\uC218\uB7C9:", msg)
         self.assertIn("\uC0AC\uC720: ENTRY", msg)
 
+    def test_order_buy_message_includes_buy_krw(self):
+        msg = build_order_message(
+            event_type="ORDER_BUY_FILLED",
+            strategy_tag="MAIN",
+            ticker="KRW-ETH",
+            price=3_000_000,
+            qty=0.0113,
+            reason="ENTRY",
+            buy_krw=34_000,
+        )
+        self.assertIn("\uB9E4\uC218\uAE08: 34,000 KRW", msg)
+
     def test_order_message_includes_ob_fvg_adjust_line(self):
         msg = build_order_message(
             event_type="ORDER_PARTIAL_FILL",

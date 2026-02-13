@@ -706,6 +706,10 @@ def try_main_entries(
                 state[ticker]["trail_from_pct"] = max(0.0, float(entry_params.get("trail_from", 0.0)))
                 state[ticker]["trail_giveback_pct"] = max(0.0, float(entry_params.get("trail_giveback", 0.0)))
 
+        filled_buy_krw = float(entry_price) * float(initial_vol)
+        if filled_buy_krw <= 0:
+            filled_buy_krw = float(per_trade_amt)
+
         save_state_fn()
         buy_notify_ok = bool(
             notify_order(
@@ -715,6 +719,7 @@ def try_main_entries(
             price=float(entry_price),
             qty=float(initial_vol),
             reason="ENTRY",
+            buy_krw=float(filled_buy_krw),
             )
         )
         if not buy_notify_ok:
@@ -727,6 +732,7 @@ def try_main_entries(
                     f"\uC885\uBAA9: {ticker}",
                     f"\uAC00\uACA9: {float(entry_price):,.0f}",
                     f"\uC218\uB7C9: {float(initial_vol):.8f}".rstrip("0").rstrip("."),
+                    f"\uB9E4\uC218\uAE08: {float(filled_buy_krw):,.0f} KRW",
                     "\uC0AC\uC720: ENTRY",
                 ],
             )
@@ -848,6 +854,9 @@ def try_scalp_entries(
             entry_ts=float(now.timestamp()),
         )
         state[ticker]["entry_bucket"] = "SURGE"
+        filled_buy_krw = float(entry_price) * float(initial_vol)
+        if filled_buy_krw <= 0:
+            filled_buy_krw = float(buy_krw)
         save_state_fn()
         buy_notify_ok = bool(
             notify_order(
@@ -857,6 +866,7 @@ def try_scalp_entries(
             price=float(entry_price),
             qty=float(initial_vol),
             reason="ENTRY",
+            buy_krw=float(filled_buy_krw),
             )
         )
         if not buy_notify_ok:

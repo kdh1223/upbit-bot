@@ -1916,6 +1916,7 @@ def _try_scalp_btc_entry(
             price=float(entry),
             qty=float(qty),
             reason="ENTRY",
+            buy_krw=float(filled_buy_krw),
             )
         )
         if not buy_notify_ok:

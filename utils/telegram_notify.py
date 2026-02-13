@@ -170,6 +170,16 @@ def _fmt_qty(qty) -> str:
     return f"{q:.8f}".rstrip("0").rstrip(".")
 
 
+def _fmt_krw(value) -> str:
+    try:
+        v = float(value)
+    except Exception:
+        return "-"
+    if v <= 0:
+        return "-"
+    return f"{int(round(v)):,}"
+
+
 def _title(event_type: str) -> str:
     code = str(event_type or "").upper().strip()
     return EVENT_TITLE.get(code, f"\u2139\uFE0F {code or 'UNKNOWN'}")
@@ -191,15 +201,21 @@ def build_order_message(
     price,
     qty,
     reason: str,
+    buy_krw=None,
 ) -> str:
+    code = str(event_type or "").upper().strip()
     reason_code = str(reason or "").upper().strip()
     lines = [
         f"\uC804\uB7B5: {str(strategy_tag or '').upper().strip() or '-'}",
         f"\uC885\uBAA9: {str(ticker or '').strip() or '-'}",
         f"\uAC00\uACA9: {_fmt_price(price)}",
         f"\uC218\uB7C9: {_fmt_qty(qty)}",
-        f"\uC0AC\uC720: {reason_code or '-'}",
     ]
+    if code == "ORDER_BUY_FILLED":
+        buy_txt = _fmt_krw(buy_krw)
+        if buy_txt != "-":
+            lines.append(f"\uB9E4\uC218\uAE08: {buy_txt} KRW")
+    lines.append(f"\uC0AC\uC720: {reason_code or '-'}")
     if reason_code in {"TP1_OB_FVG_ADJUST", "RUNNER_TRAIL_TIGHTEN_OB_FVG"}:
         lines.append("OB/FVG 보정 적용")
     return build_event_message(
@@ -472,6 +488,7 @@ def notify_order(
     price,
     qty,
     reason: str,
+    buy_krw=None,
 ):
     msg = build_order_message(
         event_type=event_type,
@@ -480,6 +497,7 @@ def notify_order(
         price=price,
         qty=qty,
         reason=reason,
+        buy_krw=buy_krw,
     )
     ok = tg_notify(event_type=event_type, message=msg)
     code = str(event_type or "").upper().strip()
