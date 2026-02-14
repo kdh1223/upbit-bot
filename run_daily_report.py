@@ -465,6 +465,7 @@ def _find_anchor_equity(
     history: List[Tuple[dt.datetime, float]],
     boundary: dt.datetime,
     max_after_sec: float = EQUITY_ANCHOR_MAX_AFTER_SEC,
+    allow_first_after_without_limit: bool = False,
 ) -> Optional[float]:
     if not history:
         return None
@@ -479,7 +480,10 @@ def _find_anchor_equity(
             break
     if first_after is None:
         return None
-    if (first_after[0] - boundary).total_seconds() <= float(max_after_sec):
+    gap_sec = (first_after[0] - boundary).total_seconds()
+    if gap_sec <= float(max_after_sec):
+        return float(first_after[1])
+    if bool(allow_first_after_without_limit):
         return float(first_after[1])
     return None
 
@@ -501,7 +505,11 @@ def _build_month_equity_points(
     current_equity: float,
 ) -> List[Tuple[dt.datetime, float]]:
     points: List[Tuple[dt.datetime, float]] = []
-    month_anchor = _find_anchor_equity(history, month_start)
+    month_anchor = _find_anchor_equity(
+        history,
+        month_start,
+        allow_first_after_without_limit=True,
+    )
     if month_anchor is not None and month_anchor > 0:
         points.append((month_start, float(month_anchor)))
     for ts, eq in history:
@@ -1222,6 +1230,15 @@ def main():
 
     daily_anchor = _find_anchor_equity(equity_history, day_start, max_after_sec=anchor_max_after_sec)
     month_anchor = _find_anchor_equity(equity_history, month_start, max_after_sec=anchor_max_after_sec)
+    if month_anchor is None:
+        month_anchor = _find_anchor_equity(
+            equity_history,
+            month_start,
+            max_after_sec=anchor_max_after_sec,
+            allow_first_after_without_limit=True,
+        )
+        if month_anchor is not None:
+            log_line("[WARN] monthly anchor fallback: using first post-boundary equity snapshot")
     daily_pnl_krw, daily_pnl_pct, daily_anchor_ok = _calc_snapshot_pnl(total_equity, daily_anchor)
     month_pnl_krw, month_pnl_pct, month_anchor_ok = _calc_snapshot_pnl(total_equity, month_anchor)
     if not daily_anchor_ok:

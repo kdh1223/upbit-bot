@@ -3,7 +3,9 @@ import unittest
 from zoneinfo import ZoneInfo
 
 from run_daily_report import (
+    _build_month_equity_points,
     _calc_mdd_from_equity_points,
+    _find_anchor_equity,
     build_0900_mini_report_text,
     build_heartbeat_text,
     build_metrics,
@@ -76,6 +78,30 @@ class DailyReportLogicTests(unittest.TestCase):
     def test_snapshot_mdd_none_when_insufficient_points(self):
         points = [(dt.datetime(2026, 2, 1, 21, 0, 0, tzinfo=KST), 1_000_000.0)]
         self.assertIsNone(_calc_mdd_from_equity_points(points))
+
+    def test_anchor_fallback_uses_first_after_when_month_boundary_missing(self):
+        boundary = dt.datetime(2026, 2, 1, 21, 0, 0, tzinfo=KST)
+        history = [(dt.datetime(2026, 2, 2, 21, 0, 0, tzinfo=KST), 99_000.0)]
+        self.assertIsNone(_find_anchor_equity(history, boundary, max_after_sec=3600))
+        self.assertEqual(
+            _find_anchor_equity(
+                history,
+                boundary,
+                max_after_sec=3600,
+                allow_first_after_without_limit=True,
+            ),
+            99_000.0,
+        )
+
+    def test_month_points_include_fallback_anchor_on_boundary(self):
+        month_start = dt.datetime(2026, 2, 1, 21, 0, 0, tzinfo=KST)
+        now = dt.datetime(2026, 2, 3, 21, 0, 0, tzinfo=KST)
+        history = [
+            (dt.datetime(2026, 2, 2, 21, 0, 0, tzinfo=KST), 99_000.0),
+            (dt.datetime(2026, 2, 3, 9, 0, 0, tzinfo=KST), 98_500.0),
+        ]
+        points = _build_month_equity_points(history, month_start, now, current_equity=98_000.0)
+        self.assertEqual(points[0], (month_start, 99_000.0))
 
     def test_build_report_text_without_overall_sections(self):
         report_end = dt.datetime(2026, 2, 10, 21, 0, 0, tzinfo=KST)
