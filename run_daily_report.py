@@ -192,15 +192,6 @@ def _row_pnl_pct_for_metrics(row: Dict[str, str]) -> float:
     return float(logged)
 
 
-def _compound_return_pct(rows: List[Dict[str, str]]) -> float:
-    rows = [r for r in rows if not _is_partial_reason(r.get("reason", ""))]
-    mult = 1.0
-    for row in rows:
-        pnl = _row_pnl_pct_for_metrics(row)
-        mult *= (1.0 + pnl / 100.0)
-    return (mult - 1.0) * 100.0
-
-
 def build_metrics(rows: List[Dict[str, str]]):
     rows = [r for r in rows if not _is_partial_reason(r.get("reason", ""))]
     n = len(rows)
@@ -208,7 +199,6 @@ def build_metrics(rows: List[Dict[str, str]]):
     wins = sum(1 for x in pnls if x > 0)
     wr = (wins / n * 100.0) if n > 0 else 0.0
     avg = (sum(pnls) / n) if n > 0 else 0.0
-    cum = _compound_return_pct(rows) if n > 0 else 0.0
     max_pnl = max((x for x in pnls if x > 0), default=0.0)
     min_pnl = min((x for x in pnls if x < 0), default=0.0)
     sl_cnt = sum(1 for row in rows if _is_stop_reason(row.get("reason", "")))
@@ -219,7 +209,6 @@ def build_metrics(rows: List[Dict[str, str]]):
         "n": int(n),
         "wr": float(wr),
         "avg": float(avg),
-        "cum": float(cum),
         "max": float(max_pnl),
         "min": float(min_pnl),
         "sl_ratio": float(sl_ratio),
@@ -570,14 +559,21 @@ def build_strategy_metrics_month(rows_month: List[Dict[str, str]]):
     return out
 
 
-def write_summary_csv(path: str, daily: dict, month: dict, by_strategy: dict, month_mdd_pct: Optional[float] = None):
+def write_summary_csv(
+    path: str,
+    daily: dict,
+    month: dict,
+    by_strategy: dict,
+    month_mdd_pct: Optional[float] = None,
+    month_account_pnl_krw: float = 0.0,
+    month_account_return_pct: float = 0.0,
+):
     mdd_text = "N/A" if month_mdd_pct is None else f"{_to_float(month_mdd_pct, 0.0):.4f}"
     rows = [
         ["section", "metric", "value"],
         ["daily", "trades", daily["n"]],
         ["daily", "winrate_pct", f"{daily['wr']:.4f}"],
         ["daily", "avg_pnl_pct", f"{daily['avg']:.4f}"],
-        ["daily", "compound_pct", f"{daily['cum']:.4f}"],
         ["daily", "max_pnl_pct", f"{daily['max']:.4f}"],
         ["daily", "min_pnl_pct", f"{daily['min']:.4f}"],
         ["daily", "stoploss_ratio_pct", f"{daily['sl_ratio']:.4f}"],
@@ -585,7 +581,8 @@ def write_summary_csv(path: str, daily: dict, month: dict, by_strategy: dict, mo
         ["month", "trades", month["n"]],
         ["month", "winrate_pct", f"{month['wr']:.4f}"],
         ["month", "avg_pnl_pct", f"{month['avg']:.4f}"],
-        ["month", "compound_pct", f"{month['cum']:.4f}"],
+        ["month", "account_return_pct", f"{_to_float(month_account_return_pct, 0.0):.4f}"],
+        ["month", "account_pnl_krw", f"{_to_float(month_account_pnl_krw, 0.0):.0f}"],
         ["month", "mdd_pct", mdd_text],
     ]
     for strategy in ("MAIN", "SCALP_BTC"):
@@ -598,7 +595,15 @@ def write_summary_csv(path: str, daily: dict, month: dict, by_strategy: dict, mo
         csv.writer(f).writerows(rows)
 
 
-def write_xlsx_if_requested(path: str, daily: dict, month: dict, by_strategy: dict, month_mdd_pct: Optional[float] = None):
+def write_xlsx_if_requested(
+    path: str,
+    daily: dict,
+    month: dict,
+    by_strategy: dict,
+    month_mdd_pct: Optional[float] = None,
+    month_account_pnl_krw: float = 0.0,
+    month_account_return_pct: float = 0.0,
+):
     try:
         from openpyxl import Workbook
     except Exception:
@@ -612,6 +617,8 @@ def write_xlsx_if_requested(path: str, daily: dict, month: dict, by_strategy: di
     for section, data in (("daily", daily), ("month", month)):
         for k, v in data.items():
             ws.append([section, k, v])
+    ws.append(["month", "account_return_pct", float(_to_float(month_account_return_pct, 0.0))])
+    ws.append(["month", "account_pnl_krw", float(_to_float(month_account_pnl_krw, 0.0))])
     ws.append(["month", "mdd_pct", "N/A" if month_mdd_pct is None else float(month_mdd_pct)])
     for strategy in ("MAIN", "SCALP_BTC"):
         s = by_strategy.get(strategy, {"n": 0, "wr": 0.0, "avg": 0.0})
@@ -642,7 +649,6 @@ def build_report_text(
     month_krw = _to_float((pnl_amounts or {}).get("month_krw", 0.0), 0.0)
     month_pct = _to_float((pnl_amounts or {}).get("month_pct", 0.0), 0.0)
     month_mdd_text = f"{_to_float(month_mdd_pct, 0.0):.2f}%" if month_mdd_pct is not None else "N/A"
-    month_compound = _to_float((month or {}).get("cum", 0.0), 0.0)
     main_stats = (by_strategy or {}).get("MAIN", {"n": 0, "wr": 0.0, "avg": 0.0})
     scalp_stats = (by_strategy or {}).get("SCALP_BTC", {"n": 0, "wr": 0.0, "avg": 0.0})
     status_code = str(status_emoji or "\U0001F7E2")
@@ -670,8 +676,8 @@ def build_report_text(
         sep,
         f"\U0001F4C6 \uC774\uBC88 \uB2EC ({report_end.strftime('%Y-%m')})",
         f"- \uAC70\uB798 {int((month or {}).get('n', 0))} | \uC2B9\uB960 {_to_float((month or {}).get('wr', 0.0), 0.0):.2f}% | \uD3C9\uADE0 {_to_float((month or {}).get('avg', 0.0), 0.0):+.2f}%",
-        f"- \uC6D4\uAC04 \uC2E4\uD604\uC190\uC775: {month_krw:+,.0f}\uC6D0 ({month_pct:+.2f}%)",
-        f"- \uC6D4\uAC04 \uBCF5\uB9AC: {month_compound:+.2f}%",
+        f"- \uC6D4\uAC04 \uACC4\uC88C\uC218\uC775\uB960(\uC790\uC0B0\uAE30\uC900): {month_pct:+.2f}%",
+        f"- \uC6D4\uAC04 \uC2E4\uD604\uC190\uC775(\uC790\uC0B0\uAE30\uC900): {month_krw:+,.0f}\uC6D0",
         f"- \uC6D4\uAC04 MDD: {month_mdd_text}",
         "",
         sep,
@@ -1119,7 +1125,6 @@ def build_month_end_report_block(
         f"- \uAC70\uB798 {int((month_metrics or {}).get('n', 0))}\uD68C",
         f"- \uC2B9\uB960 {_to_float((month_metrics or {}).get('wr', 0.0), 0.0):.2f}%",
         f"- \uD3C9\uADE0 {_to_float((month_metrics or {}).get('avg', 0.0), 0.0):+.2f}%",
-        f"- \uC6D4\uAC04 \uBCF5\uB9AC {_to_float((month_metrics or {}).get('cum', 0.0), 0.0):+.2f}%",
         f"- \uC6D4\uAC04 MDD {month_mdd_text}",
         "",
         sep,
@@ -1281,7 +1286,15 @@ def main():
         "month_pct": float(month_pnl_pct),
     }
 
-    write_summary_csv(SUMMARY_CSV, day_metrics, month_metrics, by_strategy, month_mdd_pct=month_mdd_pct)
+    write_summary_csv(
+        SUMMARY_CSV,
+        day_metrics,
+        month_metrics,
+        by_strategy,
+        month_mdd_pct=month_mdd_pct,
+        month_account_pnl_krw=month_pnl_krw,
+        month_account_return_pct=month_pnl_pct,
+    )
     log_line(f"[OK] wrote {SUMMARY_CSV}")
 
     if args.xlsx:
@@ -1291,6 +1304,8 @@ def main():
             month_metrics,
             by_strategy,
             month_mdd_pct=month_mdd_pct,
+            month_account_pnl_krw=month_pnl_krw,
+            month_account_return_pct=month_pnl_pct,
         )
         if ok:
             log_line(f"[OK] wrote {SUMMARY_XLSX}")

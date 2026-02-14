@@ -550,6 +550,7 @@ def try_main_entries(
     main_mode: str = "CONSERVATIVE",
     runtime_risk_state=None,
     equity=None,
+    surge_tickers=None,
 ):
     runtime_risk_state = runtime_risk_state or {}
     if bool(runtime_risk_state.get("halted_flag", False)):
@@ -568,6 +569,9 @@ def try_main_entries(
     inactive_tickers = set(inactive_tickers or [])
     inactive_positions = inactive_positions or {}
     global_holding_tickers = set(global_holding_tickers or [])
+    surge_ticker_set = {
+        str(t).upper().strip() for t in list(surge_tickers or []) if str(t).strip()
+    }
 
     if total_holding_cnt >= int(max_holdings):
         return False
@@ -577,6 +581,7 @@ def try_main_entries(
         return False
 
     for ticker in universe:
+        ticker_u = str(ticker).upper().strip()
         if _is_blocked_ticker(ticker, inactive_tickers, inactive_positions):
             continue
         if ticker in global_holding_tickers:
@@ -643,8 +648,16 @@ def try_main_entries(
         if float(cur) < target:
             continue
 
+        existing_bucket = str((state.get(ticker, {}) or {}).get("entry_bucket", "")).upper().strip()
+        is_surge_entry = (ticker_u in surge_ticker_set) or (existing_bucket == "SURGE")
+        entry_reason = "ENTRY_SURGE" if is_surge_entry else "ENTRY"
+        entry_bucket = "SURGE" if is_surge_entry else "CORE"
+
         action = "ADD" if holding else "BUY"
-        print(f"[MAIN ENTRY] {action} {ticker} | Regime={regime} | KRW={per_trade_amt:,.0f}")
+        print(
+            f"[MAIN ENTRY] {action} {ticker} | Source={entry_bucket} "
+            f"| Regime={regime} | KRW={per_trade_amt:,.0f}"
+        )
         try:
             if _is_blocked_ticker(ticker, inactive_tickers, inactive_positions):
                 print(f"[BLOCK] inactive ticker buy blocked: {ticker}")
@@ -673,7 +686,7 @@ def try_main_entries(
                 ticker=ticker,
                 price=float(cur),
                 qty=0.0,
-                reason="ENTRY",
+                reason=entry_reason,
             )
             continue
 
@@ -694,7 +707,7 @@ def try_main_entries(
                 strategy_tag="MAIN",
                 entry_ts=float(now.timestamp()),
             )
-            state[ticker]["entry_bucket"] = "CORE"
+            state[ticker]["entry_bucket"] = entry_bucket
             _apply_main_tp_profile_on_entry(state[ticker], mode=main_mode, equity=equity)
             state[ticker]["tp1_adjusted_done"] = False
             state[ticker]["runner_trail_tightened_done"] = False
@@ -718,7 +731,7 @@ def try_main_entries(
             ticker=ticker,
             price=float(entry_price),
             qty=float(initial_vol),
-            reason="ENTRY",
+            reason=entry_reason,
             buy_krw=float(filled_buy_krw),
             )
         )
@@ -733,7 +746,7 @@ def try_main_entries(
                     f"\uAC00\uACA9: {float(entry_price):,.0f}",
                     f"\uC218\uB7C9: {float(initial_vol):.8f}".rstrip("0").rstrip("."),
                     f"\uB9E4\uC218\uAE08: {float(filled_buy_krw):,.0f} KRW",
-                    "\uC0AC\uC720: ENTRY",
+                    f"\uC0AC\uC720: {entry_reason}",
                 ],
             )
         time.sleep(0.15)

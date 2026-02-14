@@ -2374,10 +2374,17 @@ def run():
             # 3) MAIN entry scan (intent at order-finalization)
             if (not guard_active) and enable_main and main_entry_allowed and total_holding < max_holdings and float(per_trade_main) > 0:
                 main_universe = list(core_universe)
+                main_surge_tickers = set()
                 if main_include_surge:
                     if main_surge_source == "MOMENTUM":
+                        main_surge_tickers = {
+                            str(t).upper().strip() for t in list(surge_candidates) if str(t).strip()
+                        }
                         main_universe = _dedupe_keep_order(main_universe + list(surge_candidates))
                     else:
+                        main_surge_tickers = {
+                            str(t).upper().strip() for t in list(surge_pool) if str(t).strip()
+                        }
                         main_universe = _dedupe_keep_order(main_universe + list(surge_pool))
 
                 def before_main_buy(ticker: str, buy_krw: float, cur: float):
@@ -2460,6 +2467,7 @@ def run():
                         main_mode=entry_param_mode,
                         runtime_risk_state=runtime_risk_state,
                         equity=equity,
+                        surge_tickers=main_surge_tickers,
                     )
                 finally:
                     main_entry_intent = None

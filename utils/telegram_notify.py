@@ -205,6 +205,7 @@ def build_order_message(
 ) -> str:
     code = str(event_type or "").upper().strip()
     reason_code = str(reason or "").upper().strip()
+    reason_display = "ENTRY_SURGE(급등주)" if reason_code == "ENTRY_SURGE" else reason_code
     lines = [
         f"\uC804\uB7B5: {str(strategy_tag or '').upper().strip() or '-'}",
         f"\uC885\uBAA9: {str(ticker or '').strip() or '-'}",
@@ -215,7 +216,7 @@ def build_order_message(
         buy_txt = _fmt_krw(buy_krw)
         if buy_txt != "-":
             lines.append(f"\uB9E4\uC218\uAE08: {buy_txt} KRW")
-    lines.append(f"\uC0AC\uC720: {reason_code or '-'}")
+    lines.append(f"\uC0AC\uC720: {reason_display or '-'}")
     if reason_code in {"TP1_OB_FVG_ADJUST", "RUNNER_TRAIL_TIGHTEN_OB_FVG"}:
         lines.append("OB/FVG 보정 적용")
     return build_event_message(
