@@ -11,6 +11,7 @@ import config
 _MINUTE_REJECT_COUNTER = Counter()
 _MINUTE_REJECT_TOTAL = 0
 _MINUTE_REJECT_LAST_PRINT_TS = time.time()
+_SCALP_BTC_REGIME_CACHE = {}
 
 
 def _flush_minute_reject_summary(force: bool = False):
@@ -61,6 +62,50 @@ def safe_last(series):
         return v
     except Exception:
         return None
+
+
+def _scalp_btc_regime_allows_entry(ticker: str) -> bool:
+    if not bool(getattr(config, "SCALP_BTC_REGIME_FILTER_ON", False)):
+        return True
+
+    tf = str(getattr(config, "SCALP_BTC_REGIME_TF", "minute240"))
+    ma_fast_n = max(2, int(getattr(config, "SCALP_BTC_REGIME_MA_FAST", 20)))
+    ma_slow_n = max(ma_fast_n + 1, int(getattr(config, "SCALP_BTC_REGIME_MA_SLOW", 60)))
+    mode = str(getattr(config, "SCALP_BTC_REGIME_MODE", "BULL_ONLY")).upper().strip()
+    cache_sec = max(0.0, float(getattr(config, "SCALP_BTC_REGIME_CACHE_SEC", 300)))
+    key = (str(ticker or "").upper().strip(), tf, ma_fast_n, ma_slow_n, mode)
+
+    now_ts = time.time()
+    cached = _SCALP_BTC_REGIME_CACHE.get(key)
+    if isinstance(cached, tuple) and len(cached) == 2:
+        cached_ok, cached_ts = cached
+        try:
+            if (now_ts - float(cached_ts)) < cache_sec:
+                return bool(cached_ok)
+        except Exception:
+            pass
+
+    df4 = pyupbit.get_ohlcv(ticker, interval=tf, count=max(ma_slow_n + 5, 120))
+    if df4 is None or len(df4) < (ma_slow_n + 2) or "close" not in df4.columns:
+        _SCALP_BTC_REGIME_CACHE[key] = (False, now_ts)
+        return False
+
+    close4 = df4["close"]
+    last_close = safe_last(close4)
+    ma_fast = safe_last(close4.rolling(ma_fast_n).mean())
+    ma_slow = safe_last(close4.rolling(ma_slow_n).mean())
+    if None in (last_close, ma_fast, ma_slow):
+        _SCALP_BTC_REGIME_CACHE[key] = (False, now_ts)
+        return False
+
+    bull = (float(last_close) > float(ma_fast)) and (float(ma_fast) > float(ma_slow))
+
+    ok = True
+    if mode == "BULL_ONLY":
+        ok = bool(bull)
+
+    _SCALP_BTC_REGIME_CACHE[key] = (bool(ok), now_ts)
+    return bool(ok)
 
 
 def volume_ma(df, period):
@@ -531,6 +576,10 @@ def scalp_btc_entry_signal(ticker):
          close > prev_high, close > EMA9, RSI upturn
     - D) current 1m low > previous 1m low
     """
+    # 4h regime filter: block entries while higher timeframe trend is bearish.
+    if not _scalp_btc_regime_allows_entry(ticker):
+        return False
+
     interval = str(getattr(config, "SCALP_BTC_TF", "minute15"))
     rsi_len = int(getattr(config, "SCALP_BTC_RSI_LEN", 14))
     rsi_os = float(getattr(config, "SCALP_BTC_RSI_OS", 28))
