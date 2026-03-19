@@ -34,6 +34,14 @@ def now_kst() -> dt.datetime:
     return dt.datetime.now(KST)
 
 
+def _mini_report_enabled() -> bool:
+    return bool(getattr(config, "TELEGRAM_0900_REPORT_ENABLED", True))
+
+
+def _daily_report_enabled() -> bool:
+    return bool(getattr(config, "TELEGRAM_2100_REPORT_ENABLED", True))
+
+
 def _to_float(value, default: float = 0.0) -> float:
     try:
         return float(value)
@@ -826,6 +834,9 @@ def build_0900_mini_report_text(
 
 
 def send_0900_mini_report(now: dt.datetime, log_line):
+    if not _mini_report_enabled():
+        log_line("[INFO] 09:00 telegram mini report disabled by config")
+        return False
     try:
         kst_now = _kst_now(now)
         strategy_state, _, inactive_positions, scalp_btc_state, risk_state = load_state()
@@ -956,6 +967,9 @@ def build_heartbeat_text(
 
 
 def send_heartbeat(now: dt.datetime, log_line):
+    if not _mini_report_enabled():
+        log_line("[INFO] heartbeat telegram disabled by config")
+        return False
     strategy_state, _, _, _, risk_state = load_state()
     main_holding_cnt = _count_holdings(strategy_state, "MAIN")
     scalp_holding_cnt = _count_holdings(strategy_state, "SCALP")
@@ -1188,6 +1202,10 @@ def main():
         )
         if not should_send:
             return
+        if not _mini_report_enabled():
+            log_line("[INFO] 09:00 scheduled telegram mini report disabled by config")
+            _mark_scheduled_sent("heartbeat", target, log_line)
+            return
         if not has_telegram_credentials():
             log_line("[WARN] TELEGRAM_TOKEN/TELEGRAM_CHAT_ID missing; mini report will be queued to spool")
         mini_ok = send_0900_mini_report(_kst_now(now), log_line)
@@ -1207,6 +1225,10 @@ def main():
         log_line=log_line,
     )
     if not should_send_report:
+        return
+    if not _daily_report_enabled():
+        log_line("[INFO] 21:00 scheduled telegram daily report disabled by config")
+        _mark_scheduled_sent("daily_report", report_target, log_line)
         return
 
     rows_all, files = load_all_trades(".")
