@@ -16,7 +16,7 @@ import pyupbit
 
 import config
 import position_manager
-from engine_entry import try_main_entries, try_scalp_entries
+from engine_entry import try_main_entries, try_scalp_entries, try_v5_entries
 from engine_manage import append_trade_log, log_order, manage_positions
 from indicators import (
     check_filters_with_reason,
@@ -1945,6 +1945,13 @@ def run():
     enable_main, enable_scalp_legacy, enable_scalp_btc, force_mock_order = _mode_to_strategy_flags(bot_mode)
     main_include_surge = bool(getattr(config, "MAIN_INCLUDE_SURGE", False))
     main_surge_source = str(getattr(config, "MAIN_SURGE_SOURCE", "RANKED")).upper().strip()
+    live_strategy_mode = str(getattr(config, "LIVE_STRATEGY_MODE", "MAIN")).upper().strip()
+    if live_strategy_mode not in {"MAIN", "A_ONLY"}:
+        print(f"[WARN] invalid LIVE_STRATEGY_MODE={live_strategy_mode}; fallback to MAIN")
+        live_strategy_mode = "MAIN"
+    active_main_strategy = "A_ONLY" if live_strategy_mode == "A_ONLY" else "MAIN"
+    if live_strategy_mode == "A_ONLY":
+        main_include_surge = False
     if not _acquire_instance_lock():
         return
     atexit.register(_release_instance_lock)
@@ -2198,6 +2205,10 @@ def run():
 
             base_per_trade, base_max_holdings = get_base_position_settings(equity)
             per_trade_main, max_holdings = apply_market_regime(equity, base_per_trade, base_max_holdings, regime)
+            if live_strategy_mode == "A_ONLY":
+                max_holdings = max(1, int(getattr(config, "A_ONLY_MAX_HOLDINGS", max_holdings)))
+                a_only_scale = max(0.0, float(getattr(config, "A_ONLY_SCALE_MULT", 1.0)))
+                per_trade_main = float(per_trade_main) * float(a_only_scale)
             h_key, h_scale = apply_runtime_params_by_holdings(max_holdings)
 
             total_holding = _count_total_holdings_with_scalp_btc(
@@ -2242,16 +2253,20 @@ def run():
                 "MAIN",
             )
 
-            tp1_limit = int(getattr(config, "DAILY_TP1_EXIT_LIMIT", 3))
-            main_loss_limit = int(getattr(config, "MAIN_CONSEC_LOSS_LIMIT", getattr(config, "CONSEC_LOSS_EXIT_LIMIT", 4)))
+            if live_strategy_mode == "A_ONLY":
+                tp1_limit = int(getattr(config, "A_ONLY_DAILY_ENTRY_STOP_AFTER_WINS", 3))
+                main_loss_limit = int(getattr(config, "A_ONLY_CONSEC_LOSS_LIMIT", 4))
+            else:
+                tp1_limit = int(getattr(config, "DAILY_TP1_EXIT_LIMIT", 3))
+                main_loss_limit = int(getattr(config, "MAIN_CONSEC_LOSS_LIMIT", getattr(config, "CONSEC_LOSS_EXIT_LIMIT", 4)))
             main_entry_allowed = (day_tp1_count_main < tp1_limit) and (loss_seq_main < main_loss_limit) and (not risk_halted)
 
             blocked_main = not main_entry_allowed
             if blocked_main and not main_entry_blocked_prev:
                 if day_tp1_count_main >= tp1_limit:
-                    print(f"[ENTRY_BLOCK][MAIN] reason=TP1_LIMIT count={day_tp1_count_main}")
+                    print(f"[ENTRY_BLOCK][{active_main_strategy}] reason=TP1_LIMIT count={day_tp1_count_main}")
                 if loss_seq_main >= main_loss_limit:
-                    print(f"[ENTRY_BLOCK][MAIN] reason=LOSS_STREAK count={loss_seq_main}")
+                    print(f"[ENTRY_BLOCK][{active_main_strategy}] reason=LOSS_STREAK count={loss_seq_main}")
                 if risk_halted:
                     print(
                         f"[ENTRY_BLOCK][GLOBAL] reason={halt_reason} "
@@ -2272,8 +2287,8 @@ def run():
                     f"[STATUS] Regime={regime} | Equity~{equity:,.0f} | PerTrade~{per_trade_main:,.0f} | "
                     f"Holding={total_holding}/{max_holdings} | MAIN={main_h} LEGACY={legacy_h} SCALP_BTC={scalp_btc_h} | "
                     f"Core={len(core_universe)} Surge={len(surge_candidates)} | "
-                    f"HKey={h_key} HScale={h_scale:.2f} | TP1_MAIN={day_tp1_count_main} "
-                    f"Loss_MAIN={loss_seq_main} SBtcLoss={int(scalp_btc_state.get('loss_streak', 0))} SBtcPause={pause_txt} | "
+                    f"HKey={h_key} HScale={h_scale:.2f} | TP1_{active_main_strategy}={day_tp1_count_main} "
+                    f"Loss_{active_main_strategy}={loss_seq_main} SBtcLoss={int(scalp_btc_state.get('loss_streak', 0))} SBtcPause={pause_txt} | "
                     f"RiskHalt={'Y' if risk_halted else 'N'} Day={risk_info.get('day_key', '')} "
                     f"DayStart={float(risk_info.get('day_start_equity', 0.0)):,.0f} Peak={float(risk_info.get('peak_equity', 0.0)):,.0f}"
                 )
@@ -2290,16 +2305,16 @@ def run():
                     save_state_fn=persist_state,
                     inactive_tickers=inactive_tickers,
                     inactive_positions=inactive_positions,
-                    strategy="MAIN",
+                    strategy=active_main_strategy,
                 )
                 if events_main:
                     _notify_closed_trade_events(events_main)
-                    loss_seq_main = update_loss_seq_from_events(events_main, loss_seq_main, "MAIN")
+                    loss_seq_main = update_loss_seq_from_events(events_main, loss_seq_main, active_main_strategy)
                     day_tp1_count_main = update_day_tp1_counter(
                         strategy_state.get("MAIN", {}),
                         tp1_counted_main,
                         day_tp1_count_main,
-                        "MAIN",
+                        active_main_strategy,
                     )
 
             # 2) SCALP_BTC position management
@@ -2375,7 +2390,10 @@ def run():
             if (not guard_active) and enable_main and main_entry_allowed and total_holding < max_holdings and float(per_trade_main) > 0:
                 main_universe = list(core_universe)
                 main_surge_tickers = set()
-                if main_include_surge:
+                if live_strategy_mode == "A_ONLY":
+                    a_only_topn = max(1, int(getattr(config, "A_ONLY_TOPN", 10)))
+                    main_universe = list(main_universe[:a_only_topn])
+                elif main_include_surge:
                     if main_surge_source == "MOMENTUM":
                         main_surge_tickers = {
                             str(t).upper().strip() for t in list(surge_candidates) if str(t).strip()
@@ -2397,13 +2415,13 @@ def run():
                     )
                     if blocked_tickers:
                         reason = str(blocked_reasons.get(ticker) or "UNIVERSE_FILTER")
-                        print(f"[ENTRY_BLOCK][MAIN] reason={reason} ticker={ticker}")
+                        print(f"[ENTRY_BLOCK][{active_main_strategy}] reason={reason} ticker={ticker}")
                         return False
 
                     if ticker != btc_ticker:
                         return True
 
-                    main_entry_intent = {"strategy": "MAIN", "ticker": ticker, "ts": now}
+                    main_entry_intent = {"strategy": active_main_strategy, "ticker": ticker, "ts": now}
                     try:
                         if not _scalp_btc_is_holding(scalp_btc_state):
                             return True
@@ -2445,30 +2463,50 @@ def run():
                         main_entry_intent = None
 
                 try:
-                    did_main = try_main_entries(
-                        upbit=upbit,
-                        now=now,
-                        universe=main_universe,
-                        prices=prices,
-                        k_map=k_map,
-                        state=strategy_state["MAIN"],
-                        cooldown_until=strategy_cooldowns["MAIN"],
-                        per_trade_amt=float(per_trade_main),
-                        max_holdings=max_holdings,
-                        total_holding_cnt=total_holding,
-                        regime=regime,
-                        wait_for_filled_snapshot_fn=wait_for_filled_snapshot,
-                        save_state_fn=persist_state,
-                        inactive_tickers=inactive_tickers,
-                        inactive_positions=inactive_positions,
-                        global_holding_tickers=_all_holding_tickers_with_scalp_btc(strategy_state, scalp_btc_state),
-                        before_buy_fn=before_main_buy,
-                        entry_params=entry_params.get("MAIN") if isinstance(entry_params, dict) else None,
-                        main_mode=entry_param_mode,
-                        runtime_risk_state=runtime_risk_state,
-                        equity=equity,
-                        surge_tickers=main_surge_tickers,
-                    )
+                    if live_strategy_mode == "A_ONLY":
+                        did_main = try_v5_entries(
+                            upbit=upbit,
+                            now=now,
+                            universe=main_universe,
+                            prices=prices,
+                            state=strategy_state["MAIN"],
+                            cooldown_until=strategy_cooldowns["MAIN"],
+                            per_trade_amt=float(per_trade_main),
+                            max_holdings=max_holdings,
+                            total_holding_cnt=total_holding,
+                            wait_for_filled_snapshot_fn=wait_for_filled_snapshot,
+                            save_state_fn=persist_state,
+                            inactive_tickers=inactive_tickers,
+                            inactive_positions=inactive_positions,
+                            global_holding_tickers=_all_holding_tickers_with_scalp_btc(strategy_state, scalp_btc_state),
+                            runtime_risk_state=runtime_risk_state,
+                            equity=equity,
+                        )
+                    else:
+                        did_main = try_main_entries(
+                            upbit=upbit,
+                            now=now,
+                            universe=main_universe,
+                            prices=prices,
+                            k_map=k_map,
+                            state=strategy_state["MAIN"],
+                            cooldown_until=strategy_cooldowns["MAIN"],
+                            per_trade_amt=float(per_trade_main),
+                            max_holdings=max_holdings,
+                            total_holding_cnt=total_holding,
+                            regime=regime,
+                            wait_for_filled_snapshot_fn=wait_for_filled_snapshot,
+                            save_state_fn=persist_state,
+                            inactive_tickers=inactive_tickers,
+                            inactive_positions=inactive_positions,
+                            global_holding_tickers=_all_holding_tickers_with_scalp_btc(strategy_state, scalp_btc_state),
+                            before_buy_fn=before_main_buy,
+                            entry_params=entry_params.get("MAIN") if isinstance(entry_params, dict) else None,
+                            main_mode=entry_param_mode,
+                            runtime_risk_state=runtime_risk_state,
+                            equity=equity,
+                            surge_tickers=main_surge_tickers,
+                        )
                 finally:
                     main_entry_intent = None
 

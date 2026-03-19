@@ -112,14 +112,33 @@ def volume_ma(df, period):
     return get_sma(df["volume"], period)
 
 
-def get_rsi(df, period=14):
-    delta = df["close"].diff()
-    up = delta.clip(lower=0)
-    down = -delta.clip(upper=0)
-    gain = up.rolling(period).mean()
-    loss = down.rolling(period).mean()
+def _rsi_from_close(close, period=14):
+    n = max(2, int(period))
+    delta = close.diff()
+    up = delta.clip(lower=0.0)
+    down = -delta.clip(upper=0.0)
+    mode = str(getattr(config, "TA_RSI_MODE", "RMA")).upper().strip()
+
+    if mode == "SMA":
+        gain = up.rolling(n, min_periods=n).mean()
+        loss = down.rolling(n, min_periods=n).mean()
+    else:
+        alpha = 1.0 / float(n)
+        gain = up.ewm(alpha=alpha, adjust=False, min_periods=n).mean()
+        loss = down.ewm(alpha=alpha, adjust=False, min_periods=n).mean()
+
     rs = gain / (loss + 1e-12)
-    return 100 - (100 / (1 + rs))
+    rsi = 100.0 - (100.0 / (1.0 + rs))
+
+    both_zero = (gain <= 1e-12) & (loss <= 1e-12)
+    loss_zero = (loss <= 1e-12) & (gain > 1e-12)
+    rsi = rsi.where(~both_zero, 50.0)
+    rsi = rsi.where(~loss_zero, 100.0)
+    return rsi
+
+
+def get_rsi(df, period=14):
+    return _rsi_from_close(df["close"], period=period)
 
 
 def get_atr(df, period=14):
@@ -397,6 +416,778 @@ def minute_entry_score(df, cfg=config):
         "vol_ma20_now": float(vol_ma20_now),
     }
     return int(score), reasons, metrics
+
+
+def _v5_clamp_sl_pct(raw_sl_pct: float, cfg=config) -> float:
+    sl_min = max(0.0, float(getattr(cfg, "V5_SL_MIN_PCT", 0.008)))
+    sl_max = max(sl_min, float(getattr(cfg, "V5_SL_MAX_PCT", 0.018)))
+    return max(sl_min, min(sl_max, float(raw_sl_pct)))
+
+
+def _v5_breakout_quality_check(
+    *,
+    breakout_level: float,
+    cur_open: float,
+    cur_high: float,
+    cur_low: float,
+    cur_close: float,
+    cfg=config,
+):
+    candle_range = float(cur_high) - float(cur_low)
+    if candle_range <= 0:
+        return False, "BREAKOUT_RANGE_ZERO", {}
+
+    body = abs(float(cur_close) - float(cur_open))
+    if body <= 0:
+        return False, "BREAKOUT_BODY_ZERO", {}
+
+    close_pos = (float(cur_close) - float(cur_low)) / candle_range
+    top_pct = max(0.01, min(0.49, float(getattr(cfg, "V5_BREAKOUT_CLOSE_TOP_PCT", 0.25))))
+    if close_pos < (1.0 - top_pct):
+        return False, "BREAKOUT_CLOSE_WEAK", {"close_pos": float(close_pos)}
+
+    wick_body_max = max(0.0, float(getattr(cfg, "V5_BREAKOUT_UPPER_WICK_MAX_BODY", 0.50)))
+    upper_wick = float(cur_high) - max(float(cur_open), float(cur_close))
+    wick_body_ratio = float(upper_wick / body) if body > 0 else 999.0
+    if upper_wick > (body * wick_body_max):
+        return False, "BREAKOUT_UPPER_WICK_TOO_LARGE", {"wick_body_ratio": float(wick_body_ratio)}
+
+    if float(cur_close) <= 0:
+        return False, "BREAKOUT_CLOSE_INVALID", {}
+
+    min_body_pct = max(0.0, float(getattr(cfg, "V5_BREAKOUT_MIN_BODY_PCT", 0.0)))
+    body_pct = body / float(cur_close)
+    if body_pct < min_body_pct:
+        return False, "BREAKOUT_BODY_TOO_SMALL", {"body_pct": float(body_pct)}
+
+    min_range_pct = max(0.0, float(getattr(cfg, "V5_BREAKOUT_MIN_RANGE_PCT", 0.0)))
+    range_pct = candle_range / float(cur_close)
+    if range_pct < min_range_pct:
+        return False, "BREAKOUT_RANGE_TOO_SMALL", {"range_pct": float(range_pct)}
+
+    breakout_level = float(breakout_level)
+    if breakout_level <= 0:
+        return False, "BREAKOUT_REF_INVALID", {}
+
+    confirm_min_pct = max(0.0, float(getattr(cfg, "V5_BREAKOUT_CONFIRM_PCT", 0.0015)))
+    confirm_pct = (float(cur_close) / breakout_level) - 1.0
+    if confirm_pct < confirm_min_pct:
+        return False, "BREAKOUT_CONFIRM_TOO_SMALL", {"confirm_pct": float(confirm_pct)}
+
+    return True, "OK", {
+        "close_pos": float(close_pos),
+        "wick_body_ratio": float(wick_body_ratio),
+        "body_pct": float(body_pct),
+        "range_pct": float(range_pct),
+        "confirm_pct": float(confirm_pct),
+    }
+
+
+def v5_breakout_pullback_signal_df(df, cfg=config):
+    """
+    V5 long-only signal on completed 5m candles:
+    1) Breakout candle closes above prior N high with volume spike.
+    2) 1~M pullback candles hold above EMA.
+    3) Latest candle re-accelerates above previous high and closes above EMA.
+    """
+    required_cols = {"open", "high", "low", "close", "volume"}
+    if df is None or len(df) < 40 or (not required_cols.issubset(df.columns)):
+        return {"ok": False, "reason": "DATA_SHORT"}
+
+    lookback = max(5, int(getattr(cfg, "V5_BREAKOUT_LOOKBACK", 20)))
+    pullback_max = max(1, int(getattr(cfg, "V5_PULLBACK_MAX_BARS", 3)))
+    ema_period = max(2, int(getattr(cfg, "V5_EMA_PERIOD", 20)))
+    vol_ma_period = max(2, int(getattr(cfg, "V5_VOL_MA_PERIOD", 20)))
+    vol_mult = max(
+        1.0,
+        float(getattr(cfg, "V5_VOLUME_MULT", getattr(cfg, "V5_BREAKOUT_VOL_MULT", 1.7))),
+    )
+    require_quality = bool(getattr(cfg, "V5_BREAKOUT_QUALITY_FILTER", False))
+    require_retest = bool(getattr(cfg, "V5_REQUIRE_RETEST_CONFIRM", False))
+    retest_touch_tol = max(0.0, float(getattr(cfg, "V5_RETEST_TOUCH_TOL_PCT", 0.0015)))
+    retest_break_tol = max(0.0, float(getattr(cfg, "V5_RETEST_BREAK_TOL_PCT", 0.0030)))
+    retest_reclaim_min = max(0.0, float(getattr(cfg, "V5_RETEST_RECLAIM_MIN_PCT", 0.0)))
+
+    n = len(df)
+    min_needed = lookback + pullback_max + max(ema_period, vol_ma_period) + 5
+    if n < min_needed:
+        return {"ok": False, "reason": "DATA_SHORT"}
+
+    close = df["close"]
+    open_ = df["open"]
+    high = df["high"]
+    low = df["low"]
+    volume = df["volume"]
+    ema = get_ema(close, ema_period)
+    vol_ma = volume_ma(df, vol_ma_period)
+
+    cur_open = safe_last(open_)
+    cur_high = safe_last(high)
+    cur_low = safe_last(low)
+    cur_close = safe_last(close)
+    cur_prev_high = safe_last(high.iloc[:-1])
+    cur_ema = safe_last(ema)
+    if None in (cur_open, cur_high, cur_low, cur_close, cur_prev_high, cur_ema):
+        return {"ok": False, "reason": "DATA_NAN"}
+
+    trend_mode = str(getattr(cfg, "V5_TREND_FILTER", "OFF")).upper().strip()
+    if trend_mode in {"CLOSE_GT_EMA50", "EMA20_GT_EMA50"}:
+        ema50 = get_ema(close, 50)
+        ema50_now = safe_last(ema50)
+        if ema50_now is None:
+            return {"ok": False, "reason": "TREND_DATA_NAN"}
+        if not (float(cur_close) > float(ema50_now)):
+            return {"ok": False, "reason": "TREND_CLOSE_BELOW_EMA50"}
+        if trend_mode == "EMA20_GT_EMA50":
+            if not (float(cur_ema) > float(ema50_now)):
+                return {"ok": False, "reason": "TREND_EMA20_BELOW_EMA50"}
+
+    # Optional RSI upturn gate for V5 experiments.
+    if bool(getattr(cfg, "ENTRY_REQUIRE_RSI_UPTURN", False)):
+        rsi_series = get_rsi(df, 14)
+        rsi_now = safe_last(rsi_series)
+        rsi_prev = None
+        try:
+            rsi_prev = float(rsi_series.iloc[-2])
+            if rsi_prev != rsi_prev:
+                rsi_prev = None
+        except Exception:
+            rsi_prev = None
+        if rsi_now is None or rsi_prev is None:
+            return {"ok": False, "reason": "RSI_DATA_NAN"}
+        delta_min = float(getattr(cfg, "ENTRY_RSI_DELTA_MIN", 0.8))
+        if (float(rsi_now) - float(rsi_prev)) < float(delta_min):
+            return {"ok": False, "reason": "RSI_DELTA_LOW"}
+
+    # Require re-acceleration now.
+    if not (float(cur_close) > float(cur_prev_high) and float(cur_close) > float(cur_ema)):
+        return {"ok": False, "reason": "REACCEL_FAIL"}
+
+    for pullback_len in range(1, pullback_max + 1):
+        breakout_idx = n - 1 - pullback_len
+        if breakout_idx <= lookback:
+            continue
+
+        prev_high_n = safe_last(high.iloc[breakout_idx - lookback : breakout_idx])
+        breakout_close = safe_last(close.iloc[: breakout_idx + 1])
+        breakout_vol = safe_last(volume.iloc[: breakout_idx + 1])
+        breakout_vol_ma = safe_last(vol_ma.iloc[: breakout_idx + 1])
+        breakout_ema = safe_last(ema.iloc[: breakout_idx + 1])
+
+        if None in (prev_high_n, breakout_close, breakout_vol, breakout_vol_ma, breakout_ema):
+            continue
+        if not (float(breakout_close) > float(prev_high_n)):
+            continue
+        if not (float(breakout_vol_ma) > 0 and float(breakout_vol) >= float(breakout_vol_ma) * float(vol_mult)):
+            continue
+        if not (float(breakout_close) > float(breakout_ema)):
+            continue
+
+        pull_start = breakout_idx + 1
+        pull_end = n - 1  # exclude current re-acceleration candle
+        if pull_start >= pull_end:
+            continue
+
+        lows = low.iloc[pull_start:pull_end]
+        emas = ema.iloc[pull_start:pull_end]
+        if lows.empty or emas.empty or len(lows) != len(emas):
+            continue
+        if bool((lows < emas).any()):
+            continue
+
+        if require_retest:
+            breakout_level = float(prev_high_n)
+            if breakout_level <= 0:
+                continue
+            pull_lows = lows.astype("float64")
+            pull_closes = close.iloc[pull_start:pull_end].astype("float64")
+            if pull_closes.empty or len(pull_closes) != len(pull_lows):
+                continue
+            min_pull_low = float(pull_lows.min())
+            touched = bool(min_pull_low <= (breakout_level * (1.0 + retest_touch_tol)))
+            no_deep_break = bool(min_pull_low >= (breakout_level * (1.0 - retest_break_tol)))
+            reclaimed = bool((pull_closes >= (breakout_level * (1.0 + retest_reclaim_min))).any())
+            if not (touched and no_deep_break and reclaimed):
+                continue
+
+        quality_metrics = {}
+        if require_quality:
+            ok_quality, quality_reason, quality_metrics = _v5_breakout_quality_check(
+                breakout_level=float(prev_high_n),
+                cur_open=float(cur_open),
+                cur_high=float(cur_high),
+                cur_low=float(cur_low),
+                cur_close=float(cur_close),
+                cfg=cfg,
+            )
+            if not ok_quality:
+                return {"ok": False, "reason": quality_reason, **dict(quality_metrics or {})}
+
+        swing_low = float(low.iloc[breakout_idx:n].min())
+        entry_price = float(cur_close)
+        if swing_low <= 0 or entry_price <= swing_low:
+            continue
+        raw_sl_pct = (entry_price - swing_low) / entry_price
+        sl_pct = _v5_clamp_sl_pct(raw_sl_pct, cfg=cfg)
+        stop_price = float(entry_price) * (1.0 - float(sl_pct))
+
+        return {
+            "ok": True,
+            "reason": "V5_BREAKOUT_PULLBACK",
+            "entry_price": float(entry_price),
+            "stop_price": float(stop_price),
+            "sl_pct": float(sl_pct),
+            "swing_low": float(swing_low),
+            "pullback_bars": int(pullback_len),
+            "breakout_level": float(prev_high_n),
+            "breakout_close": float(breakout_close),
+            "retest_required": bool(require_retest),
+            "quality_filter": bool(require_quality),
+            **dict(quality_metrics or {}),
+        }
+
+    return {"ok": False, "reason": "PATTERN_NOT_FOUND"}
+
+
+def v5_breakout_pullback_signal(ticker: str, cfg=config):
+    interval = str(getattr(cfg, "V5_SIGNAL_INTERVAL", "minute5"))
+    lookback = max(60, int(getattr(cfg, "V5_SIGNAL_LOOKBACK", 120)))
+    df = pyupbit.get_ohlcv(ticker, interval=interval, count=lookback)
+    return v5_breakout_pullback_signal_df(df, cfg=cfg)
+
+
+def _sr_pivot_levels(df, lookback: int, delta_len: int):
+    if df is None or len(df) < 10:
+        return [], []
+    if ("high" not in df.columns) or ("low" not in df.columns):
+        return [], []
+
+    lookback = max(10, int(lookback))
+    delta_len = max(1, int(delta_len))
+    work = df.tail(max(lookback + delta_len * 2 + 8, 40))
+    if len(work) < (delta_len * 2 + 3):
+        return [], []
+
+    highs = work["high"].astype("float64").reset_index(drop=True)
+    lows = work["low"].astype("float64").reset_index(drop=True)
+    n = len(work)
+    support_levels = []
+    resistance_levels = []
+
+    for i in range(delta_len, n - delta_len):
+        lv_low = float(lows.iloc[i])
+        lv_high = float(highs.iloc[i])
+        left_low = float(lows.iloc[i - delta_len : i].min())
+        right_low = float(lows.iloc[i + 1 : i + delta_len + 1].min())
+        left_high = float(highs.iloc[i - delta_len : i].max())
+        right_high = float(highs.iloc[i + 1 : i + delta_len + 1].max())
+
+        if lv_low <= left_low and lv_low <= right_low:
+            support_levels.append(float(lv_low))
+        if lv_high >= left_high and lv_high >= right_high:
+            resistance_levels.append(float(lv_high))
+
+    # Keep recency while dropping near-duplicates.
+    def _dedupe_recent(levels):
+        out = []
+        for lv in list(levels or []):
+            if not out:
+                out.append(float(lv))
+                continue
+            prev = float(out[-1])
+            if prev <= 0:
+                out.append(float(lv))
+                continue
+            if abs(float(lv) - prev) / prev < 0.0005:
+                continue
+            out.append(float(lv))
+        return out[-24:]
+
+    return _dedupe_recent(support_levels), _dedupe_recent(resistance_levels)
+
+
+def _sr_build_zones_15m(df15, cfg=config):
+    if df15 is None or len(df15) < 30:
+        return [], [], None
+
+    lookback = max(10, int(getattr(cfg, "SR_LOOKBACK", 20)))
+    delta_len = max(1, int(getattr(cfg, "SR_DELTA_VOL_LEN", 2)))
+    box_mult = max(0.1, float(getattr(cfg, "SR_BOX_ATR_MULT", 1.0)))
+    atr15 = get_atr(df15, 14)
+    atr_now = safe_last(atr15)
+    close_now = safe_last(df15["close"]) if "close" in df15.columns else None
+    if atr_now is None or atr_now <= 0:
+        if close_now is None or close_now <= 0:
+            return [], [], None
+        atr_now = float(close_now) * 0.003
+
+    zone_half = max(1e-9, float(atr_now) * float(box_mult) * 0.5)
+    support_levels, resistance_levels = _sr_pivot_levels(df15, lookback=lookback, delta_len=delta_len)
+
+    support_zones = []
+    for lv in support_levels:
+        support_zones.append(
+            {
+                "low": float(lv) - float(zone_half),
+                "high": float(lv) + float(zone_half),
+                "pivot": float(lv),
+            }
+        )
+
+    resistance_zones = []
+    for lv in resistance_levels:
+        resistance_zones.append(
+            {
+                "low": float(lv) - float(zone_half),
+                "high": float(lv) + float(zone_half),
+                "pivot": float(lv),
+            }
+        )
+
+    support_zones = sorted(support_zones, key=lambda z: float(z["high"]))
+    resistance_zones = sorted(resistance_zones, key=lambda z: float(z["low"]))
+    return support_zones, resistance_zones, float(atr_now)
+
+
+def _sr_volume_zscore(volume_series, length: int):
+    if volume_series is None:
+        return None
+    length = max(5, int(length))
+    if len(volume_series) < (length + 2):
+        return None
+    win = volume_series.iloc[-length:].astype("float64")
+    mean_v = float(win.mean())
+    std_v = float(win.std(ddof=0))
+    cur_v = float(volume_series.iloc[-1])
+    if std_v <= 1e-12:
+        return 0.0
+    return float((cur_v - mean_v) / std_v)
+
+
+def sr_only_entry_signal_df(df15, df5, cfg=config):
+    required_cols = {"open", "high", "low", "close", "volume"}
+    if df15 is None or len(df15) < 80 or (not required_cols.issubset(df15.columns)):
+        return {"ok": False, "reason": "SR_15M_DATA_SHORT"}
+    if df5 is None or len(df5) < 40 or (not required_cols.issubset(df5.columns)):
+        return {"ok": False, "reason": "SR_5M_DATA_SHORT"}
+
+    c15 = safe_last(df15["close"])
+    if c15 is None or c15 <= 0:
+        return {"ok": False, "reason": "SR_15M_CLOSE_NAN"}
+
+    support_zones, resistance_zones, atr15 = _sr_build_zones_15m(df15, cfg=cfg)
+    if not support_zones:
+        return {"ok": False, "reason": "SR_SUPPORT_NOT_FOUND"}
+
+    if bool(getattr(cfg, "SR_USE_EMA_TREND_FILTER", True)):
+        ema_len = max(20, int(getattr(cfg, "SR_EMA_LEN", 200)))
+        ema_line = get_ema(df15["close"], ema_len)
+        ema_now = safe_last(ema_line)
+        if ema_now is None:
+            return {"ok": False, "reason": "SR_EMA_DATA_NAN"}
+        if not (float(c15) > float(ema_now)):
+            return {"ok": False, "reason": "SR_EMA_FILTER_FAIL"}
+
+    if bool(getattr(cfg, "SR_USE_VOL_Z_FILTER", True)):
+        z_len = max(5, int(getattr(cfg, "SR_VOL_Z_LEN", 50)))
+        z_min = float(getattr(cfg, "SR_VOL_Z_MIN", 0.3))
+        z_now = _sr_volume_zscore(df15["volume"], z_len)
+        if z_now is None:
+            return {"ok": False, "reason": "SR_VOL_Z_DATA_SHORT"}
+        if float(z_now) < float(z_min):
+            return {"ok": False, "reason": "SR_VOL_Z_FILTER_FAIL"}
+
+    supports_below = [z for z in support_zones if float(z["high"]) <= float(c15)]
+    if not supports_below:
+        supports_cover = [z for z in support_zones if float(z["low"]) <= float(c15) <= float(z["high"])]
+        if supports_cover:
+            support = supports_cover[-1]
+        else:
+            return {"ok": False, "reason": "SR_NO_NEAR_SUPPORT"}
+    else:
+        support = min(supports_below, key=lambda z: abs(float(c15) - float(z["high"])))
+
+    support_low = float(support["low"])
+    support_high = float(support["high"])
+    if float(c15) <= float(support_high):
+        return {"ok": False, "reason": "SR_PRICE_NOT_ABOVE_SUPPORT"}
+
+    resistances_above = [z for z in resistance_zones if float(z["low"]) > float(c15)]
+    nearest_res = min(resistances_above, key=lambda z: float(z["low"])) if resistances_above else None
+
+    atr5 = safe_last(get_atr(df5, 14))
+    close5 = safe_last(df5["close"])
+    prev_high5 = safe_last(df5["high"].iloc[:-1]) if len(df5) >= 2 else None
+    low5 = safe_last(df5["low"])
+    if None in (close5, prev_high5, low5):
+        return {"ok": False, "reason": "SR_5M_DATA_NAN"}
+    if atr5 is None or atr5 <= 0:
+        atr5 = float(close5) * 0.003
+
+    tol_atr = float(atr5) * max(0.01, float(getattr(cfg, "SR_RETEST_ATR5_MULT", 0.10)))
+    tol_fix = float(close5) * max(0.0, float(getattr(cfg, "SR_RETEST_FIXED_PCT", 0.0015)))
+    retest_tol = max(float(tol_atr), float(tol_fix))
+
+    touched = (float(low5) <= float(support_high) + float(retest_tol)) and (
+        float(low5) >= float(support_high) - float(retest_tol)
+    )
+    if not touched:
+        return {"ok": False, "reason": "SR_RETEST_NOT_TOUCHED"}
+
+    if not (float(close5) > float(prev_high5)):
+        return {"ok": False, "reason": "SR_REACCEL_FAIL"}
+    if not (float(close5) > float(support_high)):
+        return {"ok": False, "reason": "SR_CLOSE_BELOW_SUPPORT_TOP"}
+
+    entry_price = float(close5)
+    sl_offset_pct = max(0.0, float(getattr(cfg, "SR_SL_OFFSET_PCT", 0.003)))
+    stop_price = float(support_low) * (1.0 - float(sl_offset_pct))
+    if stop_price <= 0 or not (float(entry_price) > float(stop_price)):
+        return {"ok": False, "reason": "SR_STOP_INVALID"}
+
+    r_pct = (float(entry_price) - float(stop_price)) / float(entry_price)
+    if r_pct <= 0:
+        return {"ok": False, "reason": "SR_R_INVALID"}
+
+    mode = str(getattr(cfg, "SR_TP_MODE", "R_FIXED")).upper().strip()
+    tp_mode = "R_FIXED"
+    tp_reason = "EXIT_SR_TP_R"
+    tp_price = float(entry_price) * (1.0 + float(max(0.1, float(getattr(cfg, "SR_TP_R", 2.0)))) * float(r_pct))
+    if mode in {"RESIST", "MODE_A", "TP_RESIST"}:
+        if nearest_res is not None and float(nearest_res["low"]) > float(entry_price):
+            tp_mode = "RESIST"
+            tp_reason = "EXIT_SR_TP_RESIST"
+            tp_price = float(nearest_res["low"])
+
+    return {
+        "ok": True,
+        "reason": "ENTRY_SR_RETEST",
+        "entry_price": float(entry_price),
+        "stop_price": float(stop_price),
+        "r_pct": float(r_pct),
+        "tp_mode": str(tp_mode),
+        "tp_reason": str(tp_reason),
+        "tp_price": float(tp_price),
+        "support_low": float(support_low),
+        "support_high": float(support_high),
+        "resistance_low": float(nearest_res["low"]) if nearest_res is not None else 0.0,
+        "resistance_high": float(nearest_res["high"]) if nearest_res is not None else 0.0,
+        "atr15": float(atr15) if atr15 is not None else 0.0,
+        "atr5": float(atr5),
+        "bar_5m_ts": str(df5.index[-1]),
+    }
+
+
+def sr_only_entry_signal(ticker: str, cfg=config):
+    interval_15 = str(getattr(cfg, "SR_ZONE_INTERVAL", "minute15"))
+    interval_5 = str(getattr(cfg, "SR_EXEC_INTERVAL", "minute5"))
+    lookback_15 = max(
+        int(getattr(cfg, "SR_SIGNAL_LOOKBACK_15M", 360)),
+        int(getattr(cfg, "SR_EMA_LEN", 200)) + int(getattr(cfg, "SR_LOOKBACK", 20)) + 40,
+    )
+    lookback_5 = max(int(getattr(cfg, "SR_SIGNAL_LOOKBACK_5M", 240)), 80)
+    df15 = pyupbit.get_ohlcv(ticker, interval=interval_15, count=lookback_15)
+    df5 = pyupbit.get_ohlcv(ticker, interval=interval_5, count=lookback_5)
+    return sr_only_entry_signal_df(df15=df15, df5=df5, cfg=cfg)
+
+
+def _sr_pivot_points(df, lookback: int, delta_len: int):
+    if df is None or len(df) < 10:
+        return [], []
+    if ("high" not in df.columns) or ("low" not in df.columns):
+        return [], []
+
+    lookback = max(10, int(lookback))
+    delta_len = max(1, int(delta_len))
+    work = df.tail(max(lookback + delta_len * 2 + 8, 60)).copy()
+    if len(work) < (delta_len * 2 + 3):
+        return [], []
+
+    highs = work["high"].astype("float64").reset_index(drop=True)
+    lows = work["low"].astype("float64").reset_index(drop=True)
+    idx_list = list(work.index)
+    n = len(work)
+    supports = []
+    resistances = []
+    for i in range(delta_len, n - delta_len):
+        lv_low = float(lows.iloc[i])
+        lv_high = float(highs.iloc[i])
+        left_low = float(lows.iloc[i - delta_len : i].min())
+        right_low = float(lows.iloc[i + 1 : i + delta_len + 1].min())
+        left_high = float(highs.iloc[i - delta_len : i].max())
+        right_high = float(highs.iloc[i + 1 : i + delta_len + 1].max())
+        candle_range = max(1e-9, float(highs.iloc[i] - lows.iloc[i]))
+        if lv_low <= left_low and lv_low <= right_low:
+            supports.append(
+                {
+                    "price": float(lv_low),
+                    "candle_range": float(candle_range),
+                    "idx": int(i),
+                    "ts": str(idx_list[i]),
+                }
+            )
+        if lv_high >= left_high and lv_high >= right_high:
+            resistances.append(
+                {
+                    "price": float(lv_high),
+                    "candle_range": float(candle_range),
+                    "idx": int(i),
+                    "ts": str(idx_list[i]),
+                }
+            )
+
+    def _dedupe_recent(points):
+        out = []
+        for p in list(points or []):
+            if not out:
+                out.append(dict(p))
+                continue
+            prev = float(out[-1]["price"])
+            cur = float(p["price"])
+            if prev > 0 and abs(cur - prev) / prev < 0.0005:
+                continue
+            out.append(dict(p))
+        return out[-24:]
+
+    return _dedupe_recent(supports), _dedupe_recent(resistances)
+
+
+def _sr_volume_zscore_at(volume_series, idx: int, length: int):
+    if volume_series is None:
+        return None
+    length = max(5, int(length))
+    idx = int(idx)
+    if idx < (length - 1) or idx >= len(volume_series):
+        return None
+    win = volume_series.iloc[idx - length + 1 : idx + 1].astype("float64")
+    mean_v = float(win.mean())
+    std_v = float(win.std(ddof=0))
+    cur_v = float(volume_series.iloc[idx])
+    if std_v <= 1e-12:
+        return 0.0
+    return float((cur_v - mean_v) / std_v)
+
+
+def _sr_build_zones_15m_tv(df15, cfg=config):
+    if df15 is None or len(df15) < 40:
+        return [], [], None
+    lookback = max(10, int(getattr(cfg, "SR_TV_LOOKBACK", 20)))
+    delta_len = max(1, int(getattr(cfg, "SR_TV_DELTA_VOL_LEN", 2)))
+    box_mult = max(0.1, float(getattr(cfg, "SR_TV_BOX_ATR_MULT", 1.0)))
+    use_vol_z = bool(getattr(cfg, "SR_TV_USE_VOL_Z_FILTER", True))
+    vol_z_len = max(5, int(getattr(cfg, "SR_TV_VOL_Z_LEN", 50)))
+    vol_z_min = float(getattr(cfg, "SR_TV_VOL_Z_MIN", 0.3))
+
+    atr15 = get_atr(df15, 14)
+    atr_now = safe_last(atr15)
+    close_now = safe_last(df15["close"]) if "close" in df15.columns else None
+    if atr_now is None or atr_now <= 0:
+        if close_now is None or close_now <= 0:
+            return [], [], None
+        atr_now = float(close_now) * 0.003
+
+    supports, resistances = _sr_pivot_points(df15, lookback=lookback, delta_len=delta_len)
+    vol_series = df15["volume"].astype("float64").reset_index(drop=True)
+    support_zones = []
+    for p in supports:
+        z = _sr_volume_zscore_at(vol_series, int(p["idx"]), vol_z_len)
+        if use_vol_z and (z is None or float(z) < float(vol_z_min)):
+            continue
+        half = max(float(atr_now) * float(box_mult) * 0.5, float(p["candle_range"]) * 0.5)
+        support_zones.append(
+            {
+                "id": f"S|{p['ts']}|{float(p['price']):.6f}",
+                "low": float(p["price"]) - float(half),
+                "high": float(p["price"]) + float(half),
+                "pivot": float(p["price"]),
+                "pivot_ts": str(p["ts"]),
+                "vol_z": float(z) if z is not None else 0.0,
+            }
+        )
+
+    resistance_zones = []
+    for p in resistances:
+        z = _sr_volume_zscore_at(vol_series, int(p["idx"]), vol_z_len)
+        if use_vol_z and (z is None or float(z) < float(vol_z_min)):
+            continue
+        half = max(float(atr_now) * float(box_mult) * 0.5, float(p["candle_range"]) * 0.5)
+        resistance_zones.append(
+            {
+                "id": f"R|{p['ts']}|{float(p['price']):.6f}",
+                "low": float(p["price"]) - float(half),
+                "high": float(p["price"]) + float(half),
+                "pivot": float(p["price"]),
+                "pivot_ts": str(p["ts"]),
+                "vol_z": float(z) if z is not None else 0.0,
+            }
+        )
+
+    support_zones = sorted(support_zones, key=lambda z: float(z["high"]))
+    resistance_zones = sorted(resistance_zones, key=lambda z: float(z["low"]))
+    return support_zones, resistance_zones, float(atr_now)
+
+
+def sr_tv_combo_entry_signal_df(df15, df5, cfg=config):
+    out = {
+        "ok": False,
+        "reason": "TV_INIT",
+        "zone_id": "",
+        "touch_detected": False,
+        "flip_break_detected": False,
+        "entry_price": 0.0,
+        "support_low": 0.0,
+        "support_high": 0.0,
+        "resistance_low": 0.0,
+        "resistance_high": 0.0,
+        "tp_price": 0.0,
+        "bar_5m_ts": "",
+    }
+    required_cols = {"open", "high", "low", "close", "volume"}
+    if df15 is None or len(df15) < 80 or (not required_cols.issubset(df15.columns)):
+        out["reason"] = "SR_TV_15M_DATA_SHORT"
+        return out
+    if df5 is None or len(df5) < 20 or (not required_cols.issubset(df5.columns)):
+        out["reason"] = "SR_TV_5M_DATA_SHORT"
+        return out
+
+    c15 = safe_last(df15["close"])
+    if c15 is None or c15 <= 0:
+        out["reason"] = "SR_TV_15M_CLOSE_NAN"
+        return out
+
+    support_zones, resistance_zones, _atr15 = _sr_build_zones_15m_tv(df15=df15, cfg=cfg)
+    if not support_zones:
+        out["reason"] = "SR_TV_SUPPORT_NOT_FOUND"
+        return out
+
+    if bool(getattr(cfg, "SR_TV_USE_EMA_TREND_FILTER", True)):
+        ema_len = max(20, int(getattr(cfg, "SR_TV_EMA_LEN", 200)))
+        ema_line = get_ema(df15["close"], ema_len)
+        ema_now = safe_last(ema_line)
+        if ema_now is None:
+            out["reason"] = "SR_TV_EMA_DATA_NAN"
+            return out
+        if not (float(c15) > float(ema_now)):
+            out["reason"] = "SR_TV_EMA_FILTER_FAIL"
+            return out
+
+    supports_below = [z for z in support_zones if float(z["high"]) <= float(c15)]
+    if not supports_below:
+        supports_cover = [z for z in support_zones if float(z["low"]) <= float(c15) <= float(z["high"])]
+        support = supports_cover[-1] if supports_cover else None
+    else:
+        support = min(supports_below, key=lambda z: abs(float(c15) - float(z["high"])))
+    if support is None:
+        out["reason"] = "SR_TV_NO_NEAR_SUPPORT"
+        return out
+
+    support_low = float(support["low"])
+    support_high = float(support["high"])
+    out["zone_id"] = str(support.get("id", ""))
+    out["support_low"] = float(support_low)
+    out["support_high"] = float(support_high)
+
+    resistances_above = [z for z in resistance_zones if float(z["low"]) > float(support_high)]
+    nearest_res = min(resistances_above, key=lambda z: float(z["low"])) if resistances_above else None
+    if nearest_res is not None:
+        out["resistance_low"] = float(nearest_res["low"])
+        out["resistance_high"] = float(nearest_res["high"])
+
+    close5 = safe_last(df5["close"])
+    open5 = safe_last(df5["open"])
+    low5 = safe_last(df5["low"])
+    prev_high5 = safe_last(df5["high"].iloc[:-1]) if len(df5) >= 2 else None
+    if None in (close5, open5, low5, prev_high5):
+        out["reason"] = "SR_TV_5M_DATA_NAN"
+        return out
+    out["bar_5m_ts"] = str(df5.index[-1])
+
+    tol_pct = max(0.0, float(getattr(cfg, "SR_TV_RETEST_TOL_PCT", 0.0015)))
+    touch_in_zone = float(support_low) <= float(low5) <= float(support_high)
+    touch_upper = abs(float(low5) - float(support_high)) <= (float(support_high) * float(tol_pct))
+    out["touch_detected"] = bool(touch_in_zone or touch_upper)
+    out["flip_break_detected"] = bool(
+        (float(close5) <= float(support_low))
+        or (float(out["resistance_high"]) > 0 and float(close5) >= float(out["resistance_high"]))
+    )
+
+    if not bool(out["touch_detected"]):
+        out["reason"] = "SR_TV_TOUCH_FAIL"
+        return out
+
+    bullish = float(close5) > float(open5)
+    if not bullish:
+        out["reason"] = "SR_TV_NOT_BULLISH"
+        return out
+
+    recover = float(close5) > float(support_high)
+    break_prev = float(close5) > float(prev_high5)
+    base_long_signal = bool(recover or break_prev)
+    if not bool(base_long_signal):
+        out["reason"] = "SR_TV_RECOVERY_FAIL"
+        return out
+
+    if nearest_res is None or float(out["resistance_low"]) <= float(close5):
+        out["reason"] = "SR_TV_NO_RESIST_TP"
+        return out
+
+    version = str(getattr(cfg, "SR_TV_VERSION", "V1")).upper().strip()
+    if version == "V2_RECLAIM":
+        if bool(getattr(cfg, "SR_TV_RECLAIM_ON", True)):
+            reclaim_ok = bool(float(close5) >= float(support_high))
+            if not reclaim_ok:
+                out["reason"] = "SR_TV_V2_RECLAIM_FAIL"
+                return out
+    elif version == "V2_EMA200":
+        if bool(getattr(cfg, "SR_TV_EMA200_ON", True)):
+            ema_len_5m = max(20, int(getattr(cfg, "SR_TV_EMA_LEN", 200)))
+            ema200_5m = get_ema(df5["close"], ema_len_5m)
+            ema200_now = safe_last(ema200_5m)
+            if ema200_now is None:
+                out["reason"] = "SR_TV_V2_EMA200_DATA_NAN"
+                return out
+            if not (float(close5) > float(ema200_now)):
+                out["reason"] = "SR_TV_V2_EMA200_FAIL"
+                return out
+    elif version == "V2_VOLCONF":
+        if bool(getattr(cfg, "SR_TV_VOLCONF_ON", True)):
+            ma_n = max(2, int(getattr(cfg, "SR_TV_VOLCONF_MA_N", 20)))
+            mult = max(0.0, float(getattr(cfg, "SR_TV_VOLCONF_MULT", 1.0)))
+            vol_now_5m = safe_last(df5["volume"])
+            vol_ma_5m = safe_last(df5["volume"].rolling(ma_n).mean())
+            if vol_now_5m is None or vol_ma_5m is None or float(vol_ma_5m) <= 0:
+                out["reason"] = "SR_TV_V2_VOLCONF_DATA_NAN"
+                return out
+            if not (float(vol_now_5m) >= float(vol_ma_5m) * float(mult)):
+                out["reason"] = "SR_TV_V2_VOLCONF_FAIL"
+                return out
+
+    out["ok"] = True
+    out["reason"] = "ENTRY_SR_TV_COMBO"
+    out["entry_price"] = float(close5)
+    out["tp_price"] = float(out["resistance_low"])
+    return out
+
+
+def sr_tv_combo_entry_signal(ticker: str, cfg=config):
+    interval_15 = str(getattr(cfg, "SR_TV_ZONE_INTERVAL", "minute15"))
+    interval_5 = str(getattr(cfg, "SR_TV_EXEC_INTERVAL", "minute5"))
+    lookback_15 = max(
+        int(getattr(cfg, "SR_TV_SIGNAL_LOOKBACK_15M", 360)),
+        int(getattr(cfg, "SR_TV_EMA_LEN", 200)) + int(getattr(cfg, "SR_TV_LOOKBACK", 20)) + 40,
+    )
+    lookback_5 = max(int(getattr(cfg, "SR_TV_SIGNAL_LOOKBACK_5M", 240)), 80)
+    df15 = pyupbit.get_ohlcv(ticker, interval=interval_15, count=lookback_15)
+    df5 = pyupbit.get_ohlcv(ticker, interval=interval_5, count=lookback_5)
+    return sr_tv_combo_entry_signal_df(df15=df15, df5=df5, cfg=cfg)
+
+
+def sr_only_tv_combo_entry_signal_df(df15, df5, cfg=config):
+    return sr_tv_combo_entry_signal_df(df15=df15, df5=df5, cfg=cfg)
+
+
+def sr_only_tv_combo_entry_signal(ticker: str, cfg=config):
+    return sr_tv_combo_entry_signal(ticker=ticker, cfg=cfg)
 
 
 def h4_trend_ok(df4h):
