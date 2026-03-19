@@ -124,6 +124,14 @@ def _record_sell_krw(state: dict, qty: float, price: float):
 
 def _reason_code_from_fail_reason(fail_reason: str) -> str:
     raw = str(fail_reason or "").lower()
+    if "sr_tp_resist" in raw:
+        return "EXIT_SR_TP_RESIST"
+    if "sr_tp_r" in raw:
+        return "EXIT_SR_TP_R"
+    if "sr_timeout" in raw:
+        return "EXIT_SR_TIMEOUT"
+    if "sr_sl" in raw:
+        return "EXIT_SR_SL"
     if "tp2_partial" in raw:
         return "TP2_PARTIAL"
     if "runner_trail" in raw:
@@ -280,6 +288,19 @@ def _resolve_trail_drawdown_pct(regime_trail_back: float) -> float:
 
 def _is_main_strategy(strategy_tag: str) -> bool:
     return str(strategy_tag or "").upper().strip() == "MAIN"
+
+
+def _is_v5_strategy(strategy_tag: str) -> bool:
+    return str(strategy_tag or "").upper().strip() in {"V5", "A_ONLY"}
+
+
+def _is_sr_only_strategy(strategy_tag: str) -> bool:
+    return str(strategy_tag or "").upper().strip() == "SR_ONLY"
+
+
+def _is_sr_tv_combo_strategy(strategy_tag: str) -> bool:
+    t = str(strategy_tag or "").upper().strip()
+    return t in {"SR_ONLY_TV_COMBO", "SR_ONLY_TV_COMBO_A", "SR_ONLY_TV_COMBO_B"}
 
 
 def _normalize_main_mode(mode: str) -> str:
@@ -559,6 +580,9 @@ def apply_risk_rules(upbit, ticker: str, state: dict, cur: float, market_sell, n
     _ensure_position_accounting(state, strategy_tag=strategy_tag)
     tag = str(state.get("strategy_tag") or strategy_tag or "MAIN").upper().strip() or "MAIN"
     is_main = _is_main_strategy(tag)
+    is_v5 = _is_v5_strategy(tag)
+    is_sr_only = _is_sr_only_strategy(tag)
+    is_sr_tv = _is_sr_tv_combo_strategy(tag)
 
     _ensure_trail_state(state, now_ts)
     state["peak"] = max(float(state.get("peak", entry)), float(cur))
@@ -597,15 +621,192 @@ def apply_risk_rules(upbit, ticker: str, state: dict, cur: float, market_sell, n
             }
         return {"closed": False, "partials": partials}
 
+    if is_sr_only or is_sr_tv:
+        sr_support_low = _as_nonneg_float(state.get("sr_support_low", 0.0), 0.0)
+        sr_support_high = _as_nonneg_float(state.get("sr_support_high", 0.0), 0.0)
+
+        if is_sr_tv:
+            sl_mode = str(state.get("sr_tv_sl_mode", "A")).upper().strip()
+            if sl_mode == "B":
+                # Variant B: close-below support zone top.
+                sr_stop_price = float(sr_support_high) if sr_support_high > 0 else 0.0
+            else:
+                # Variant A: support zone bottom -0.3%.
+                sr_stop_price = _as_nonneg_float(state.get("sr_stop_price", 0.0), 0.0)
+                if sr_stop_price <= 0 and sr_support_low > 0:
+                    sr_stop_price = float(sr_support_low) * (1.0 - 0.003)
+        else:
+            sr_stop_price = _as_nonneg_float(state.get("sr_stop_price", 0.0), 0.0)
+            if sr_stop_price <= 0:
+                if sr_support_low > 0:
+                    sr_stop_offset = max(0.0, float(getattr(config, "SR_SL_OFFSET_PCT", 0.003)))
+                    sr_stop_price = float(sr_support_low) * (1.0 - float(sr_stop_offset))
+                else:
+                    sr_sl_pct = _get_state_pct(state, "sl_one_pct", None)
+                    if sr_sl_pct is None:
+                        sr_sl_pct = float(getattr(config, "STOP_LOSS_PCT", 0.01))
+                    sr_stop_price = float(entry) * (1.0 - float(max(0.0, sr_sl_pct)))
+
+        if sr_stop_price > 0 and float(cur) <= float(sr_stop_price):
+            if vol > 0 and _can_order(float(cur), vol):
+                ok, err = _execute_sell(
+                    upbit,
+                    ticker,
+                    vol,
+                    market_sell,
+                    "sr_sl_sell_failed",
+                    strategy_tag=tag,
+                    cur_price=float(cur),
+                )
+                if not ok:
+                    return {"closed": False, "reason": err, "partials": partials}
+                _record_realized(state, vol, float(cur))
+                _record_sell_krw(state, vol, float(cur))
+                if not _is_real_order():
+                    _mock_reduce_volume(state, vol)
+            state["holding"] = False
+            state["runner_active"] = False
+            state["last_exit_reason"] = "EXIT_SR_SL"
+            return {
+                "closed": True,
+                "reason": "EXIT_SR_SL",
+                "exit_price": float(cur),
+                "close_qty": float(max(0.0, vol)),
+                "partials": partials,
+            }
+
+        tp_mode = str(state.get("sr_tp_mode", getattr(config, "SR_TP_MODE", "R_FIXED"))).upper().strip()
+        tp_price = _as_nonneg_float(state.get("sr_tp_price", 0.0), 0.0)
+        if is_sr_tv:
+            tp_mode = "RESIST"
+            if tp_price <= 0:
+                tp_price = _as_nonneg_float(state.get("sr_resistance_low", 0.0), 0.0)
+
+        if tp_mode in {"RESIST", "MODE_A", "TP_RESIST"}:
+            if tp_price <= 0:
+                tp_price = _as_nonneg_float(state.get("sr_resistance_low", 0.0), 0.0)
+            if tp_price > float(entry) and float(cur) >= float(tp_price):
+                if vol > 0 and _can_order(float(cur), vol):
+                    ok, err = _execute_sell(
+                        upbit,
+                        ticker,
+                        vol,
+                        market_sell,
+                        "sr_tp_resist_sell_failed",
+                        strategy_tag=tag,
+                        cur_price=float(cur),
+                    )
+                    if not ok:
+                        return {"closed": False, "reason": err, "partials": partials}
+                    _record_realized(state, vol, float(cur))
+                    _record_sell_krw(state, vol, float(cur))
+                    if not _is_real_order():
+                        _mock_reduce_volume(state, vol)
+                state["holding"] = False
+                state["runner_active"] = False
+                state["last_exit_reason"] = "EXIT_SR_TP_RESIST"
+                return {
+                    "closed": True,
+                    "reason": "EXIT_SR_TP_RESIST",
+                    "exit_price": float(cur),
+                    "close_qty": float(max(0.0, vol)),
+                    "partials": partials,
+                }
+        elif not is_sr_tv:
+            if tp_price <= 0:
+                r_pct = _get_state_pct(state, "sr_r_pct", None)
+                if r_pct is None:
+                    r_pct = _get_state_pct(state, "v5_r_pct", None)
+                if r_pct is None:
+                    r_pct = _get_state_pct(state, "sl_one_pct", None)
+                r_pct = max(0.0, float(r_pct or 0.0))
+                tp_r = max(0.1, float(getattr(config, "SR_TP_R", 2.0)))
+                tp_price = float(entry) * (1.0 + float(tp_r) * float(r_pct))
+            if tp_price > float(entry) and float(cur) >= float(tp_price):
+                if vol > 0 and _can_order(float(cur), vol):
+                    ok, err = _execute_sell(
+                        upbit,
+                        ticker,
+                        vol,
+                        market_sell,
+                        "sr_tp_r_sell_failed",
+                        strategy_tag=tag,
+                        cur_price=float(cur),
+                    )
+                    if not ok:
+                        return {"closed": False, "reason": err, "partials": partials}
+                    _record_realized(state, vol, float(cur))
+                    _record_sell_krw(state, vol, float(cur))
+                    if not _is_real_order():
+                        _mock_reduce_volume(state, vol)
+                state["holding"] = False
+                state["runner_active"] = False
+                state["last_exit_reason"] = "EXIT_SR_TP_R"
+                return {
+                    "closed": True,
+                    "reason": "EXIT_SR_TP_R",
+                    "exit_price": float(cur),
+                    "close_qty": float(max(0.0, vol)),
+                    "partials": partials,
+                }
+
+        timeout_min = max(0.0, float(getattr(config, "SR_TIMEOUT_MIN", 0)))
+        if timeout_min > 0 and elapsed_sec >= (timeout_min * 60.0):
+            if vol > 0 and _can_order(float(cur), vol):
+                ok, err = _execute_sell(
+                    upbit,
+                    ticker,
+                    vol,
+                    market_sell,
+                    "sr_timeout_sell_failed",
+                    strategy_tag=tag,
+                    cur_price=float(cur),
+                )
+                if not ok:
+                    return {"closed": False, "reason": err, "partials": partials}
+                _record_realized(state, vol, float(cur))
+                _record_sell_krw(state, vol, float(cur))
+                if not _is_real_order():
+                    _mock_reduce_volume(state, vol)
+            state["holding"] = False
+            state["runner_active"] = False
+            state["last_exit_reason"] = "EXIT_SR_TIMEOUT"
+            return {
+                "closed": True,
+                "reason": "EXIT_SR_TIMEOUT",
+                "exit_price": float(cur),
+                "close_qty": float(max(0.0, vol)),
+                "partials": partials,
+            }
+
+        return {"closed": False, "partials": partials}
+
     # 1) stop loss full close
     # In the early post-entry window, force fixed SL only (no ATR stop widening/tightening).
     if elapsed_sec < trail_arm_sec:
         stop_pct = float(sl_one) if sl_one is not None else float(getattr(config, "STOP_LOSS_PCT", 0.01))
     else:
         stop_pct = float(sl_one) if sl_one is not None else _calc_stop_pct(entry, ticker, regime)
-    if pnl <= -stop_pct:
+    stop_pct = max(0.0, float(stop_pct))
+    stop_price = float(entry) * (1.0 - float(stop_pct))
+
+    if is_v5:
+        v5_stop_price = _as_nonneg_float(state.get("v5_stop_price", 0.0), 0.0)
+        if v5_stop_price > 0:
+            stop_price = float(v5_stop_price)
+
+    if (
+        is_main
+        and bool(getattr(config, "MAIN_BE_AFTER_TP1_ENABLED", True))
+        and bool(state.get("tp1_done", False))
+    ):
+        be_buffer_pct = max(0.0, float(getattr(config, "MAIN_BE_AFTER_TP1_BUFFER_PCT", 0.0)))
+        be_price = float(entry) * (1.0 + float(be_buffer_pct))
+        stop_price = max(float(stop_price), float(be_price))
+
+    if float(cur) <= float(stop_price):
         if bool(getattr(config, "DEBUG_TRADE_FLOW", False)):
-            print(f"[손절] {ticker} pnl={pnl:.4f}")
+            print(f"[손절] {ticker} cur={float(cur):.6f} stop={float(stop_price):.6f} pnl={pnl:.4f}")
         if vol > 0 and _can_order(float(cur), vol):
             ok, err = _execute_sell(
                 upbit,
@@ -633,6 +834,183 @@ def apply_risk_rules(upbit, ticker: str, state: dict, cur: float, market_sell, n
             "close_qty": float(max(0.0, vol)),
             "partials": partials,
         }
+
+    if is_v5:
+        # V5 exits are R-multiple based (TP1/TP2/runner trail) on top of fixed swing stop.
+        r_pct = _get_state_pct(state, "v5_r_pct", None)
+        if r_pct is None:
+            v5_stop_price = _as_nonneg_float(state.get("v5_stop_price", 0.0), 0.0)
+            if v5_stop_price > 0 and entry > v5_stop_price:
+                r_pct = (float(entry) - float(v5_stop_price)) / float(entry)
+            else:
+                r_pct = max(0.0, float(getattr(config, "V5_SL_MIN_PCT", 0.008)))
+            state["v5_r_pct"] = float(r_pct)
+        r_pct = max(0.0, float(r_pct or 0.0))
+        if r_pct <= 0:
+            return {"closed": False, "partials": partials}
+
+        tp1_r = max(0.0, float(getattr(config, "V5_TP1_R", 1.0)))
+        tp2_r = max(tp1_r, float(getattr(config, "V5_TP2_R", 2.0)))
+        runner_arm_r = max(tp2_r, float(getattr(config, "V5_RUNNER_ARM_R", 3.0)))
+        runner_trail_back_r = max(0.1, float(getattr(config, "V5_RUNNER_TRAIL_BACK_R", 1.0)))
+
+        tp1_target = float(tp1_r) * float(r_pct)
+        tp2_target = float(tp2_r) * float(r_pct)
+        runner_arm_target = float(runner_arm_r) * float(r_pct)
+
+        # TP1 partial
+        if (not bool(state.get("tp1_done", False))) and pnl >= tp1_target:
+            vol = _get_volume(upbit, ticker, state)
+            if vol > 0:
+                base_qty = _estimate_entry_qty(state, entry)
+                target_qty = max(0.0, float(base_qty) * float(state.get("tp1_ratio", 0.0)))
+                sell_qty = min(float(target_qty), float(vol))
+                if sell_qty > 0 and _can_order(float(cur), sell_qty):
+                    ok, err = _execute_sell(
+                        upbit,
+                        ticker,
+                        sell_qty,
+                        market_sell,
+                        "tp1_sell_failed",
+                        strategy_tag=tag,
+                        cur_price=float(cur),
+                    )
+                    if not ok:
+                        return {"closed": False, "reason": err, "partials": partials}
+                    _record_realized(state, sell_qty, float(cur))
+                    _record_sell_krw(state, sell_qty, float(cur))
+                    if not _is_real_order():
+                        _mock_reduce_volume(state, sell_qty)
+                    state["tp1_done"] = True
+                    state["tp1"] = True
+                    state["tp1_pnl_pct"] = float(pnl * 100.0)
+                    partials.append(
+                        {
+                            "reason": "TP1",
+                            "qty": float(sell_qty),
+                            "price": float(cur),
+                            "pnl_pct": float(pnl * 100.0),
+                        }
+                    )
+
+        # TP2 partial
+        if (not bool(state.get("tp2_done", False))) and pnl >= tp2_target:
+            vol = _get_volume(upbit, ticker, state)
+            if vol > 0:
+                base_qty = _estimate_entry_qty(state, entry)
+                target_qty = max(0.0, float(base_qty) * float(state.get("tp2_ratio", 0.0)))
+                max_sell = max(0.0, float(vol) * (1.0 - 1e-9))
+                sell_qty = min(float(target_qty), float(max_sell))
+                if sell_qty > 0 and _can_order(float(cur), sell_qty):
+                    ok, err = _execute_sell(
+                        upbit,
+                        ticker,
+                        sell_qty,
+                        market_sell,
+                        "tp2_partial_sell_failed",
+                        strategy_tag=tag,
+                        cur_price=float(cur),
+                    )
+                    if not ok:
+                        return {"closed": False, "reason": err, "partials": partials}
+                    _record_realized(state, sell_qty, float(cur))
+                    _record_sell_krw(state, sell_qty, float(cur))
+                    if not _is_real_order():
+                        _mock_reduce_volume(state, sell_qty)
+                    state["tp2_done"] = True
+                    state["tp2"] = True
+                    state["tp2_pnl_pct"] = float(pnl * 100.0)
+                    partials.append(
+                        {
+                            "reason": "TP2_PARTIAL",
+                            "qty": float(sell_qty),
+                            "price": float(cur),
+                            "pnl_pct": float(pnl * 100.0),
+                        }
+                    )
+
+        # Arm runner after reaching 3R threshold.
+        vol = _get_volume(upbit, ticker, state)
+        if (not bool(state.get("runner_active", False))) and vol > 0 and pnl >= runner_arm_target:
+            state["runner_active"] = True
+            state["runner_hwm"] = max(float(cur), _as_nonneg_float(state.get("runner_hwm", 0.0), 0.0))
+            state["runner_start_ts"] = float(now_ts)
+
+        if bool(state.get("runner_active", False)):
+            state["runner_hwm"] = max(float(cur), _as_nonneg_float(state.get("runner_hwm", 0.0), 0.0))
+            runner_hwm = _as_nonneg_float(state.get("runner_hwm", 0.0), 0.0)
+            one_r_price = float(entry) * float(r_pct)
+            cut_price = float(runner_hwm) - (float(one_r_price) * float(runner_trail_back_r))
+            if cut_price <= 0:
+                cut_price = float(entry)
+
+            if float(cur) <= float(cut_price):
+                vol = _get_volume(upbit, ticker, state)
+                if vol > 0 and _can_order(float(cur), vol):
+                    ok, err = _execute_sell(
+                        upbit,
+                        ticker,
+                        vol,
+                        market_sell,
+                        "runner_trail_sell_failed",
+                        strategy_tag=tag,
+                        cur_price=float(cur),
+                    )
+                    if not ok:
+                        return {"closed": False, "reason": err, "partials": partials}
+                    _record_realized(state, vol, float(cur))
+                    _record_sell_krw(state, vol, float(cur))
+                    if not _is_real_order():
+                        _mock_reduce_volume(state, vol)
+                state["holding"] = False
+                state["runner_active"] = False
+                state["last_exit_reason"] = "RUNNER_TRAIL"
+                return {
+                    "closed": True,
+                    "reason": "RUNNER_TRAIL",
+                    "exit_price": float(cur),
+                    "close_qty": float(max(0.0, vol)),
+                    "partials": partials,
+                }
+
+            runner_start_ts = _as_nonneg_float(state.get("runner_start_ts", 0.0), 0.0)
+            max_hold_min = max(0.0, float(getattr(config, "V5_RUNNER_MAX_HOLD_MIN", 240)))
+            timeout_sec = max_hold_min * 60.0
+            timeout_pnl_min = float(getattr(config, "V5_RUNNER_TIMEOUT_CLOSE_IF_PNL_GE", 0.0))
+            timeout_hit = False
+            if runner_start_ts > 0 and timeout_sec > 0:
+                timeout_hit = (now_ts - runner_start_ts) >= timeout_sec and pnl >= timeout_pnl_min
+
+            if timeout_hit:
+                vol = _get_volume(upbit, ticker, state)
+                if vol > 0 and _can_order(float(cur), vol):
+                    ok, err = _execute_sell(
+                        upbit,
+                        ticker,
+                        vol,
+                        market_sell,
+                        "runner_timeout_sell_failed",
+                        strategy_tag=tag,
+                        cur_price=float(cur),
+                    )
+                    if not ok:
+                        return {"closed": False, "reason": err, "partials": partials}
+                    _record_realized(state, vol, float(cur))
+                    _record_sell_krw(state, vol, float(cur))
+                    if not _is_real_order():
+                        _mock_reduce_volume(state, vol)
+                state["holding"] = False
+                state["runner_active"] = False
+                state["last_exit_reason"] = "RUNNER_TIMEOUT"
+                return {
+                    "closed": True,
+                    "reason": "RUNNER_TIMEOUT",
+                    "exit_price": float(cur),
+                    "close_qty": float(max(0.0, vol)),
+                    "partials": partials,
+                }
+
+        return {"closed": False, "partials": partials}
 
     if is_main:
         def _close_main_dust_after_partial():

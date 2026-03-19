@@ -34,8 +34,16 @@ BOT_MODE = MODE  # backward compatibility
 REAL_ORDER = MODE != "TEST"
 REQUIRE_ORDER_CONFIRM = False
 
-ENABLE_MAIN_STRATEGY = True
+# ===============================
+# Live strategy routing
+# ===============================
+LIVE_STRATEGY_MODE = _env_str("LIVE_STRATEGY_MODE", "MAIN").upper()
+if LIVE_STRATEGY_MODE not in {"MAIN", "A_ONLY"}:
+    LIVE_STRATEGY_MODE = "MAIN"
+
+ENABLE_MAIN_STRATEGY = LIVE_STRATEGY_MODE == "MAIN"
 ENABLE_SCALP_STRATEGY = False
+A_ONLY_ENABLED = LIVE_STRATEGY_MODE == "A_ONLY"
 
 # Legacy SCALP(11~30) and BTC-only SCALP switch
 SCALP_LEGACY_ENABLED = False
@@ -368,8 +376,16 @@ ENTRY_SCORE_LOG_PASS = False
 MAIN_INCLUDE_SURGE = True
 MAIN_SURGE_SOURCE = "RANKED"
 
+# A-only (V5-based) live params
+A_ONLY_TOPN = 10
+A_ONLY_MAX_HOLDINGS = 2
+A_ONLY_ALLOW_ADD_BUY = False
+A_ONLY_SCALE_MULT = 1.00
+A_ONLY_CONSEC_LOSS_LIMIT = 4
+A_ONLY_DAILY_ENTRY_STOP_AFTER_WINS = 3
+
 # V5 strategy (5m breakout + pullback, R-multiple exits)
-ENABLE_V5_STRATEGY = False
+ENABLE_V5_STRATEGY = A_ONLY_ENABLED
 V5_REGIME_FILTER_ON = False
 V5_REGIME_BLOCKED = {"HALT"}
 # V5 BTC trend gate (optional): block all V5 entries when BTC trend is weak.
