@@ -2069,8 +2069,8 @@ def run():
     minute_cache = {}
 
     print(
-        f"[BOT] start | MODE={bot_mode} | REAL_ORDER={config.REAL_ORDER} "
-        f"| MAIN={'ON' if enable_main else 'OFF'} "
+        f"[BOT] start | MODE={bot_mode} | LIVE_STRATEGY={live_strategy_mode} | REAL_ORDER={config.REAL_ORDER} "
+        f"| {active_main_strategy}={'ON' if enable_main else 'OFF'} "
         f"SCALP_BTC={'ON' if enable_scalp_btc else 'OFF'} "
         f"LEGACY_SCALP={'ON' if enable_scalp_legacy else 'OFF'}"
     )
@@ -2078,8 +2078,9 @@ def run():
         event_type="BOT_START",
         lines=[
             f"\uBAA8\uB4DC: {bot_mode}",
+            f"LIVE_STRATEGY_MODE: {live_strategy_mode}",
             f"REAL_ORDER: {bool(getattr(config, 'REAL_ORDER', False))}",
-            f"\uC804\uB7B5: MAIN={'ON' if enable_main else 'OFF'}, SCALP_BTC={'ON' if enable_scalp_btc else 'OFF'}",
+            f"\uC804\uB7B5: {active_main_strategy}={'ON' if enable_main else 'OFF'}, SCALP_BTC={'ON' if enable_scalp_btc else 'OFF'}",
         ],
     )
 
